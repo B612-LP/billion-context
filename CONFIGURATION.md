@@ -1552,7 +1552,7 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
 - **Status:** ACTIVE
 - **Description:** Price profile for the **cache-economics verdicts** in the session cache report (`acp_cache` tool / `/acp-cache` command / `GET /__bili/cache-report`, #800/#1279). The per-fold P&L fields (`oneTimeCostUnits`, `perTurnSavingUnits`, `breakevenTurns`, `paidBack`) are computed from three multipliers over the input-token unit: `w` (cache-write cost), `r` (cache-read cost), `q` (output cost). Two unit conventions coexist, both printed verbatim in the report header (`FOLD ECONOMICS (N folds @ w=.. r=.. q=..)`):
   - **User config** uses **ratios normalized to the input price (p_in = 1)**: `w` = cacheWrite ÷ input, `r` = cacheRead ÷ input, `q` = output ÷ input. Sub-fields merge deepest-wins across the three levels like every other CompressSettings field (set `q` at provider level, refine one field at model level); fields left unset within a partial profile fall back to the kernel ratios `w: 1`, `r: 0.1`, `q: 4`.
-  - **Registry default** (no level sets the key): derived from the request model's models.dev price row — **absolute $/Mtok**, `w = cost.input`, `r = cost.cache_read ?? 0.1 × input`, `q = cost.output ?? 1.5 × input` (convention fallbacks for rows without those fields). Direct-to-provider traffic gets that host's own listing; unknown relays get the first matching listing across hosts (with a one-time warning when listings conflict). Live registry wins when reachable, bundled snapshot is the offline floor (#282).
+   - **Registry default** (no level sets the key): derived from the request model's models.dev price row — **absolute $/Mtok**, `w = cost.input`, `r = cost.cache_read ?? 0.1 × w`, `q = cost.output ?? 4 × w` (convention fallbacks for rows without those fields). Direct-to-provider traffic gets that host's own listing; unknown relays get the first matching listing across hosts (with a one-time warning when listings conflict). Live registry wins when reachable, bundled snapshot is the offline floor (#282).
   User config wins wholesale — a profile set at any level is never mixed field-by-field with the registry row. The last request's effective value is stamped onto the session, so every report face prices folds with the profile that governed that session's most recent turn. **Report-only**: the profile never affects compression triggers, cadence, or any wire behavior. User-config examples (override the registry row, e.g. for relays with custom markup):
   ```jsonc
   // DeepSeek-V3 ≈ low output multiple
@@ -1562,7 +1562,12 @@ For each request, the proxy resolves the settings by longest-URL-prefix match (t
   // Self-hosted / free tier: everything costs zero tokens of your budget
   { "compress": { "priceProfile": { "w": 0, "r": 0, "q": 0 } } }
   ```
-  Use list prices relative to the same model's normal input price; relays with custom markup should use their effective rates.
+   Use list prices relative to the same model's normal input price; relays with custom markup should use their effective rates.
+   **Real-money display (#2478).** When a session's last request resolves a models.dev row, bili stamps the price provenance (`cachePriceSource`: resolved catalog key + raw $/Mtok fields) alongside the profile, and every report face adds a **PRICED ECONOMICS** section next to the token-denominated FOLD ECONOMICS — gross saved, one-time cost (re-pay premium + summary output) and net, in USD: what compression saves AND what it costs are both counted. Conventions:
+   - **Registry stamp** — the profile is already absolute $/Mtok, so the unit math IS microusd (scale 1);
+   - **User config** — ratios anchored to the resolved row's input price (μ$ = units × anchor); if the model cannot be resolved there is no anchor and the report stays token-denominated;
+   - **No stamp** (kernel default ratios) — token-denominated only.
+   The web UI's savings headline switches to ≈$ for priced sessions (token figures stay alongside; unpriced sessions keep the token headline with their remainder shown), `/acp-cache` text and the `GET /__bili/cache-report` JSON gain a `priced` field. Figures are **list-price estimates**, not actual billing (relay markups differ). Report-only invariant unchanged: none of this affects triggers or the wire.
 
 #### `outputSteering`
 

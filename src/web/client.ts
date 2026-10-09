@@ -444,6 +444,17 @@ export const WEB_CLIENT = `(function () {
         while (Math.abs(n) >= 1024 && i < units.length - 1) { n /= 1024; i++; }
         return (i > 0 ? n.toFixed(1) : String(Math.round(n))) + " " + units[i];
     }
+    // #2478: money formatting mirroring the server's fmtUsd (cache-ledger.ts).
+    function fmtUsd(n) {
+        if (n === null || n === undefined || isNaN(n)) return t("common.none");
+        n = Number(n);
+        const sign = n < 0 ? "-" : "";
+        const a = Math.abs(n);
+        if (a >= 1e6) return sign + "$" + (a / 1e6).toFixed(2) + "M";
+        if (a >= 10000) return sign + "$" + (a / 1000).toFixed(1) + "K";
+        if (a >= 100) return sign + "$" + a.toFixed(1);
+        return sign + "$" + a.toFixed(2);
+    }
     function timeAgo(iso) {
         if (!iso) return t("common.none");
         const then = typeof iso === "number" ? iso : Date.parse(String(iso));
@@ -577,6 +588,20 @@ export const WEB_CLIENT = `(function () {
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
     // to the local tokensSaved estimate; neither present => honest dash, never fake 0.
     function savedTd(x) {
+        // #2478: priced sessions read in real money (list-price estimate with
+        // compression costs included); unpriced ones keep the token display.
+        if (x.netSavedUsd != null) {
+            const v = x.netSavedUsd;
+            const tipParts = [
+                x.priceSource ? t("ses.saved_usd_tip", { s: x.priceSource }) : t("ses.saved_usd_tip_plain"),
+                v < 0 ? t("ov.saved_neg_usd_tip") : "",
+                x.coverageLostFolds ? t("ses.covlost_tip", { n: x.coverageLostFolds, x: fmtW(x.coverageLostFrozenTokens || 0) }) : "",
+            ].filter(Boolean).join(" ");
+            const tip = ' title="' + escapeHtml(tipParts) + '"';
+            if (v > 0) return '<td class="num good-num"' + tip + ">≈" + fmtUsd(v) + "</td>";
+            if (v < 0) return '<td class="num"' + tip + ">" + fmtUsd(v) + "</td>";
+            return '<td class="num dim"' + tip + ">≈$0</td>";
+        }
         const v = x.netSaved != null ? x.netSaved : (x.tokensSaved || 0);
         // #2202: name the frozen share in the tooltip when any fold lost
         // coverage — the number is honest now, but the operator must see it.
@@ -990,14 +1015,28 @@ function changelogCatOf(rawLine) {
             $("st-sessions").textContent = String(total);
             $("st-sessions-sub").textContent = liveN + " " + t("ov.live_now") + " · " + Math.max(0, total - liveN) + " " + t("ov.hist");
             $("st-reqs").textContent = o.requests ? fmtW(o.requests) : t("common.none");
-            const grossEl = $("st-gross");
-            grossEl.textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
-            grossEl.title = o.grossSavedTotal ? String(Math.round(Number(o.grossSavedTotal))) : "";
-            $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "");
-            const netEl = $("st-netsaved");
-            netEl.textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
-            netEl.title = o.hasFoldData && o.netSavedTotal ? String(Math.round(Number(o.netSavedTotal))) : "";
-            $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "") : "";
+            // #2478: when any fold-session is priced the headlines read in real
+            // money (list-price estimate); unpriced sessions stay visible in
+            // tokens so mixed calibers never blend silently.
+            if (o.hasFoldData && o.netSavedUsdTotal != null) {
+                $("st-gross").textContent = "≈" + fmtUsd(o.grossSavedUsdTotal || 0);
+                $("st-gross-sub").textContent = t("ov.gross_priced", { n: o.pricedSessions || 0 })
+                    + ((o.unpricedGrossTokens || 0) > 0 ? " · " + t("ov.unpriced_remainder", { t: fmtW(o.unpricedGrossTokens) }) : "")
+                    + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "");
+                $("st-netsaved").textContent = "≈" + fmtUsd(o.netSavedUsdTotal);
+                $("st-net-sub").textContent = t("ov.net_priced_cost", { c: fmtUsd(o.oneTimeCostTotal || 0) })
+                    + ((o.unpricedNetTokens || 0) !== 0 ? " · " + t("ov.unpriced_remainder", { t: fmtW(o.unpricedNetTokens) }) : "")
+                    + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "");
+            } else {
+                const grossEl = $("st-gross");
+                grossEl.textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
+                grossEl.title = o.grossSavedTotal ? String(Math.round(Number(o.grossSavedTotal))) : "";
+                $("st-gross-sub").textContent = t("ov.gross_note") + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "");
+                const netEl = $("st-netsaved");
+                netEl.textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
+                netEl.title = o.hasFoldData && o.netSavedTotal ? String(Math.round(Number(o.netSavedTotal))) : "";
+                $("st-net-sub").textContent = o.hasFoldData ? t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }) + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "") + ((o.coverageLostFrozenTotal || 0) > 0 ? " · " + t("ov.covlost_note", { n: o.coverageLostFoldTotal || 0, x: fmtW(o.coverageLostFrozenTotal) }) : "") : "";
+            }
             $("st-hitpct").textContent = o.hitPct == null ? t("common.none") : o.hitPct.toFixed(1) + "%";
             const hs = $("st-hit-split");
             if (hs) {
@@ -2603,9 +2642,21 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         }
         mini(parts, t("det.hit_pct"), d.cacheHitPct == null ? null : d.cacheHitPct.toFixed(1) + "%", false, hitSub, missArgs ? t("det.miss_split_line", missArgs) : "");
         mini(parts, t("ov.output_tokens"), d.outputTokens ? fmtW(d.outputTokens) : null);
-        const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
-        mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0,
-            d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : "");
+        if (d.netSavedUsd != null) {
+            // #2478: priced detail reads in money; the token figure stays on the
+            // sub-line so both calibers are visible at once.
+            const dSavedSub = [
+                d.priceSource ? t("ses.saved_usd_tip", { s: d.priceSource }) : t("ses.saved_usd_tip_plain"),
+                t("ov.net_priced_cost", { c: fmtUsd(d.oneTimeCostUsd || 0) }),
+                "tok: " + fmtW(d.netSaved != null ? d.netSaved : 0),
+                d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : "",
+            ].filter(Boolean).join(" · ");
+            mini(parts, t("ov.tokens_saved"), "≈" + fmtUsd(d.netSavedUsd), d.netSavedUsd > 0, dSavedSub);
+        } else {
+            const dSavedV = d.netSaved != null ? d.netSaved : d.tokensSaved;
+            mini(parts, t("ov.tokens_saved"), dSavedV ? fmtW(dSavedV) : null, dSavedV > 0,
+                d.coverageLostFolds ? t("det.covlost_sub", { n: d.coverageLostFolds, x: fmtW(d.coverageLostFrozenTokens || 0) }) : "");
+        }
         mini(parts, t("det.last_input"), (d.lastInputTokens || 0) > 0 ? fmtW(d.lastInputTokens) : null);
         parts.push("</div>");
         // #1839: mark estimate-grade context numbers so a bounded local estimate

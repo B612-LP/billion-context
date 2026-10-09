@@ -1543,7 +1543,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **状态：** ACTIVE
 - **说明：** 会话缓存报告（`acp_cache` 工具 / `/acp-cache` 命令 / `GET /__bili/cache-report`，#800/#1279）中**压缩经济学判定**所用的价格档。每个 fold 的损益字段（`oneTimeCostUnits`、`perTurnSavingUnits`、`breakevenTurns`、`paidBack`）由三个基于输入 token 单位的乘数计算得出：`w`（cache 写入成本）、`r`（cache 读取成本）、`q`（output 成本）。两种单位约定并存，且都会原样打印在报告头部（`FOLD ECONOMICS (N folds @ w=.. r=.. q=..)`）：
   - **用户配置**采用**相对输入价归一化（p_in = 1）的比例**：`w` = cacheWrite ÷ input，`r` = cacheRead ÷ input，`q` = output ÷ input。子字段与其他 CompressSettings 字段一样按“深层覆盖”三级合并（provider 层设 `q`、model 层精调单个字段均可）；部分配置中未设置的字段回落到内核比例 `w: 1`、`r: 0.1`、`q: 4`。
-  - **注册表默认**（任何层级都未设置该键时）：由请求模型在 models.dev 的价格行推导——**绝对 $/Mtok**，`w = cost.input`，`r = cost.cache_read ?? 0.1 × input`，`q = cost.output ?? 1.5 × input`（缺这些字段的行用惯例回落值）。直连供应商流量取该 host 自己的挂牌行；未知中转站取跨 host 第一个匹配行（挂牌冲突时一次性告警）。可达时实时注册表优先，随包快照为离线兜底（#282）。
+   - **注册表默认**（任何层级都未设置该键时）：由请求模型在 models.dev 的价格行推导——**绝对 $/Mtok**，`w = cost.input`，`r = cost.cache_read ?? 0.1 × w`，`q = cost.output ?? 4 × w`（缺这些字段的行用惯例回落值）。直连供应商流量取该 host 自己的挂牌行；未知中转站取跨 host 第一个匹配行（挂牌冲突时一次性告警）。可达时实时注册表优先，随包快照为离线兜底（#282）。
   用户配置整体胜出——任何层级设置了 profile 都不会与注册表行逐字段混用。最近一次请求生效的值会被戳记到会话上，因此所有报告出口都用该会话最近一轮所适用的价格档计价。**纯报表面**：价格档绝不影响压缩触发、频率或任何 wire 行为。用户配置示例（覆盖注册表行，例如中转站有自定义加成时）：
   ```jsonc
   // DeepSeek-V3 ≈ output 倍数低
@@ -1553,7 +1553,12 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
   // 自托管 / 免费额度：一切不消耗你的 token 预算
   { "compress": { "priceProfile": { "w": 0, "r": 0, "q": 0 } } }
   ```
-  请用同一模型正常输入价的相对挂牌价；有自定义加成的中转站应填实际生效费率。
+   请用同一模型正常输入价的相对挂牌价；有自定义加成的中转站应填实际生效费率。
+   **真实金额展示（#2478）。** 当会话最近一次请求能解析到 models.dev 价格行时，bili 会把价格出处（`cachePriceSource`：解析到的目录键 + 原始 $/Mtok 字段）与价格档一起戳记到会话上，所有报告出口都会在 token 口径的 FOLD ECONOMICS 旁增加 **PRICED ECONOMICS** 一节——以美元给出累计节省、一次性成本（复付溢价 + 摘要输出）与净节省：压缩省的钱和费的钱（如摘要输出）都算进去。约定：
+   - **注册表戳记**——价格档本身已是绝对 $/Mtok，单位数学即微美元（scale=1）；
+   - **用户配置**——比例锚定到解析行的输入价（μ$ = units × 锚点）；解析不到模型则无锚点，报告保持 token 口径；
+   - **无戳记**（内核默认比例）——仅 token 口径。
+   Web UI 的节省标题对已计价会话切换为 ≈$（token 数字保留在旁边；未计价会话维持 token 标题并显示其余额部分），`/acp-cache` 文本与 `GET /__bili/cache-report` JSON 新增 `priced` 字段。金额为**挂牌价估算**，非实际账单（中转加成各异）。纯报表面不变：均不影响触发条件或 wire。
 
 #### `outputSteering`
 

@@ -1002,7 +1002,13 @@ Per-fold P&L verdicts are priced by the optional `compress.priceProfile`
 request model's models.dev price row applies in absolute $/Mtok (kernel ratio
 defaults only for unresolvable models) — breakeven/PAID BACK therefore reflect
 your upstream's actual economics out of the box; override per provider for
-relays with custom markup (CONFIGURATION.md, #1279).
+relays with custom markup (CONFIGURATION.md, #1279). Since #2478 the report
+also carries a **PRICED ECONOMICS** section whenever the session's last request
+resolved a models.dev row: gross saved / one-time cost (re-pay premium + summary
+output) / net in USD — user-configured ratio profiles are anchored to that row's
+input price; unresolvable models stay token-denominated. The web UI's savings
+headline switches to ≈$ for priced sessions (list-price estimates, not actual
+billing).
 
 The same seam carries `/acp-rule` (#1251/#1399) — the human entry point to
 the persistent-rules feature (identical output to the `acp_rule` tool):

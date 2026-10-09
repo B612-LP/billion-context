@@ -102,6 +102,13 @@ test("priceProfile stamp: provider-level priceProfile stamps session.metadata; a
         { q: 1.5 },
         "runPrepare stamped the effective priceProfile on the session",
     );
+    // #2478: the provenance stamp rides along; this test's registry is empty,
+    // so a config profile has no models.dev anchor to record.
+    assert.deepEqual(
+        (stamped.metadata as Record<string, unknown>).cachePriceSource,
+        { kind: "config" },
+        "runPrepare stamped the price provenance alongside the profile",
+    );
 
     // Same conversation through a lane WITHOUT priceProfile: latest-wins must
     // CLEAR the stamp (server.ts deletes on empty), not leave the stale one.
@@ -115,6 +122,11 @@ test("priceProfile stamp: provider-level priceProfile stamps session.metadata; a
         (stamped.metadata as Record<string, unknown>).cachePriceProfile,
         undefined,
         "unstamped lane clears the session priceProfile stamp",
+    );
+    assert.equal(
+        (stamped.metadata as Record<string, unknown>).cachePriceSource,
+        undefined,
+        "unstamped lane clears the provenance stamp with the profile (#2478)",
     );
 
     } finally {
@@ -156,6 +168,13 @@ test("priceProfile stamp: registry pricing is the default when no level configur
             { w: 2, r: 0.2, q: 8 },
             "unconfigured session stamped with the registry's absolute $/Mtok profile",
         );
+        // #2478: provenance carries the resolved catalog key + raw $/Mtok, so
+        // reports can name their price source and stay in real money (scale=1).
+        assert.deepEqual(
+            sa.metadata.cachePriceSource,
+            { kind: "registry", modelKey: "somehost/claude-reg", inputPerMtok: 2, outputPerMtok: 8, cacheReadPerMtok: 0.2 },
+            "registry stamp records the resolved models.dev row",
+        );
 
         const beforeB = new Set(listSessions().map((s) => s.id));
         const rb = await post("claude-noreg", "pp-registry-b");
@@ -166,6 +185,11 @@ test("priceProfile stamp: registry pricing is the default when no level configur
             sb.metadata.cachePriceProfile,
             undefined,
             "unresolvable model leaves no stamp (kernel relative defaults apply downstream)",
+        );
+        assert.equal(
+            sb.metadata.cachePriceSource,
+            undefined,
+            "unresolvable model leaves no provenance either (#2478)",
         );
 
         // User config at any level wins wholesale — no field mixing with the registry row.
@@ -189,6 +213,13 @@ test("priceProfile stamp: registry pricing is the default when no level configur
                 sc.metadata.cachePriceProfile,
                 { q: 1.5 },
                 "route-level priceProfile overrides the registry listing wholesale",
+            );
+            // #2478: config-stamped sessions are RATIO profiles — provenance still
+            // carries the models.dev row as the input-price anchor for real-money math.
+            assert.deepEqual(
+                sc.metadata.cachePriceSource,
+                { kind: "config", modelKey: "somehost/claude-reg", inputPerMtok: 2, outputPerMtok: 8, cacheReadPerMtok: 0.2 },
+                "user-config lane records the anchor row when the model resolves",
             );
         } finally {
             if (proxyCfg) await new Promise<void>((r) => proxyCfg!.close(() => r()));
