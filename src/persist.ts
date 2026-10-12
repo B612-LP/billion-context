@@ -1219,7 +1219,10 @@ export class SessionStore {
         return [...rels];
     }
 
-    private async removeSessionFiles(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Promise<void> {
+    /** #2935: public so the host-side conversation-delete path
+     *  (src/session-delete.ts) can sweep a non-resident id without a live
+     *  Session; same candidate set + CCR companion as removeLegacyFile. */
+    async removeSessionFiles(id: string, meta?: { protocol?: string; upstreamOrigin?: string }): Promise<void> {
         for (const rel of await this.findSessionFiles(id, meta)) {
             await rm(path.join(this.sessionsDir, rel), { force: true }).catch(() => {});
             if (rel.endsWith(".json") && !rel.endsWith(".fb.json")) {
