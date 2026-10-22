@@ -77,14 +77,20 @@ test("#4254 egress: circuit-open without a scheduled probe still 503, no Retry-A
     assert.match((JSON.parse(body) as { error?: string }).error ?? "", /circuit open/);
 });
 
-test("#4254 egress: expected-fail-fast marker round-trips and stays off JSON.stringify", () => {
+test("#4254 egress: expected-fail-fast marker round-trips and stays non-enumerable", () => {
     const plain = new Error("x");
     assert.equal(isExpectedFailFast(plain), false);
     assert.equal(isExpectedFailFast(undefined), false);
     assert.equal(isExpectedFailFast(null), false);
     const marked = markExpectedFailFast(plain);
     assert.equal(isExpectedFailFast(marked), true);
-    assert.equal(JSON.stringify(plain), "{}", "marker is non-enumerable");
+    // A symbol key never reaches JSON.stringify whether enumerable or not, so
+    // pin the descriptor itself: every own property (incl. the marker) must stay
+    // non-enumerable or inspect/spread would leak it into serialized diagnostics.
+    for (const d of Object.values(Object.getOwnPropertyDescriptors(marked))) {
+        assert.equal(d.enumerable, false, "every own property (incl. the marker) must be non-enumerable");
+    }
+    assert.equal(JSON.stringify(plain), "{}", "nothing serializable leaks");
 });
 
 // --- host display rule (loopback-exempt) ---------------------------------------
