@@ -458,6 +458,90 @@ test("route: proxy down + under-window body keeps the fail-open direct send", as
     assert.equal(s.proxyBase, undefined);
 });
 
+// #4121: the degrade gate must apply the SAME media-aware two-stage judgment
+// as the dsh takeover gate (#4119/#4111). Stage 1 keeps the raw bytes/4 bar;
+// stage 2 (refuse path only) re-prices on media-EXCLUDED core bytes so inline
+// base64/images stop minting phantom text tokens that false-refused media-heavy
+// requests during the direct-degrade window. Both directions asserted (#3617):
+// media-heavy bodies ride the direct fallback again; genuinely-over-limit TEXT
+// (with or without media) still refuses locally.
+const MEDIA_B64 = "A".repeat(8_000); // ~8KB base64 — resolution-billed upstream (~2-4 KB/token), so bytes/4 wildly overbills it
+const mediaBody = (): string => JSON.stringify({
+    input: [
+        { type: "input_image", image_url: `data:image/png;base64,${MEDIA_B64}` },
+        { type: "input_text", text: "hi" },
+    ],
+});
+
+test("route: proxy down + media-heavy body (raw-bytes over, core-text under) rides the direct fallback — no false refusal", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+    const route = createNativeRoute(state, { probe: async () => false });
+    const s: V2State = { windows: new Map([["prov/model-x", 1_000]]) };
+    const e: V2HttpRequestEvent = {
+        sessionID: "ses_media_direct",
+        model: { providerID: "prov", id: "model-x" },
+        request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body: mediaBody() }),
+    };
+    await route(e, s); // must NOT throw — the raw bytes/4 bar tripped, but the core text fits
+    assert.equal((e.request as Request).url, MODEL_URL, "direct send — request not rewritten");
+    assert.equal(s.proxyBase, undefined);
+});
+
+test("route: busy-exhausted + media-heavy body also rides the direct fallback (second wording branch shares the math)", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:18931", ready: Promise.resolve(undefined) };
+    const route = createNativeRoute(state, {
+        probe: async () => ({ state: "busy" as const }),
+        probeTtlMs: 500,
+        busyWaitCapMs: 120,
+        busyReprobeBaseMs: 20,
+    });
+    const s: V2State = { windows: new Map([["prov/model-x", 1_000]]) };
+    const e: V2HttpRequestEvent = {
+        sessionID: "ses_media_busy",
+        model: { providerID: "prov", id: "model-x" },
+        request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body: mediaBody() }),
+    };
+    await route(e, s); // must NOT throw — the busy-exhausted branch receives the same disarmed verdict
+    assert.equal(state.lastUnavailableReason, "busy-exhausted", "we went through the saturated-but-alive path");
+    assert.equal((e.request as Request).url, MODEL_URL, "direct send — request not rewritten");
+    assert.equal(s.proxyBase, undefined);
+});
+
+test("route: proxy down + over-limit TEXT at the same mass still refuses locally (teeth kept)", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+    const route = createNativeRoute(state, { probe: async () => false });
+    const s: V2State = { windows: new Map([["prov/model-x", 1_000]]) };
+    const e: V2HttpRequestEvent = {
+        sessionID: "ses_text_teeth",
+        model: { providerID: "prov", id: "model-x" },
+        request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ messages: [{ role: "user", content: "x".repeat(5_000) }] }) }),
+    };
+    await assert.rejects(route(e, s), /proxy unavailable/);
+    assert.equal((e.request as Request).url, MODEL_URL, "refused request is not rewritten");
+    assert.equal(s.proxyBase, undefined);
+});
+
+test("route: proxy down + huge text WITH media still refuses, and reports the excluded media mass", async () => {
+    const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
+    const route = createNativeRoute(state, { probe: async () => false });
+    const s: V2State = { windows: new Map([["prov/model-x", 1_000]]) };
+    const body = JSON.stringify({
+        input: [
+            { type: "input_image", image_url: `data:image/png;base64,${MEDIA_B64}` },
+            { type: "input_text", text: "x".repeat(5_000) },
+        ],
+    });
+    const e: V2HttpRequestEvent = {
+        sessionID: "ses_text_media_teeth",
+        model: { providerID: "prov", id: "model-x" },
+        request: new Request(MODEL_URL, { method: "POST", headers: { "content-type": "application/json" }, body }),
+    };
+    const err = await route(e, s).then(() => undefined, (x: unknown) => x);
+    assert.ok(err instanceof Error, "core text alone exceeds the window — media exclusion must not rescue it");
+    assert.match(err.message, /proxy unavailable/);
+    assert.match(err.message, /media excluded/, "the error carries how much media was stripped from the estimate");
+});
+
 test("route: proxy down + unknown or mismatched window keeps the fail-open direct send (no false refusal)", async () => {
     const state: NativeInterceptState = { origin: undefined, ready: Promise.resolve(undefined) };
     const route = createNativeRoute(state, { probe: async () => false });

@@ -627,7 +627,8 @@ export function mediaBytesOfWireBody(raw: string): number {
 /** #4111: the shared two-stage doom predicate for the gate's oversize arms
  *  (the `threw` arm and the unattributed arm). Stage 1 prices the RAW body at
  *  bytes/4 — exactly the old math, cheap — and disarms when that is not even
- *  provisionally over the #4079-floored window. Stage 2 runs ONLY on the
+ *  provisionally over the window (#4079-floored unless opts.applyFloor === false).
+ *  Stage 2 runs ONLY on the
  *  would-refuse path: re-price on media-excluded core bytes and disarm when
  *  the core text alone still fits (the #4111 false refusal was media mass
  *  billed as text). Returns the refusal's numbers when the body is PROVABLY
@@ -638,9 +639,16 @@ export function bodyProvablyOverWindow(
     body: { bytes: number } | undefined,
     init: RequestInit | undefined,
     declaredWindow: number | undefined,
+    opts?: { applyFloor?: boolean },
 ): { coreBytes: number; mediaBytes: number; floorTokens: number; window: number; declaredWindow: number } | undefined {
     if (body === undefined || declaredWindow === undefined) return undefined;
-    const window = Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
+    // #4121: the #4079 1M floor defends against a WRONG-SMALL DECLARED window
+    // (stale host config / catalog fallback) — correct for the dsh arm, whose
+    // window comes from cached model info. A lane whose window source is
+    // MEASURED rather than declared passes applyFloor:false to keep its bar
+    // verbatim; the media exclusion below applies either way (that part has no
+    // decision dependency).
+    const window = opts?.applyFloor === false ? declaredWindow : Math.max(declaredWindow, MIN_ASSUMED_WINDOW_TOKENS);
     if (Math.ceil(body.bytes / 4) <= window) return undefined;
     const rawBody: unknown = init?.body;
     let raw: string | undefined;
