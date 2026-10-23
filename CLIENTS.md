@@ -203,7 +203,9 @@ anchor on its own labeled scale, and recent fold/switch events with reclaimed
 tokens. It refreshes every 10 s; when the running proxy predates this build
 the tab degrades to a restart notice plus an open-Web-UI button instead of
 guessing. Plain React from dsh's own runtime — no iframe, no added
-dependencies.
+dependencies. Third-party UI plugins can read the same status route
+cross-origin — the stable contract (fields, errors, access gate, evolution
+promise) is documented in README → **Host plugin integration** (#4319).
 
 ## Kimi Code (Moonshot)
 
