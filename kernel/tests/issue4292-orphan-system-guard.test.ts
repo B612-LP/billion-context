@@ -85,12 +85,9 @@ test("#4292 shape: sidecar system immediately before the anchor is re-voiced", (
   });
 });
 
-test("consecutive orphaned systems before the anchor re-voice as a whole run", () => {
+test("consecutive plain orphaned systems before the anchor re-voice as a whole run", () => {
   const S1 = sys([{ type: "text", text: "first" }]);
-  const S2 = sys([
-    { type: "text", text: "second" },
-    TOOL_ADDITION,
-  ]);
+  const S2 = sys([{"type":"text","text":"second"}]);
   const rebuilt = coreToAnthropic([
     { id: "u0", role: "user", contentType: "text", text: "q1" },
     { id: "s1", role: "system", contentType: "text", text: "first", rawAnthropicMessage: S1 },
@@ -110,6 +107,46 @@ test("consecutive orphaned systems before the anchor re-voice as a whole run", (
       { type: "text", text: "next" },
     ],
   });
+});
+
+// #4400: a tool-carrying system may NOT be re-voiced — role:user with
+// tool_addition blocks is a guaranteed Anthropic rejection (WC-022), the
+// same permanent 400 the guard exists to prevent. Tool-update systems are
+// accepted at any mid-conversation position, so they stay verbatim.
+test("#4400 shape: tool-carrying orphan adjacent to the anchor stays system", () => {
+  const S = sys([{ type: "text", text: "tools updated" }, TOOL_ADDITION]);
+  const rebuilt = coreToAnthropic([
+    { id: "u0", role: "user", contentType: "text", text: "q1" },
+    { id: "s1", role: "system", contentType: "text", text: "tools updated", rawAnthropicMessage: S },
+    anchor("a1", "[Compressed conversation section] folded"),
+    { id: "t1", role: "user", contentType: "text", text: "next" },
+  ] as never);
+  assert.deepEqual(rebuilt[1], S);
+  assert.equal(rebuilt[2]!.role, "user");
+});
+
+test("#4400 mixed run: plain system re-voices, tool-carrying system in the same run stays", () => {
+  const S1 = sys([{ type: "text", text: "plain" }]);
+  const S2 = sys([{ type: "text", text: "tools" }, TOOL_ADDITION]);
+  const rebuilt = coreToAnthropic([
+    { id: "u0", role: "user", contentType: "text", text: "q1" },
+    { id: "s1", role: "system", contentType: "text", text: "plain", rawAnthropicMessage: S1 },
+    { id: "s2", role: "system", contentType: "text", text: "tools", rawAnthropicMessage: S2 },
+    anchor("a1", "[Compressed conversation section] folded"),
+  ] as never);
+  assert.equal(rebuilt[1]!.role, "user");
+  assert.deepEqual(rebuilt[1]!.content, S1.content);
+  assert.deepEqual(rebuilt[2], S2);
+});
+
+test("#4400: tool_removal-carrying orphan is exempt too", () => {
+  const S = sys([{ type: "tool_removal", tool_name: "t" } as never]);
+  const rebuilt = coreToAnthropic([
+    { id: "u0", role: "user", contentType: "text", text: "q1" },
+    { id: "s1", role: "system", contentType: "text", text: "[system]", rawAnthropicMessage: S },
+    anchor("a1", "[Compressed conversation section] folded"),
+  ] as never);
+  assert.deepEqual(rebuilt[1], S);
 });
 
 test("re-voicing substitutes fresh objects; the stored sidecar is never mutated", () => {

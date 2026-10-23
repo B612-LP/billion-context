@@ -387,11 +387,26 @@ function isDirectiveOnlySystem(e: AnthropicWireMessage): boolean {
   );
 }
 
+// #4400: tool_addition/tool_removal blocks are ONLY valid inside role:system
+// messages (WC-022), so re-voicing a system that carries them would trade the
+// position rejection for a guaranteed tool-block rejection — the same
+// permanent 400 this guard exists to prevent. Anthropic accepts tool-update
+// systems at any mid-conversation position (that is their purpose), so the
+// orphaned tool-carrying system stays verbatim.
+function carriesToolUpdateBlocks(e: AnthropicWireMessage): boolean {
+  if (!Array.isArray(e.content)) return false;
+  return e.content.some(
+    (b) =>
+      typeof b?.type === "string" &&
+      (b.type.startsWith("tool_addition") || b.type.startsWith("tool_removal")),
+  );
+}
+
 function revoiceFoldOrphanedSystems(out: AnthropicWireMessage[]): void {
   for (let j = out.length - 1; j >= 0; j--) {
     const e = out[j];
     if (!e || e.role !== "system") break;
-    if (isDirectiveOnlySystem(e)) continue;
+    if (isDirectiveOnlySystem(e) || carriesToolUpdateBlocks(e)) continue;
     out[j] = { ...e, role: "user" };
   }
 }
