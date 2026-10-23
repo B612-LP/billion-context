@@ -119,14 +119,29 @@ export interface LocalRefusalRecord {
 
 const LOCAL_REFUSAL_MAX_RECORDS = 16;
 
+/** (#3974/#4079) a local refusal is route-scoped CIRCUMSTANTIAL evidence, not
+ *  a permanent property of the model: windows get re-declared (config fix,
+ *  catalog refresh, #3993-style fallback recovery), payloads shrink, and an
+ *  unexpiring record locked new sessions out of every forward-once escape
+ *  hatch forever. Ten minutes covers the aggressive host-retry window the
+ *  record exists for (#3846's consecutive full-bill re-sends) while
+ *  guaranteeing the lock self-heals without any user action. */
+const LOCAL_REFUSAL_TTL_MS = 10 * 60_000;
+
 export function readLocalRefusals(metadata: Record<string, unknown>): LocalRefusalRecord[] {
     const raw = metadata.localRefusals;
     if (!Array.isArray(raw)) return [];
+    const now = Date.now();
     return raw.filter((r): r is LocalRefusalRecord =>
         !!r && typeof r === "object"
         && typeof (r as LocalRefusalRecord).origin === "string"
         && typeof (r as LocalRefusalRecord).model === "string"
-        && typeof (r as LocalRefusalRecord).window === "number",
+        && typeof (r as LocalRefusalRecord).window === "number"
+        // (#4079/#3974) a record without a readable timestamp is treated as
+        // expired too — sessions persisted before the TTL carried no `at`, and
+        // those are exactly the ones stuck in the never-expiring lock.
+        && typeof (r as LocalRefusalRecord).at === "number"
+        && (r as LocalRefusalRecord).at > now - LOCAL_REFUSAL_TTL_MS,
     );
 }
 
