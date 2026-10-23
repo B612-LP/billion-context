@@ -328,7 +328,7 @@ Stable read-only surface for third-party host-side UI plugins that want to show 
 - `{"origin":"http://127.0.0.1:<port>"}` — use this as the base for all `/__bili/*` calls below;
 - `{"origin":null,"relay":true}` — admin relay mode (#3373): derive your base from the probe response URL itself instead;
 - `{"origin":null}` — no proxy bound yet (attach/spawn still booting); keep polling;
-- route absent (404) — older host build without the route.
+- route absent (404) — host build predates the route, or the dsh profile has no web server (TUI/headless); no amount of polling resolves that case.
 
 Newer builds additionally carry bili's own UI face flags (`contextTab`, optional `contextTabLabel`, #4237) in the same body — internal to bili's DSH client bundle; ignore them.
 
