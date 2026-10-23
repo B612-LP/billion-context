@@ -1218,7 +1218,7 @@ function withUndeliveredNotice<T>(result: AgentToolResult<T>): AgentToolResult<T
  *  once via this tool result). Returns null when the run was NOT injected,
  *  in which case the caller delivers the full payload via formatRunResult(). */
 export function injectedWaitMessage(
-  run: { injected?: boolean; readSuppressed?: boolean; result?: { file: string } },
+  run: { injected?: boolean; readSuppressed?: boolean; result?: { file?: string } },
   runId: string,
   remainingLine: string,
 ): string | null {

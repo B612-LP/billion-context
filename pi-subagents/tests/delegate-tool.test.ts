@@ -393,7 +393,7 @@ test("buildChildArgs keeps -p for sync delegates even on pi", async () => {
 
 test("buildWaitResult returns usage in merged mode", () => {
   resetDelegateUsage();
-  const run = { runId: "del_x", agent: "reviewer", task: "test", usage: { input: 150, output: 80, cacheRead: 0, cacheWrite: 0, totalTokens: 230, cost: { input: 0.0015, output: 0.0008, cacheRead: 0, cacheWrite: 0, total: 0.0023 } } };
+  const run = { runId: "del_x", agent: "reviewer", task: "test", usage: { input: 150, output: 80, cacheRead: 0, cacheWrite: 0, totalTokens: 230, cost: { input: 0.0015, output: 0.0008, cacheRead: 0, cacheWrite: 0, total: 0.0023 } }, usageReported: false };
   const result = buildWaitResult(run as any, "content", "merged");
   assert.ok(result.usage, "usage is present in merged mode");
   assert.equal(result.usage!.input, 150);
@@ -402,7 +402,7 @@ test("buildWaitResult returns usage in merged mode", () => {
 
 test("buildWaitResult accumulates usage in separate mode (default)", () => {
   resetDelegateUsage();
-  const run = { runId: "del_x", agent: "reviewer", task: "test", usage: { input: 150, output: 80, cacheRead: 0, cacheWrite: 0, totalTokens: 230, cost: { input: 0.0015, output: 0.0008, cacheRead: 0, cacheWrite: 0, total: 0.0023 } } };
+  const run = { runId: "del_x", agent: "reviewer", task: "test", usage: { input: 150, output: 80, cacheRead: 0, cacheWrite: 0, totalTokens: 230, cost: { input: 0.0015, output: 0.0008, cacheRead: 0, cacheWrite: 0, total: 0.0023 } }, usageReported: false };
   const result = buildWaitResult(run as any, "content");
   assert.equal(result.usage, undefined, "usage not returned in separate mode");
   assert.equal(run.usageReported, true, "sets usageReported");
@@ -430,7 +430,7 @@ test("buildWaitResult returns plain result when no usage", () => {
 
 test("buildCancelResult returns usage in merged mode", () => {
   resetDelegateUsage();
-  const run = { runId: "del_x", agent: "reviewer", task: "test", usage: { input: 150, output: 80, cacheRead: 0, cacheWrite: 0, totalTokens: 230, cost: { input: 0.0015, output: 0.0008, cacheRead: 0, cacheWrite: 0, total: 0.0023 } } };
+  const run = { runId: "del_x", agent: "reviewer", task: "test", usage: { input: 150, output: 80, cacheRead: 0, cacheWrite: 0, totalTokens: 230, cost: { input: 0.0015, output: 0.0008, cacheRead: 0, cacheWrite: 0, total: 0.0023 } }, usageReported: false };
   const result = buildCancelResult(run as any, "content", "merged");
   assert.ok(result.usage, "usage is present in merged mode");
   assert.equal(result.usage!.input, 150);
@@ -439,7 +439,7 @@ test("buildCancelResult returns usage in merged mode", () => {
 
 test("buildCancelResult accumulates usage in separate mode", () => {
   resetDelegateUsage();
-  const run = { runId: "del_x", agent: "reviewer", task: "test", usage: { input: 150, output: 80, cacheRead: 0, cacheWrite: 0, totalTokens: 230, cost: { input: 0.0015, output: 0.0008, cacheRead: 0, cacheWrite: 0, total: 0.0023 } } };
+  const run = { runId: "del_x", agent: "reviewer", task: "test", usage: { input: 150, output: 80, cacheRead: 0, cacheWrite: 0, totalTokens: 230, cost: { input: 0.0015, output: 0.0008, cacheRead: 0, cacheWrite: 0, total: 0.0023 } }, usageReported: false };
   const result = buildCancelResult(run as any, "content");
   assert.equal(result.usage, undefined, "usage not returned in separate mode");
   assert.equal(run.usageReported, true, "sets usageReported");
@@ -1333,7 +1333,7 @@ test("acp_delegate_wait timeout on a running run reports neutral text and leaves
     assert.ok(!("usage" in waitRes), "timeout settles no usage");
     assert.ok(runningRunsSnapshot().some((r) => r.runId === runId), "the timeout did not settle the run");
     // The surviving run is still cancellable; cancel reaps the sleeper child.
-    await cancelTool.execute("tc-wait-to-c", { runId: runId! });
+    await cancelTool.execute("tc-wait-to-c", { runId: runId! }, undefined, undefined, ctx);
     const reapDeadline = Date.now() + 5000;
     while (runningRunsSnapshot().some((r) => r.runId === runId) && Date.now() < reapDeadline) {
       await new Promise((r) => setTimeout(r, 25));
