@@ -936,6 +936,18 @@ export function _setStallSinkForTest(sink?: (level: "info" | "warn", line: strin
     stallSinkForTest = sink;
 }
 
+// #4129: EPIPE on a severed stderr pipe arrives as an ASYNC 'error' event, not a
+// sync throw — the try/catch around the write below cannot see it, and unhandled
+// it crashes the host process on the very diagnostic this feature exists to emit
+// (the same lesson #1233 learned in src/logger.ts). Arm a no-op guard once; never
+// over an error handler the host installed itself.
+let stderrPipeGuardArmed = false;
+function armStderrPipeGuard(): void {
+    if (stderrPipeGuardArmed) return;
+    stderrPipeGuardArmed = true;
+    if (process.stderr.listenerCount("error") === 0) process.stderr.on("error", () => {});
+}
+
 /** Install the global fetch patch. The first call wraps globalThis.fetch and
  *  returns true; later calls return false (a process installs one chain) BUT
  *  always rebind the live-state slot, so a host hot-reimport that re-applies
@@ -984,7 +996,10 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             logHostEvent(level, "[native-client]", line);
             // Headless runs (pi -p under a supervisor) have no TUI to corrupt and
             // are exactly where the silent hang bites — surface it on stderr there only.
-            if (process.stderr.isTTY !== true) process.stderr.write(`${new Date().toISOString()} [${level}] ${line}\n`);
+            if (process.stderr.isTTY !== true) {
+                armStderrPipeGuard();
+                process.stderr.write(`${new Date().toISOString()} [${level}] ${line}\n`);
+            }
         } catch {
             // swallow — observability only
         }
@@ -1410,5 +1425,8 @@ export function _resetForTest(opts: { anchor?: typeof globalThis.fetch } = {}): 
     delete g[ACTIVE_STATE];
     delete g[ACTIVE_STATE_SEQ];
     signedDirectSeen.clear();
+    stallProbeMsOverride = undefined;
+    stallCooldownMsOverride = undefined;
+    stallSinkForTest = undefined;
     resetFetchChainForTest(opts);
 }
