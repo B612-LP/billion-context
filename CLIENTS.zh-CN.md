@@ -109,6 +109,15 @@ fork 继承同一面;Antigravity 自带用户插件系统 —— `plugins/<name>
   - **`direct` 豁免:** `providers` 表(以上游 URL 为键,见 CONFIGURATION.zh-CN.md)里声明 `"direct": true` 的路由保持直连 —— 任何 lane 都能遵守的同一套豁免机制。
   通道把代理拉在自管端口区(#1660):基准口 `18787`,每 lane 粘性记录(自动跟随历史上的 +1 阶梯漂移),碰撞由子进程 +1 阶梯解决,漂移时共享 store 改写到存活 origin —— 即使没有交接,包装也能跨会话重启存活。`BILI_ZCODE_PORT` 钉死一个确切端口(严格模式:占用者被大声拒绝,不跳口)。`BILI_ZCODE_ROUTE`(`plans`/`none`)是兼容逃生舱;`BILI_ZCODE_SIGNING_FIXED=1` 在 ZCode 发布签名修复后关掉 #1621 跳过。
 - **看门狗与生命周期:** MCP 子进程每 30 s 探测一次代理。attach 模式下永远等待(绝不碰用户自己的代理);spawn 模式下代理死亡则重新拉起并把路由改写到新 origin。恢复失败时移除受管改写,让流量退回直连上游而不是打到死端口。会话结束时 ZCode 杀掉 MCP 子进程,父进程 pid 看门狗随之收掉拉起的代理;MCP 子进程退出前(SIGTERM/SIGINT/正常退出)在锁下交接:若共享 provider store 仍指向它自己的代理,优先改写到另一个存活兼容实例,没有则移除受管改写退回直连(#1623)——实例死后共享配置不留死端口。看门狗每个 tick 同时检查共享 store:若残留着其他实例的死端口(硬杀场景,上述交接没跑成——如 Windows TerminateProcess 跳过 JS handler),接管修复(优先改到存活实例,否则回退直连);只在 store 指向死端口时动手,绝不从存活实例手里抢路由。多个并发会话共享第一个拉起的代理;它消失后其余会话自动重新拉起并改路。边界:ZCode 按会话缓存 provider baseURL,上述修复只对「之后的新读取」(新会话/新查询)生效,在途会话仍会重试缓存的旧端口直到重读;要结构性规避,把 `BILLION_CONTEXT_PROXY` 钉到一个常驻代理(`bili start`)让所有会话 attach 上去(attach 模式绝不碰用户自己的代理)。
+- **防双压缩姿态(#4369):** 与其他 lane 不同,bili 对 ZCode 的原生自动压缩**什么都不注入** —— 没有可自禁用的进程内插件(两个 node 脚本跑在客户端外围,ZCode 应用 bundle 里也没有任何 `DISABLE_*COMPACT*` 式检测逻辑,#4006)。它的保护是一个隐式前提:bili 把折叠后的上下文压在 ZCode 原生 autoCompact 阈值之下 —— 实测:折叠后 ~200k,阈值为 716000(窗口配置 750000 token,#4006)。一旦这个余量丢失(窗口配置异常,或增长尖峰把转发上下文推过阈值),ZCode 的原生 compaction 会直接穿过 bili 执行 —— 正是其他 lane 显式拦下的那类双重压缩问题:
+
+  | Lane | 如何挡下宿主原生 compaction |
+  |------|---------------------------|
+  | claude | 受管 settings 块置 `DISABLE_AUTO_COMPACT=1` |
+  | dsh | wire-level guard(#1729)本地应答原生 compaction 调用 —— 默认回 bili 折叠快照(#3733/#3901),`BILI_DSH_AUTHORED_COMPACTION=0` 时以 422 拒绝 |
+  | opencode | 安装器关掉 `compaction.auto`(纯代理配置需手动设置) |
+  | pi / omp | 扩展经 `session_before_compact` / `auto_compaction_start` hook 取消 |
+  | zcode | **不注入任何东西** —— bili 把折叠后上下文压在原生 autoCompact 阈值之下(上述隐式前提;无强制手段) |
 - **已知局限:** ZCode 的反欺诈指纹(#661)作用于 `zcode.z.ai` 登录流量的 MITM 重建 body —— 原生模式不碰那个面(模型流量走 provider store,不走 GUI 代理);若你同时使用 GUI 代理/MITM 配置,请保留 `"mitm://zcode.z.ai": { "passthrough": true }` 路由。v3.14+ 构建上,coding-plan 账号的 ClientRequestSigningV4 在模型创建阶段拒绝非 HTTPS origin,且其握手路径只从 origin 派生(丢弃任何 /bili/ 前缀),因此 /bili/ 包装的 baseURL 会以 "Client signing handshake requires HTTPS." 失败(#1621)。该冲突硬编码在 ZCode 侧,原生模式把这些账号**逐条跳过** —— 记录原因、这些账号保持直连;在这些账号上请用 GUI 证书 MITM 配置获得压缩能力,直到 ZCode 发布签名修复,届时设 `BILI_ZCODE_SIGNING_FIXED=1` 即可恢复路由。默认 `route:"all"` 下只有这些账号被跳过 —— store 上其余 provider 继续路由;整体退场(路由全关)只在 `route:"plans"` 下发生,因为那里 plan 账号本身就是签名账号。pre-3.14 legacy-store 客户端不受影响。`BILLION_CONTEXT_PROXY` 已设置(attach 模式管着代理)或定义了 `BILI_PROVIDER_REWRITES` 时插件整体退场。退出开关:`BILI_NATIVE_ZCODE=0`。
 
 ## Codex(OpenAI Codex CLI)

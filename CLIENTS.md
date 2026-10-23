@@ -443,6 +443,24 @@ two small node scripts that do the work around the client:
    port until it re-reads. To avoid this structurally, pin `BILLION_CONTEXT_PROXY`
    at a resident proxy (`bili start`) and let every session attach to it
    (attach mode never touches a user-owned proxy).
+- **Double-compression posture (#4369):** unlike every other lane, bili injects
+  **nothing** to stop ZCode's native auto-compaction — there is no in-process
+  plugin to self-disable (the two node scripts run outside the client, and the
+  ZCode app bundle contains no `DISABLE_*COMPACT*`-style detection, #4006). The
+  protection is an implicit precondition instead: bili keeps the folded context
+  below ZCode's native autoCompact threshold — measured ~200k post-fold against
+  a 716000 threshold on a 750000-token window (#4006). If that margin is lost
+  (a misconfigured window or a growth spike that pushes the forwarded context
+  past the threshold), ZCode's native compaction runs straight through bili —
+  the same double-compression class the other lanes block explicitly:
+
+  | Lane | How the host's native compaction is kept out |
+  |------|----------------------------------------------|
+  | claude | managed settings block sets `DISABLE_AUTO_COMPACT=1` |
+  | dsh | wire-level guard (#1729) answers native compaction calls locally — bili's folded snapshot by default (#3733/#3901), 422 refusal under `BILI_DSH_AUTHORED_COMPACTION=0` |
+  | opencode | installer turns off `compaction.auto` (set it manually on pure-proxy setups) |
+  | pi / omp | extension cancels via `session_before_compact` / `auto_compaction_start` hooks |
+  | zcode | **nothing injected** — bili keeps the folded context under the native autoCompact threshold (implicit precondition above; not enforced) |
 - **Known limitations:** ZCode's anti-fraud fingerprinting (#661) applies to
   MITM-rebuilt bodies on `zcode.z.ai` login traffic — native mode does not
   touch that surface (model traffic flows through the provider store, not the
