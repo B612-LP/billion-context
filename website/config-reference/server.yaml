@@ -368,7 +368,7 @@ entries:
     default: "unset (built-in 「压缩代理」/「Compression」)"
     group: behavior
     desc_en: "Custom display name for the DSH top-bar Compression tab (#4237), e.g. \"压缩账本\" when another plugin (dsh-context) owns the name 「上下文」. Trimmed non-empty string wins over the built-in label; blank or absent falls back to the built-in. File-only tier (display preference, no env knob per #2030). Default unset = built-in label unchanged."
-    desc_zh: "DSH 顶栏上下文标签页的自定义显示名（#4237），例如另一插件（dsh-context）已占用「上下文」时改为\"压缩账本\"。去空白后的非空字符串优先于内置名；留空或缺省回退内置名。仅文件层（显示偏好，按 #2030 不设 env 开关）。默认缺省 = 内置名不变。"
+    desc_zh: "DSH 顶栏压缩代理标签页的自定义显示名（#4237），例如另一插件（dsh-context）已占用「上下文」时改为\"压缩账本\"。去空白后的非空字符串优先于内置名；留空或缺省回退内置名。仅文件层（显示偏好，按 #2030 不设 env 开关）。默认缺省 = 内置名不变。"
   - key: resign
     type: "scheme → { enabled?, passthrough?, credentialRef? }"
     default: "{} (armed; built-in scheme sdk-hmac-sha256)"
