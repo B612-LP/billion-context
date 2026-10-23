@@ -273,8 +273,10 @@ interface CacheLedger {
         seamSuspects: number;
         seamMissed: number;
         /** #3837: unexplained-residual pairs that fell under the substantive
-         *  floor (tr ≤ 8192 or tr ≤ 0.3·input) — counted so small breaks stay
-         *  visible in the report instead of vanishing at the gate; never warned. */
+         *  floor (0 < tr ≤ 8192 or tr ≤ 0.3·input) — counted so small breaks
+         *  stay visible in the report instead of vanishing at the gate; never
+         *  warned. tr === 0 means the miss is fully explained by new content
+         *  (missed = nc + cr + tr) — a healthy turn, never counted. */
         seamFloored: number;
         seamFlooredMissed: number;
         /** #1592 follow-up: misses with no client-side prefix break — the current
@@ -855,14 +857,18 @@ function detectSeam(session: Session, led: CacheLedger): void {
     // post-switch cold-tail continuations (they carry no sw/pw/uw flag); legacy lines lack it and keep old behavior.
     if (line.sw === 1 || line.pw === 1 || line.uw === 1 || line.rs === 1 || line.cause !== undefined || line.foldSeq !== null) return;
     // Substantive unexplained residual only: a big ttlRepay slice of a big bill.
-    // #3837: below-floor pairs no longer vanish silently — counted in seam.floored
-    // and announced once at info level so small unexplained breaks stay visible.
+    // #3837: below-floor pairs with a REAL residual no longer vanish silently —
+    // counted in seam.floored and announced once at info level so small
+    // unexplained breaks stay visible. tr === 0 means the miss is fully explained
+    // by new content (missed = nc + cr + tr): a healthy turn, kept silent as before.
     const agg = led.agg;
     if (!(line.tr > 8192 && line.tr > 0.3 * line.input)) {
-        agg.seamFloored += 1;
-        agg.seamFlooredMissed += line.tr;
-        if (agg.seamFloored === 1) {
-            loggerLog("info", `[${session.id}] [cache-seam] unexplained break under the warn floor (unexplained=${Math.round(line.tr)} tok, input=${line.input}) — counted in seam.floored, not warned (#3837)`);
+        if (line.tr > 0) {
+            agg.seamFloored += 1;
+            agg.seamFlooredMissed += line.tr;
+            if (agg.seamFloored === 1) {
+                loggerLog("info", `[${session.id}] [cache-seam] unexplained break under the warn floor (unexplained=${Math.round(line.tr)} tok, input=${line.input}) — counted in seam.floored, not warned (#3837)`);
+            }
         }
         return;
     }

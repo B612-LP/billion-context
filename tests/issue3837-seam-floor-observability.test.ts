@@ -4,7 +4,8 @@
 // (agg.seamFloored / seamFlooredMissed) + one-time info log + additive report
 // field (seam.floored) + formatSeam section. Warn thresholds untouched.
 // Gate discipline (#3617): positive = floored pair counted & NOT flagged;
-// negative control = above-floor pair STILL flags as a suspect (unchanged).
+// negative control = above-floor pair STILL flags as a suspect (unchanged);
+// gate negative = healthy fully-cached turn (tr=0) NOT counted at all.
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { noteForwardedBody, settleUsageReport, getCacheLedger, buildSessionCacheReport, handleAcpCache } from "../src/cache-ledger.ts";
@@ -58,6 +59,27 @@ test("#3837: a small mid-history break below the warn floor is counted, not flag
     assert.ok(report.seam.floored.missed > 0, "floored volume surfaced in the report");
     const text = handleAcpCache(s).text;
     assert.match(text, /SEAM SAMPLES UNDER FLOOR/, "report section names the floored samples");
+});
+
+test("#3837 gate negative: a healthy fully-cached append turn (tr=0) is not counted as floored", () => {
+    const s = makeSession();
+    noteForwardedBody(s, body(["alpha-one", "beta-two", "gamma-three", "delta-four"]));
+    settle(s, 20_000, 0); // opener (nb-marked)
+    // Provider serves the ENTIRE previous prefix; the only fresh bill is the
+    // appended message itself — missed = growth, so the miss is fully explained
+    // by new content (tr = 0). A healthy turn must stay out of seam.floored.
+    noteForwardedBody(s, body(["alpha-one", "beta-two", "gamma-three", "delta-four", "epsilon-five"]));
+    settle(s, 20_500, 20_000);
+    const led = getCacheLedger(s);
+    const line = led.lines[led.lines.length - 1]!;
+    assert.equal(line.missed, 500, "the turn billed fresh content");
+    assert.equal(line.tr, 0, "the miss is fully explained by new content");
+    assert.equal(led.agg.seamFloored, 0, "healthy turns are NOT floored samples");
+    assert.equal(led.agg.seamFlooredMissed, 0);
+    assert.equal(led.agg.seamSuspects, 0);
+    assert.equal(led.seamEvents?.length ?? 0, 0);
+    const report = buildSessionCacheReport(s);
+    assert.equal(report.seam.floored.count, 0, "report stays clean for a healthy session");
 });
 
 test("#3837 negative control: an above-floor mid-history break still flags as a suspect", () => {
