@@ -1593,6 +1593,10 @@ export function noteOutboundContextEstimates(
     session.stats.contextEstimateCalibrated = est.calibrated;
     session.stats.contextTokens = est.upperBound;
     session.stats.contextTokensSource = "estimate";
+    // #4383: cycle-depth bookkeeping — one more completed main-lane send since
+    // the last usage settle; gradeAnchorCycleStale demotes only at ≥ 2 so a
+    // single silent cycle (in-flight settle lag, #1839 G1) keeps its anchor.
+    session.stats.sendsSinceUsageSettle = (session.stats.sendsSinceUsageSettle ?? 0) + 1;
 }
 
 export function settleUsageReport(
@@ -1620,6 +1624,9 @@ export function settleUsageReport(
         delete session.stats.emergencyShrinkEstimate;
         session.stats.contextTokens = session.stats.lastInputTokens;
         session.stats.contextTokensSource = "usage";
+        // #4383: the report just landed — cycle depth restarts from zero, so
+        // both staleness predicates go quiet until sends outpace settles again.
+        session.stats.sendsSinceUsageSettle = 0;
         if (session.metadata) session.metadata.contextTokensAt = Date.now();
         recordContextObservation(session, session.stats.lastInputTokens, (session.stats.compressCreditTokens ?? 0) > 0 ? "estimate" : "usage");
         // #1933 F2: record which route measured this baseline — the gate uses

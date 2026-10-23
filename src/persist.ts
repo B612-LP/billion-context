@@ -155,6 +155,7 @@ interface PersistedSession {
         overflowArmMismatchWarned?: boolean;
         contextTokens?: number;
         contextTokensSource?: string;
+        sendsSinceUsageSettle?: number;
         // #2129: measurement-state fields buildRecord persists via spread —
         // declared here so the on-disk schema documents what the loader must
         // restore (the five decision-grade ones below plus the in-memory-only
@@ -2792,6 +2793,10 @@ function buildSession(parsed: PersistedSession): Session {
             contextTokens: Math.max(0, stats.contextTokens ?? parsed.contextTokens ?? 0),
             // #1839: display provenance — legacy files lack it; absent = no marker.
             contextTokensSource: stats.contextTokensSource === "usage" || stats.contextTokensSource === "estimate" ? stats.contextTokensSource : undefined,
+            // #4383: cycle-depth counter — legacy files lack it; absent counts as 0,
+            // which keeps restored anchors authoritative until two more silent
+            // sends accrue (self-healing within one exchange pair).
+            sendsSinceUsageSettle: typeof stats.sendsSinceUsageSettle === "number" && Number.isFinite(stats.sendsSinceUsageSettle) && stats.sendsSinceUsageSettle > 0 ? stats.sendsSinceUsageSettle : undefined,
             // #2129: measurement-state fields buildRecord persists via spread but this
             // reader used to drop — after a restart the preflight gate judged on the
             // UNCALIBRATED local estimate (k̂ lost → folded fitting payloads) and nudge

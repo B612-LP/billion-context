@@ -365,6 +365,13 @@ export type Session = {
          *  never-reporting upstreams). Display surfaces mark estimate-grade
          *  values instead of presenting them as measurements. */
         contextTokensSource?: "usage" | "estimate";
+        /** #4383: main-lane sends since the last usage settle — the cycle-DEPTH
+         *  signal the binary contextTokensSource flip cannot carry: it tells
+         *  "one silent cycle" (anchor still rides, #1839 G1) apart from "the
+         *  usage flow is dead" (anchor demoted, #4383 arm-swallow egress).
+         *  Incremented in noteOutboundContextEstimates, zeroed in
+         *  settleUsageReport. Legacy sessions lack it; absent counts as 0. */
+        sendsSinceUsageSettle?: number;
         /** #728: char-count upper bound of the LAST turn's outbound payload
          *  (post-fold processed messages + system/tools overhead + images),
          *  recorded locally in prepare* each turn. Read ONLY while
@@ -730,14 +737,46 @@ export function usageAnchorCycleStale(stats: Session["stats"]): boolean {
     return (stats.localInputEstimate ?? 0) > 0;
 }
 
+/** #4383 second egress (arm-swallow): a settled grade anchor is likewise
+ *  stale when the primary anchor slot holds something that is NOT itself a
+ *  fresh measurement AND the usage flow is provably dead — canonical shape:
+ *  armFailureShrink adopted the per-send estimate into lastInputTokens
+ *  (source "estimate") on an upstream failure, leaving lastUsageGradeTokens
+ *  frozen at an early sidecar sample; the grade branch of effectiveTokenCount
+ *  then resurrected the frozen value because usageAnchorCycleStale only looks
+ *  at source === "usage" (probe: after the first failed turn every reader
+ *  still served 4733 at a real ~300K). Neither the binary contextTokensSource
+ *  flip nor a magnitude ratio can carry the distinction here: the flip is
+ *  already set one send after ANY settle, and a legitimate measurement can
+ *  sit far below the char-count bound for a grown payload (#1839 G1 pins a
+ *  measured 5K anchor that MUST keep sizing one failed turn later even though
+ *  the per-send bound reads ~3.5× higher). Cycle DEPTH is what separates the
+ *  two shapes: sendsSinceUsageSettle ≥ 2 proves at least two completed
+ *  main-lane cycles ended without a report (flow dead → demote), while 0–1
+ *  keeps the anchor authoritative (fresh settle / in-flight settle lag).
+ *  Fresh usage anchors have their own freshness story (usageAnchorCycleStale)
+ *  and overflow arms are themselves per-send measurements (#1839) — neither
+ *  qualifies here. Same remedy: ride the per-send upper bound (fail-closed
+ *  caliber, #553/#728) until a real report re-anchors. */
+const STALE_GRADE_MIN_SILENT_SENDS = 2;
+export function gradeAnchorCycleStale(stats: Session["stats"]): boolean {
+    const grade = stats.lastUsageGradeTokens ?? 0;
+    if (grade <= 0 || stats.contextTokensSource !== "estimate") return false;
+    const s = stats.lastInputTokensSource;
+    if (s === "usage" || s === "overflow-arm") return false;
+    return (stats.localInputEstimate ?? 0) > 0 && (stats.sendsSinceUsageSettle ?? 0) >= STALE_GRADE_MIN_SILENT_SENDS;
+}
+
 export function statusInputBaseline(session: Session): number {
     const stats = session.stats;
     // #4383: a cycle-stale usage anchor must not mask the live payload on
     // status surfaces either — the panel read usage=1% at a real ~300K for
     // four hours while the request path (effectiveTokenCount) kept sizing on
     // the same frozen anchor. Ride the per-send upper bound (fail-closed
-    // caliber, #553/#728) until a real report re-anchors.
-    if (usageAnchorCycleStale(stats)) return stats.localInputEstimate ?? 0;
+    // caliber, #553/#728) until a real report re-anchors. The grade variant
+    // covers the arm-swallow egress where a failed turn moved the primary
+    // anchor off the usage slot first.
+    if (usageAnchorCycleStale(stats) || gradeAnchorCycleStale(stats)) return stats.localInputEstimate ?? 0;
     return stats.lastInputTokensSource === "usage" || stats.lastInputTokensSource === "overflow-arm"
         ? stats.lastInputTokens
         : stats.lastUsageGradeTokens ?? 0;
@@ -1370,6 +1409,9 @@ export function resetSessionCompression(session: Session): void {
     delete session.metadata.postRebuildAnchor;
     session.stats.contextTokens = 0;
     delete session.stats.contextTokensSource;
+    // #4383: a fresh compaction epoch starts at zero cycle depth — a stale
+    // counter from the pre-compaction epoch must not demote the next anchor.
+    delete session.stats.sendsSinceUsageSettle;
     session.metadata.nativeCompactionAt = Date.now();
     markDirty(session);
 }
