@@ -107,12 +107,12 @@ function isReasoning(m: CoreMessage): boolean {
 }
 
 function isCarrier(m: CoreMessage): boolean {
-    if (m.summaryOfBlockId !== undefined) return true;
-    const t = m.text ?? "";
-    // #4388: the #564 run-boundary marker rides the exemption ledger like a
-    // carrier — it is bili's own outbound-only injection (#2627), never part
-    // of the client's resent history.
-    return t.startsWith(CHAIN_TAG_PREFIX) || t.includes(SUMMARY_MARKER) || isResponsesTurnSeparatorText(t);
+  if (m.summaryOfBlockId !== undefined) return true;
+  const t = m.text ?? "";
+  // #4388: the #564 run-boundary marker rides the exemption ledger like a
+  // carrier — it is bili's own outbound-only injection (#2627), never part
+  // of the client's resent history.
+  return t.startsWith(CHAIN_TAG_PREFIX) || t.includes(SUMMARY_MARKER) || isResponsesTurnSeparatorText(t);
 }
 
 function isSummaryCarrier(m: CoreMessage): boolean {
@@ -209,7 +209,10 @@ export function judgeInboundOutbound(
       // history (#4388). A nearTwin means something resembling e DID sit in
       // the frozen window and differ — that stays a violation; attributing
       // client-mutated heads vs bili rewrites is the loop lane's job, not a
-      // reason to silence the alarm here.
+      // reason to silence the alarm here. A foreign NON-exempt element in the
+      // consumed window cannot ride along silently either: j >= matched always
+      // holds, so it sits at an outbound position the carrier-pin check below
+      // still scans and flags (carrier-drift).
       if (folded && k >= freezeEnd && !nearTwin) { foldStart = i; break; }
       violations.push({
         kind: nearTwin ? "mid-history-rewrite" : "mid-history-drop",

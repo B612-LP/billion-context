@@ -372,3 +372,16 @@ test("#4388 NEG: an unfolded frozen prefix with a missing stable message still f
   assert.equal(v.ok, false);
   assert.ok(v.violations.some((x) => x.kind === "mid-history-drop" || x.kind === "mid-history-rewrite"));
 });
+
+test("#4388 NEG: a missing stable message beside a FOREIGN unexplained element before the fold carrier still flags via carrier pinning (close-out safety backstop)", () => {
+  const entry = [mk("user", "text", "one"), mk("assistant", "text", "two"), mk("user", "text", "three")];
+  const exit = [
+    mk("user", "text", "one"),
+    mk("user", "text", "foreign element"),
+    mk("user", "text", "[Compressed conversation section]\nold stuff summarized", { summaryOfBlockId: "b1" }),
+    mk("user", "text", "three"),
+  ];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false, JSON.stringify(v.violations));
+  assert.ok(v.violations.some((x) => x.kind === "carrier-drift"));
+});
