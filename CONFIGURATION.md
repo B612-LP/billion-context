@@ -175,6 +175,9 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `guardrails.maxOutputBytes` | number | 50000 | BILI_GUARDRAIL_MAX_OUTPUT_BYTES | Combined text-output byte cap per tool result in the pi/omp plugin (0 disables the cap). Over-cap output is truncated head-first with a notice pointing at the host-saved full output. |
 | `guardrails.repetition` | boolean | true | BILI_GUARDRAIL_REPETITION | Identical-call loop-breaker for the pi/omp plugin (warn at 3, abort at 5 consecutive byte-identical calls). false / env 0 disables it. |
 | `guardrails.textRunThreshold` | number | 200 | BILI_GUARDRAIL_TEXT_RUN_THRESHOLD | Single-codepoint repetition breaker over decoded model text on the response stream (#3260; kill switch added by #3406 item 1 after the #3331 review). Trips at N consecutive identical codepoints - legit prose/code stays far below the 200 default, a symbol-loop model does not. Set N to tune, 0 (or negative) to disable: legit long same-char output (code comment separators, ASCII rules) is then never cut mid-stream. The thinking/reasoning channels sit inside this lane too. |
+| `watchdog` | object | {} (all defaults) | — | Native-lane proxy respawn watchdog cadence (per-session zcode/claude/kimi MCP entries, #4006). |
+| `watchdog.intervalMs` | number | 30000 (floor 1000) | BILI_WATCHDOG_INTERVAL_MS | Health-probe tick of the lane watchdogs; worst-case recovery window after an externally killed lane proxy = interval × failureLimit (~90 s at defaults — the 64 s measured in #4006). Values below 1000 fall back to the default (seconds-vs-ms typo guard). |
+| `watchdog.failureLimit` | number | 3 | BILI_WATCHDOG_FAILURE_LIMIT | Consecutive failed probes before the lane watchdog respawns the proxy. |
 | `persist` | object | {} (all defaults) | — | Session persistence to disk under the XDG state dir. |
 | `persist.enabled` | boolean | true | BILI_PERSIST | Master switch for writing session records to disk (0/false turns it off). |
 | `persist.zstd` | boolean | false | BILI_PERSIST_ZSTD | Zstd-compress persisted session files (1/true enables). |
@@ -994,6 +997,13 @@ Security boundary: the file controls ONLY *when* to upgrade and *which published
 - **Default:** `{ retries: 0, bufCapBytes: 16777216 }`
 - **Status:** ACTIVE
 - **Description:** Fake-completion safety net for hosts that abort mid-stream (#371) — **opt-in**, `retries: 0` (default) is the pre-#371 passthrough. `bufCapBytes` is the OOM guard on the buffered response. Twins `BILI_FAKE_COMPLETION_RETRIES`, `BILI_FAKE_BUF_CAP`.
+
+### `watchdog`
+
+- **Type:** `{ intervalMs?: number; failureLimit?: number }`
+- **Default:** `{ intervalMs: 30000, failureLimit: 3 }`
+- **Status:** ACTIVE (#4006)
+- **Description:** Cadence of the per-session native-lane proxy respawn watchdog — the tick runs inside each client-spawned MCP entry process (zcode #1145, claude #1821, kimi #963), NOT inside the proxy itself. Every tick probes the lane proxy's local health endpoint (2 s timeout); after `failureLimit` consecutive failed probes the entry respawns the proxy through the same launcher path used at session boot (re-routing/re-pinning as needed). Worst-case recovery window after an externally killed lane proxy is therefore interval × failureLimit (~90 s at defaults — the 64 s measured in #4006). Both keys resolve env > file > default; `intervalMs` is read once when the watchdog arms (takes effect on the next session's entry) while `failureLimit` is read per tick (a config-file edit takes effect within one tick even for a running entry). `intervalMs` below 1000 falls back to the default — a seconds-vs-ms typo must not degenerate the probe into a hot loop. Twins `BILI_WATCHDOG_INTERVAL_MS`, `BILI_WATCHDOG_FAILURE_LIMIT`.
 
 ### `codexCompact` / `ccrRetrievalTtlMs` / `decompressTmpCap`
 
@@ -1838,6 +1848,8 @@ File keys resolve only when the matching env var is unset. Defaults in parenthes
 | `BILI_UPSTREAM_PROXY` | `proxy` | unset (direct) |
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
+| `BILI_WATCHDOG_FAILURE_LIMIT` | `watchdog.failureLimit` | 3 |
+| `BILI_WATCHDOG_INTERVAL_MS` | `watchdog.intervalMs` | 30000 (floor 1000) |
 | `BILI_WS_OUTBOUND_BYTES` | `network.wsOutboundBytes` | 10485760 |
 | `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
