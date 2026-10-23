@@ -492,7 +492,7 @@ export function resetForkCapabilityCacheForTest(): void {
  *  Only definitive results are cached per base (register.base changes when the
  *  extension re-registers with a new proxy); a failed read is never cached, so a
  *  later probe re-hits the wire and self-heals once the proxy is reachable. */
-export type ForkCapabilityProbe = { capable: boolean; definitive: boolean };
+type ForkCapabilityProbe = { capable: boolean; definitive: boolean };
 
 export async function probeForkCapability(base: string, fetchImpl?: typeof fetch): Promise<ForkCapabilityProbe> {
     const cached = forkCapabilityCache.get(base);
