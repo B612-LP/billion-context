@@ -32,7 +32,7 @@ export type FailFastClass =
     | "deterministic-exhaustion" // #3461: math proved no combination of folds closes the gap (413)
     | "upstream-throttle"        // upstream 429 surfaced through preflight (503)
     | "transient"                // relay-dependent exhaustion: empty/truncated summaries, budget draws, pool saturation (502)
-    | "dead-end-cooldown";       // #726 cached diagnosis replayed without re-running the walk
+    | "dead-end-cooldown";       // #726 cached diagnosis replayed (mechanism removed in #4079 — no exit site on current master)
 
 export type PreflightVerdict =
     /** Payload fits the window (or never triggered); forward as-is. */
@@ -43,7 +43,7 @@ export type PreflightVerdict =
     | { kind: "forward-once-arbitrate"; reason: ForwardOnceReason }
     /** Refuse locally with a diagnostic; nothing was forwarded. */
     | { kind: "fail-fast"; status: number; retryable: boolean; cls: FailFastClass }
-    /** Dead-end cooldown active: identical request already proved un-foldable (#726). */
+    /** Dead-end cooldown active: identical request already proved un-foldable (#726; mechanism removed in #4079 — no exit site on current master, kind retained for ledger mapping until step 2). */
     | { kind: "cooldown" }
     /** Growth-armed zero progress with no foldable candidates: lean steady state, no backoff (#2638). */
     | { kind: "steady-state" }
