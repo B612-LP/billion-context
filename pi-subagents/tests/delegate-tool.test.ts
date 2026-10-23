@@ -4,7 +4,7 @@ import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, writeFile, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult, effectiveExitCode, formatRunResult, resolveWaitTimeoutMs, findUndeliveredRuns, undeliveredNoticeFrom, buildRecoveryNotice, makeDelegateTool, exitLabel, cancelledFileNote, delegateStdinText, readActivityTail, scheduleRunNotification, flushDelegateNotifications, formatBatchRunSection, setDelegatePolicy, delegateChildEnv, asyncWatchdogDescription, ConcurrencyGate, setDelegateDefaults, resetDelegateDefaults, isValidThinkingLevel, resolvePerCallTimeoutMs, addDelegateUsage, emitInlineUsageNote, makeDelegateWaitTool, makeDelegateCancelTool, runningRunsSnapshot } from "../src/delegate-tool.js";
+import { buildChildArgs, delegateSpawnOptions, injectedWaitMessage, buildWaitResult, buildCancelResult, getDelegateUsage, resetDelegateUsage, injectResult, effectiveExitCode, formatRunResult, resolveWaitTimeoutMs, findUndeliveredRuns, undeliveredNoticeFrom, buildRecoveryNotice, makeDelegateTool, exitLabel, cancelledFileNote, delegateStdinText, readActivityTail, scheduleRunNotification, flushDelegateNotifications, formatBatchRunSection, setDelegatePolicy, delegateChildEnv, asyncWatchdogDescription, ConcurrencyGate, setDelegateDefaults, resetDelegateDefaults, isValidThinkingLevel, resolvePerCallTimeoutMs, addDelegateUsage, emitInlineUsageNote, makeDelegateWaitTool, makeDelegateCancelTool, runningRunsSnapshot, formatEmptyReplyDiagnostics, NO_FINAL_OUTPUT_BODY, NO_FINAL_OUTPUT_DIAG_UNKNOWN, NO_FINAL_OUTPUT_DIAG_PRINT } from "../src/delegate-tool.js";
 import { DEFAULT_DELEGATE_POLICY } from "../src/config.js";
 import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
@@ -583,6 +583,31 @@ test("effectiveExitCode: null code with delivered output counts as completed", (
   assert.equal(effectiveExitCode(null, "", ""), null, "no output at all → null (genuine failure)");
   assert.equal(effectiveExitCode(0, "", ""), 0, "real exit 0 untouched");
   assert.equal(effectiveExitCode(1, "partial", ""), 1, "real non-zero code untouched");
+});
+
+// ─── #4359: empty-reply diagnostics separate upstream error/incomplete from
+// completed-but-empty; unobserved fields render as unknown ──────────────────
+
+test("formatEmptyReplyDiagnostics: issue case A (upstream error/incomplete)", () => {
+  const line = formatEmptyReplyDiagnostics({ stopReason: "error", rawStopReason: "incomplete", errorMessage: "Response incomplete without a provider reason", textBlocks: 0, thinkingBlocks: 0, usageIn: 1, usageOut: 1 });
+  assert.equal(line, 'upstream terminal state: stopReason=error, rawStopReason=incomplete, errorMessage="Response incomplete without a provider reason", text_blocks=0, thinking_blocks=0, last_turn_usage(in=1, out=1)');
+});
+
+test("formatEmptyReplyDiagnostics: issue case B/C (completed-but-empty)", () => {
+  const line = formatEmptyReplyDiagnostics({ stopReason: "stop", rawStopReason: "completed", textBlocks: 0, thinkingBlocks: 0, usageIn: 18928, usageOut: 0 });
+  assert.equal(line, "upstream terminal state: stopReason=stop, rawStopReason=completed, text_blocks=0, thinking_blocks=0, last_turn_usage(in=18928, out=0)");
+});
+
+test("formatEmptyReplyDiagnostics: missing stopReason renders unknown; no usage omits the usage bit", () => {
+  const line = formatEmptyReplyDiagnostics({ textBlocks: 0, thinkingBlocks: 2 });
+  assert.equal(line, "upstream terminal state: stopReason=unknown, text_blocks=0, thinking_blocks=2");
+});
+
+test("formatEmptyReplyDiagnostics: nothing observed → caller substitutes its own note", () => {
+  assert.equal(formatEmptyReplyDiagnostics(undefined), "");
+  assert.match(NO_FINAL_OUTPUT_DIAG_UNKNOWN, /unknown/);
+  assert.match(NO_FINAL_OUTPUT_DIAG_PRINT, /unavailable/);
+  assert.ok(!NO_FINAL_OUTPUT_BODY.includes("likely"), "base body must not assert a cause — the diagnostic line carries it");
 });
 
 test("injectResult null code + completed status: completed header, exit ?, no missing-result warning", () => {
