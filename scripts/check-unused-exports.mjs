@@ -92,6 +92,11 @@ const WAIVERS = new Map([
     // structurally through dshCompactionGateTelemetry()'s return type; keep
     // the export so the channel payload stays named at its definition site.
     ["src/agent/dsh-compaction-disable.ts", new Set(["DshCompactionGateTelemetry"])],
+    // #4254 upstream health: the /__bili/upstreams report payload interfaces
+    // are referenced only inside src/upstream-alerts.ts (admin.ts and tests/
+    // consume them structurally via getUpstreamHealthReport()); keep the
+    // exports so the wire shape stays named at its definition site.
+    ["src/upstream-alerts.ts", new Set(["UpstreamHealthEntry", "UpstreamHealthReport"])],
 ]);
 
 const findings = [];
