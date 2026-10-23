@@ -1476,6 +1476,74 @@ function rewriteBlocks(blocks: BlockLike[], claims: Map<string, string[]>): bool
     return touched;
 }
 
+/** #4348: a re-anchor can strand a coverage island whose boundary lands MID-TURN.
+ *  rewriteBlocks splices claimed ids in place and leaves UNMATCHED old ids as dead
+ *  refs, so a block may end up covering a tool-call while its tool-result (or vice
+ *  versa) stays uncovered. The kernel's turn-integrity gate (INV2,
+ *  kernel/src/turn-integrity.ts) then rejects any fold of the uncovered half
+ *  ("Range would split N turns at the protected-zone boundary"), making that debris
+ *  permanently unfoldable and resent verbatim on every turn (#4348). Restore the
+ *  invariant the original fold's guard guarantees at creation time: for every
+ *  call/result pair present this pass, a block covers EITHER BOTH halves OR NEITHER.
+ *  A split pair is repaired by DROPPING the covered half from its owning block —
+ *  conservative (removes coverage, never claims bytes whose content changed, honoring
+ *  the exact-match doctrine) — turning the pair into a complete unfolded pair the next
+ *  fold absorbs turn-aligned. Idempotent across passes; heals both FRESH islands from
+ *  this pass's claims and EXISTING stranded ones (runs every repair pass). Returns the
+ *  number of covered ids dropped. */
+export function enforceTurnAlignedCoverage(blocks: BlockLike[], msgs: CoreMessage[]): number {
+    const callByToolCallId = new Map<string, string>();
+    const resultByToolCallId = new Map<string, string>();
+    for (const m of msgs) {
+        const tcid = m.toolCallId;
+        if (tcid === undefined || tcid === "") continue;
+        if (m.contentType === "tool-call") callByToolCallId.set(tcid, m.id);
+        else if (m.contentType === "tool-result") resultByToolCallId.set(tcid, m.id);
+    }
+    // A live id sits in at most ONE active block's coverage.
+    const ownerOf = new Map<string, BlockLike>();
+    for (const b of blocks) {
+        if (b.active === false) continue;
+        for (const id of b.effectiveMessageIds ?? []) {
+            if (!isResponsesTurnSeparatorId(id)) ownerOf.set(id, b);
+        }
+    }
+    const removeFrom = new Map<BlockLike, Set<string>>();
+    let dropped = 0;
+    // Drop `coveredId` from its owning block ONLY when its partner is present this
+    // pass yet uncovered (the orphan case). Both-covered = aligned (leave it);
+    // partner absent = lone half, foldable on its own (leave it).
+    const dropHalf = (coveredId: string | undefined, otherId: string | undefined): void => {
+        if (coveredId === undefined || otherId === undefined) return;
+        if (!ownerOf.has(coveredId)) return;
+        if (ownerOf.has(otherId)) return;
+        const owner = ownerOf.get(coveredId)!;
+        ownerOf.delete(coveredId);
+        let ids = removeFrom.get(owner);
+        if (ids === undefined) { ids = new Set(); removeFrom.set(owner, ids); }
+        ids.add(coveredId);
+        dropped++;
+    };
+    for (const [tcid, callId] of callByToolCallId) {
+        const resultId = resultByToolCallId.get(tcid);
+        dropHalf(callId, resultId);      // call covered, result orphaned -> drop call
+        dropHalf(resultId, callId);      // result covered, call orphaned -> drop result
+    }
+    if (dropped === 0) return 0;
+    for (const [block, ids] of removeFrom) {
+        for (const list of [block.effectiveMessageIds, block.directMessageIds]) {
+            if (list === undefined) continue;
+            for (let i = list.length - 1; i >= 0; i--) {
+                if (ids.has(list[i])) list.splice(i, 1);
+            }
+        }
+        // An emptied island covers nothing; deactivate so downstream surfaces
+        // (syncBlocks re-activation, nudge/report) stop treating it as live (#2297).
+        if ((block.effectiveMessageIds?.length ?? 0) === 0) block.active = false;
+    }
+    return dropped;
+}
+
 export interface ReconcileOptions {
     mode?: FoldReconcileMode;
     sessionId?: string;
@@ -1845,6 +1913,22 @@ export function reconcileFoldCoverage(session: Session, msgs: CoreMessage[], opt
             for (const newId of targets) prior.add(newId);
         }
         (session.state as { lastPassIds?: string[] }).lastPassIds = [...prior];
+    }
+
+    // #4348: repair mode owns the wire rendering here (proxy lane). A re-anchor
+    // pass can leave a coverage island landing MID-TURN (a block covering a
+    // tool-call whose result stays uncovered, or vice versa); the turn-integrity
+    // gate then makes the orphan half permanently unfoldable. Restore turn-aligned
+    // coverage by dropping the covered half of any split pair. Runs EVERY repair
+    // pass (not only when claims land) so EXISTING stranded debris heals on the
+    // next request, not just fresh islands from this pass's claims. Plugin-mode
+    // blocks mirror the agent's private state and are left untouched.
+    if (mode === "repair" && session.metadata.pluginAgent === undefined) {
+        const turnDrops = enforceTurnAlignedCoverage(blocks, msgs);
+        if (turnDrops > 0) {
+            const st = opts.sessionId === undefined ? "" : `[${opts.sessionId}] `;
+            opts.log?.("warn", `${st}fold reconcile: dropped ${turnDrops} mid-turn covered id(s) to restore turn-aligned coverage (#4348)`);
+        }
     }
 
     session.metadata[METADATA_ANCHORS] = nextAnchors;
