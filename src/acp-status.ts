@@ -190,7 +190,7 @@ export function handleAcpStatus(args: Record<string, unknown>, ctx: AcpStatusCtx
     const forkSkipped = forkAdoptionSkippedOf(ctx.session);
     if (forkSkipped && !ctx.session.state.blocks.some((b) => b.active)) {
         extra.push("");
-        extra.push(`FORK ADOPTION SKIPPED — this session forked from ${forkSkipped.parentId} with ${forkSkipped.blocks} parent block(s) (~${Math.round(forkSkipped.tokens / 1000)}K tokens) NOT inherited because forkAdoption is disabled; the parent's already-folded history replays raw and will re-fold from scratch. Set "forkAdoption": true (or BILI_FORK_ADOPTION=1) and restart bili — the recorded lineage link lets the startup sweep inherit those blocks.`);
+        extra.push(`FORK ADOPTION SKIPPED — this session forked from ${forkSkipped.parentId} with ${forkSkipped.blocks} parent block(s) (~${Math.round(forkSkipped.tokens / 1000)}K tokens) NOT inherited because forkAdoption is disabled; the parent's already-folded history replays raw and will re-fold from scratch. Restarting bili heals this session — the recorded lineage link lets the startup sweep inherit those blocks (the sweep follows resumeInheritance, on by default); set "forkAdoption": true (or BILI_FORK_ADOPTION=1) so future forks adopt at their first request instead of waiting for a restart.`);
     }
     // #2366: everything in the report above is LOCAL ESTIMATES (defaultCountTokens);
     // on CJK-heavy routes upstream billing runs 2–4× higher, so an agent judging

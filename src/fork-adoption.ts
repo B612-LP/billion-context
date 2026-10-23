@@ -366,13 +366,13 @@ export function maybeAdoptForkBlocks(args: {
     const plan = planForkAdoption(parent, new Set(incomingMsgs.map((m) => m.id)));
     // Link once the parent is confirmed loadable (a dangling link to a
     // vanished id would only churn the read-time walk for nothing).
-    const linked = session.metadata.derivedFromSessionId === undefined;
-    if (linked) {
+    const justLinked = session.metadata.derivedFromSessionId === undefined;
+    if (justLinked) {
         session.metadata.derivedFrom = parentId;
         session.metadata.derivedFromSessionId = parentId;
     }
     if (plan.adoptedActive === 0) {
-        if (linked) persistForkLineageNow(session, log);
+        if (justLinked) persistForkLineageNow(session, log);
         log("info", `[fork-adoption] fork of ${parentId}: no fully-present blocks to adopt (${plan.straddled} straddle the fork point); starting fresh; lineage linked so the startup sweep can inherit later folds (#629/#3925)`);
         return;
     }
