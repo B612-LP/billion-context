@@ -277,12 +277,12 @@ test("P-FRESH: #3146 fresh-session forward-once fires WITHOUT a covering local r
     const f = await freshFixture(t);
     const out = await callGate(f, async () => f.prepared, true);
     assert.ok(!("failFast" in out), "no refusal evidence: the fresh-session gate must forward once");
-    assert.ok(f.log.some(([, m]) => m.includes("forwarding once for the upstream to arbitrate size before failing fast (#3146)")),
+    assert.ok(f.log.some(([, m]) => m.includes("forwarding once for the upstream to arbitrate size before failing fast (#3146/#4185)")),
         `expected the #3146 forward-once log line, got:\n${f.log.map(([l, m]) => `[${l}] ${m}`).join("\n")}`);
     cleanup(t);
 });
 
-test("P-FRESH: a covering local refusal CLOSES the #3146 fresh-session gate (413 instead of re-forward)", async (t) => {
+test("P-FRESH: a covering local refusal CLOSES the #3146 fresh-session gate (fail-fast instead of re-forward)", async (t) => {
     const f = await freshFixture(t);
     seedLocalRefusal(f);
     const out = await callGate(f, async () => f.prepared, true);
@@ -295,7 +295,7 @@ test("P-FRESH: a covering local refusal CLOSES the #3146 fresh-session gate (413
         // with the status following the existing verdict rules.
         "refused fresh-session payload fails fast (no forward)");
     assert.equal(out.retryable, false);
-    assert.ok(f.log.some(([, m]) => m.includes("NOT re-forwarding for size arbitration (#3846)")),
+    assert.ok(f.log.some(([, m]) => m.includes("NOT re-forwarding for size arbitration (#3846/#4185)")),
         `expected the #3846 refusal log line, got:\n${f.log.map(([l, m]) => `[${l}] ${m}`).join("\n")}`);
     // the fall-through fail-fast re-notes the refusal — idempotent per scope:
     // the widest-window-dominates rule must keep exactly one record.
