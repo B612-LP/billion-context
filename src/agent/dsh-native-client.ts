@@ -402,9 +402,10 @@ function readOrigin(): string | undefined {
 /** #4237: Context-tab face flags from the __BILI__ snapshot (host half,
  *  dsh.contextTab / dsh.contextTabLabel): `hidden` drops the conversation.view
  *  registration entirely (the top-bar entry only — compression is untouched),
- *  `label` overrides the built-in "上下文"/"Context" for machines where another
- *  plugin occupies the same name. Both fail open: absent fields (legacy host,
- *  pre-bootstrap page load) keep today's behavior byte-identical. */
+ *  `label` overrides the built-in "压缩代理"/"Compression" (#4319) for machines
+ *  where another plugin wants the slot's former name. Both fail open:
+ *  absent fields (legacy host, pre-bootstrap page load) keep today's
+ *  behavior byte-identical. */
 function readCtxTabFace(): { hidden: boolean; label: string | undefined } {
     const g = globalThis as { __BILI__?: { contextTab?: unknown; contextTabLabel?: unknown } };
     const snap = g.__BILI__;

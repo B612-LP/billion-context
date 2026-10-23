@@ -1804,10 +1804,11 @@ test("#4237: contextTabLabel overrides the built-in tab name; blank or non-strin
     assert.equal((viewSlot.label as () => string)(), "压缩账本");
     named.runCleanups();
     const blank = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTabLabel: "   " } });
-    assert.equal((blank.optionsBySlot.get("conversation.view")!.label as () => string)(), "上下文");
+    // #4319: built-in fallback renamed 上下文 → 压缩代理.
+    assert.equal((blank.optionsBySlot.get("conversation.view")!.label as () => string)(), "压缩代理");
     blank.runCleanups();
     const junk = await mountClient({ ...baseExtra(), __BILI__: { origin: "http://127.0.0.1:8787", contextTabLabel: 42 } });
-    assert.equal((junk.optionsBySlot.get("conversation.view")!.label as () => string)(), "上下文");
+    assert.equal((junk.optionsBySlot.get("conversation.view")!.label as () => string)(), "压缩代理");
     junk.runCleanups();
 });
 

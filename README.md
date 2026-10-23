@@ -330,6 +330,8 @@ Stable read-only surface for third-party host-side UI plugins that want to show 
 - `{"origin":null}` — no proxy bound yet (attach/spawn still booting); keep polling;
 - route absent (404) — older host build without the route.
 
+Newer builds additionally carry bili's own UI face flags (`contextTab`, optional `contextTabLabel`, #4237) in the same body — internal to bili's DSH client bundle; ignore them.
+
 Poll while unresolved: the origin can land late (spawn mode binds after bootstrap) or move (runtime re-bind).
 
 **`GET /__bili/plugin/status?conversationId=<id>`** — wire-caliber session stats. Full field semantics (observation lifecycle, fork behavior, revision guards): [PLUGIN.md](PLUGIN.md) §4. The stable contract surface is the documented field set there — `ok`, `conversationId`, `sessionId`, `sessionRevision`, `pluginAgent`, `model`, `contextLimit`, `contextTokens`, `contextTokensSource`, `contextTokensAt`, `contextGeneration`, `inputTokens`, `outputTokens`, `cachedTokens`, `requests`, `blocks`, `compressibleRanges`, `lastSeen`; fields not listed are internal and carry no guarantee.
