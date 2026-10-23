@@ -175,9 +175,6 @@
 | `guardrails.maxOutputBytes` | number | 50000 | BILI_GUARDRAIL_MAX_OUTPUT_BYTES | pi/omp 插件中每个工具结果的文本输出合计字节上限（0 禁用）。超限输出从头截断并附指向宿主已存完整输出的提示。 |
 | `guardrails.repetition` | boolean | true | BILI_GUARDRAIL_REPETITION | pi/omp 插件的同一调用循环破除器（连续 3 次警告、5 次中止，按字节全同判定）。false 或 env 0 关闭。 |
 | `guardrails.textRunThreshold` | number | 200 | BILI_GUARDRAIL_TEXT_RUN_THRESHOLD | 响应流上解码后模型文本的单字符重复破除器（#3260；#3331 审查后由 #3406 第 1 项补上开关）。连续 N 个相同码点即触发——正常文本远低于默认 200，符号循环的模型会撞上。设 N 调整阈值，设 0（或负数）关闭：合法的长同字符输出（代码注释分隔线、ASCII 分隔线）不会再被中途掐断。thinking/reasoning 通道也在该守卫内。 |
-| `watchdog` | object | {} (all defaults) | — | 原生 lane「代理重生看门狗」的节拍（zcode/claude/kimi 每会话 MCP 入口，#4006）。 |
-| `watchdog.intervalMs` | number | 30000（下限 1000） | BILI_WATCHDOG_INTERVAL_MS | lane 看门狗的健康探测间隔；lane 代理被外部杀掉后的最坏恢复窗口 = 间隔 × 失败上限（默认约 90 秒——#4006 实测 64 秒）。低于 1000 的值回退默认（防秒/毫秒笔误）。 |
-| `watchdog.failureLimit` | number | 3 | BILI_WATCHDOG_FAILURE_LIMIT | 连续多少次探测失败后看门狗重生代理。 |
 | `persist` | object | {} (all defaults) | — | 会话落盘持久化（XDG state 目录之下）。 |
 | `persist.enabled` | boolean | true | BILI_PERSIST | 会话记录落盘总开关（0/false 关闭）。 |
 | `persist.zstd` | boolean | false | BILI_PERSIST_ZSTD | zstd 压缩持久化会话文件（1/true 启用）。 |
@@ -185,6 +182,9 @@
 | `persist.tailTokens` | number | 16384 (0 disables message persistence) | BILI_PERSIST_TAIL_TOKENS | 为导出保真保留的最近消息原文 token 尾部大小。 |
 | `persist.epermAlertThreshold` | number | 5 | BILI_PERSIST_EPERM_ALERT_THRESHOLD | 连续 EPERM 写失败达到该次数后在日志中告警。 |
 | `persist.epermAlertRepeatMs` | number | 0 (no repeats) | BILI_PERSIST_EPERM_ALERT_REPEAT_MS | EPERM 告警的重复间隔；0 只记录一次。 |
+| `watchdog` | object | {} (all defaults) | — | 原生车道 proxy 重生看门狗节拍（每会话的 zcode/claude/kimi MCP entry，#4006）。 |
+| `watchdog.intervalMs` | number | 30000 (floor 1000) | BILI_WATCHDOG_INTERVAL_MS | 车道看门狗的健康探针节拍；车道 proxy 被外部杀死后的最坏恢复窗口 = interval × failureLimit（默认约 90 秒——#4006 实测 64 秒）。低于 1000 的值回退默认值（秒/毫秒笔误防护）。 |
+| `watchdog.failureLimit` | number | 3 | BILI_WATCHDOG_FAILURE_LIMIT | 车道看门狗重生 proxy 前允许的连续失败探针次数。 |
 | `storage` | object | {} (all defaults) | — | 统一 SQLite 存储边车设置（#2671）。 |
 | `storage.unified` | legacy\|shadow\|full | unset (full) | BILI_STORAGE_UNIFIED | 分层存储迁移开关（#2671）：shadow = 统一 SQLite 双写干跑 + digest 对账；full = 平替读路径（unified-first 加载 + 有机导入 + legacy 兜底）。两处均未设置时默认 full（#3818 翻转 —— shadow 干跑自 #2815 起对账一直干净，索引因此成为默认加载路径；JSON 信封照写，legacy 仍是一行逃生口）。文件层只接受 legacy/shadow/full；环境变量层还接受 1/true（=shadow）与 unified（=full）并优先于文件。每个 lane 启动时解析一次 —— 热改动需重启生效。加密（BILI_ENCRYPTION_KEY）会硬阻断边车。 |
 | `storage.backend` | sqlite\|mysql | unset (sqlite) | BILI_STORAGE_BACKEND | 存储后端选择（#3388 / #3931）：统一存储消费操作级的异步 StorageBackend 契约。sqlite 为默认（现有 UnifiedStore 套一层 Promise 包装适配器）。mysql 已完整接线（第二+三步）：openBackend("mysql", dsn) 打开真正的 MysqlBackend,对接 MySQL 8.0 —— 完整契约面（带 CAS 引用计数的 ingest、读取、session_ext、收割台账、归档/恢复/GC、checkpoint、会话绑定）,mysql2 作为常规依赖打包并按需懒加载（从不选 mysql 的启动永不加载它）。代理热路径经异步影子 facade 接线：保存进串行后端队列（水位 delta、孤儿/收割台账、digest 采样 —— sqlite 保持零 await 同步快车道不变）,同步读走 JSON 信封（sidecar 经 ready() 异步挂载;viewFor/importRecord 同步面按设计 miss）,replicas/ext/GC/export 走异步孪生。writerOff 仅 sqlite（信封就是 mysql 的同步读路径）。未知名字回退 sqlite 并提示。每个 lane 启动时解析一次。 |
@@ -1848,7 +1848,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_UPSTREAM_PROXY_MODE` | `upstreamProxyMode` | auto (unset behaves as direct) |
 | `BILI_UPSTREAM_TIMEOUT_MS` | `network.upstreamTimeoutMs` | 720000 |
 | `BILI_WATCHDOG_FAILURE_LIMIT` | `watchdog.failureLimit` | 3 |
-| `BILI_WATCHDOG_INTERVAL_MS` | `watchdog.intervalMs` | 30000（下限 1000） |
+| `BILI_WATCHDOG_INTERVAL_MS` | `watchdog.intervalMs` | 30000 (floor 1000) |
 | `BILI_WS_OUTBOUND_BYTES` | `network.wsOutboundBytes` | 10485760 |
 | `PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
 | `PI_ACP_DELEGATE_FORCE_ENABLE` | `pi.subagents` | {} (acp_delegate enabled with package defaults) |
