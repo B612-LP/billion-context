@@ -50,6 +50,8 @@ export const LIVE_FILES = [
     // band (preload-zone-slot), so mid-list inserts renumber every later band
     "tests/storage-durability.test.ts",
     "tests/server-close-all-connections.test.ts",
+    "tests/storage-engine-proofs.test.ts",
+    "tests/web-storage-banner.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
