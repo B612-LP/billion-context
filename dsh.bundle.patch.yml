@@ -29,6 +29,32 @@
 # #3354: keep in sync with writeDshAcpPatch in src/launcher.ts — entry inject
 # lists are REPLACED by patches, not concatenated; if a future dsh ships its
 # own inject list on these entries, merge manually in BOTH layers.
+# #3962: these four gate rows target the FACTORY Web preset roster ONLY. A
+# profile that replaces those presets with its own ids has none of them, so all
+# four rows match nothing and dsh logs `patch: entry <id> not found` at startup
+# (buried in the `loader` logger, surfaced nowhere else).
+#
+# That miss is NOT harmless — it is a correctness risk. The inject gate is what
+# keeps a preset PENDING until the overlay service publishes, i.e. what
+# GUARANTEES the global internal/config middleware (src/agent/dsh-compaction-
+# disable.ts) registers BEFORE that preset resolves. Per that module's own
+# contract the guarantee covers only GATED ("protected") presets; an ungated
+# custom preset resolves by import order, which the upstream plugin explicitly
+# warns not to rely on. This is a TIMING WINDOW, not a certainty: if such a
+# preset happens to resolve before the overlay registers, its compaction-basic
+# AND command-compact rows may never be disabled. The direct effect is silent
+# misbehavior (the preset loads, but compaction is armed when it should not be);
+# the worst case is a dsh compaction checkpoint landing outside bili's knowledge
+# and destroying the compression substrate (#3354/#1772/#1729) — which needs
+# compaction to actually run. Your own `auto: false` blocks auto-trigger for
+# compaction-basic but NOT command-compact.
+#
+# If your profile uses custom preset ids, SELF-GATE each one by adding
+#     inject: [biliBasicCompactionPolicy]
+# to every custom preset entry (or keep the factory roster). To check whether
+# these factory rows applied on YOUR profile, grep the dsh loader log for
+# `patch: entry ... not found`. Do NOT delete these rows: factory-roster
+# profiles get a real ordering fence from them.
 - id: preset-standard
   inject: [biliBasicCompactionPolicy]
 - id: preset-ptc
