@@ -848,10 +848,12 @@ function messagesArrayCloseOffset(body: Buffer): number | null {
 // raw bytes. Whitespace-tolerant around ':' / ','; the value object is skipped
 // with a string-aware brace balance.
 const CACHE_CONTROL_KEY = [0x22, 0x63, 0x61, 0x63, 0x68, 0x65, 0x5f, 0x63, 0x6f, 0x6e, 0x74, 0x72, 0x6f, 0x6c, 0x22]; // "cache_control"
+const CACHE_CONTROL_KEY_BYTES = Buffer.from(CACHE_CONTROL_KEY);
 
 function stripCacheControlFields(body: Buffer): Buffer | null {
     const n = body.length;
     if (n < CACHE_CONTROL_KEY.length || body[0] !== 123) return null; // must open with '{'
+    if (!body.includes(CACHE_CONTROL_KEY_BYTES)) return body; // no mark bytes anywhere ⇒ nothing to strip — native memmem ≫ the JS scan below (measured ~10×, #4391 review)
     const spans: Array<[number, number]> = [];
     let i = 0;
     let inStr = false;
