@@ -334,9 +334,35 @@ async function startInlineWsBridge(
         res.writeHead(404, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "HTTP is not served by the pi inline WebSocket bridge" }));
     });
+    // The WS session swallows a rejecting dispatch (warn + bare end), which
+    // would leave Codex staring at a truncated stream. Render the failure
+    // into the envelope instead — same egress as the spawn-mode dispatch
+    // catch (server.ts) and makeDispatcher above: informative error, 503+
+    // Retry-After on a circuit-open fail-fast (#4254).
+    const guarded: ReturnType<typeof pipelineFor> = async (req, res) => {
+        try {
+            await pipeline(req, res);
+        } catch (err) {
+            const msg = String(err);
+            const e = err as { name?: string; message?: string };
+            const clientAbort = (e?.name === "AbortError" || /abort/i.test(String(e?.message ?? ""))) && (res.destroyed || res.writableEnded);
+            if (clientAbort) log("info", `client aborted mid-stream: ${msg}`);
+            else if (!isExpectedFailFast(err)) {
+                if (err instanceof Error && err.stack) log("error", `${msg}\n${err.stack.split("\n").slice(1, 8).join("\n")}`);
+                else log("error", msg);
+            }
+            if (!res.headersSent) {
+                const { status, headers, body } = buildProxyFailureResponse(msg, err);
+                res.writeHead(status, headers);
+                res.end(body);
+            } else {
+                res.end();
+            }
+        }
+    };
     const wsUpgrade = installWebSocketBridge(
         server,
-        pipeline,
+        guarded,
         log,
         [codexResponsesCodec],
         (url) => resolveProxyDecision(opts.routes, opts.proxy, url, opts.proxyFallback).proxy !== undefined,
