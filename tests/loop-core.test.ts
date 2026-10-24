@@ -509,7 +509,7 @@ test("replay retry: upstream-declared transient 400 then success → retried (#3
     try {
         const out = await drain(
             new Response(compressRound(), { status: 200 }).body!,
-            makeCtx(),
+            replayCtx(),
             { model: "gpt-4o", input: [], stream: true },
             { url: "http://mock", headers: {} },
         );
