@@ -213,15 +213,18 @@ export const DSH_LOCAL_COMPACTION_MIN_MISSING = 8;
  *
  *  A LANDED checkpoint is specifically ONE user-role, plain-text message
  *  (dsh-compaction-basic replaces the shadowed region with a single
- *  user/message whose text starts with CHECKPOINT_PREAMBLE). The framing bytes
- *  are matched as before (open tag anywhere — it sits mid-message after
- *  preamble + blank line; or the preamble at message start). But #2621 taught
- *  that matching the framing BYTES ALONE is a false-positive machine: the
- *  string survives anywhere history QUOTES it — a tool result that read a
- *  transcript containing it, the model citing it in reasoning, bili's own
- *  compress summaries quoting it, an assistant message paraphrasing the
- *  preamble. Those carriers are structurally incapable of being a checkpoint,
- *  so two gates tighten the match to "a checkpoint just landed":
+ *  user/message whose text starts with CHECKPOINT_PREAMBLE; the open tag sits
+ *  mid-message after preamble + blank line). #2621 taught that matching the
+ *  framing BYTES ALONE is a false-positive machine: the string survives
+ *  anywhere history QUOTES it — a tool result that read a transcript
+ *  containing it, the model citing it in reasoning, bili's own compress
+ *  summaries quoting it, an assistant message paraphrasing the preamble. And
+ *  #4438 proved the QUOTE class is live even among novel messages: dsh's
+ *  auto-review snapshot replays retained history that CONTAINS a landed
+ *  checkpoint inside its FILTERED_HISTORY section, and the freshly-synthesized
+ *  blob passes the novelty gate by construction (new content-hash id) — one
+ *  such 433KiB aux request wiped a live session's entire fold state. So three
+ *  gates tighten the match to "a checkpoint just landed":
  *
  *   ① CARRIER — the message must be role="user" AND plain text
  *      (contentType "text" when typed). Tool results, reasoning blocks,
@@ -237,6 +240,15 @@ export const DSH_LOCAL_COMPACTION_MIN_MISSING = 8;
  *      message; a historical quote/replay hits an OLD id. This closes the
  *      residual of ①: a user who literally typed/pasted the framing into a
  *      user message in an EARLIER turn is replayed as an old id, not a landing.
+ *   ③ STANDALONE (#4438) — the message must START with the framing
+ *      (preamble-first today; tag-first if the preamble ever drops out). A
+ *      landed checkpoint IS the whole message; a quote embeds it inside other
+ *      content. This costs nothing against real landings and removes the
+ *      mid-blob false positive entirely. Consequence accepted per this file's
+ *      version-pin doctrine (header): if dsh rewords BOTH the preamble AND
+ *      moves the tag off the message head, detection degrades to a miss —
+ *      the pre-#2432 unannounced-rewrite archive path — never a false
+ *      positive wiping live fold state.
  *
  *  Reads the core-flattened text first (BiliMessage/CoreMessage carry prose in
  *  `.text`), falling back to a raw wire content field for direct callers. When
@@ -255,7 +267,11 @@ export function carriesDshLocalCompactionSummary(
         if (knownIds !== undefined && typeof m.id === "string" && knownIds.has(m.id)) continue;
         const text = typeof m.text === "string" && m.text !== "" ? m.text : textOfContent(m.content);
         if (text === "") continue;
-        if (text.includes(DSH_CHECKPOINT_OPEN_TAG) || text.startsWith(DSH_CHECKPOINT_PREAMBLE_PREFIX)) return true;
+        // ③ STANDALONE (#4438): the framing must open the message — see the
+        // gate list above for why mid-text matching is a false-positive
+        // machine on synthesized aux blobs that quote old checkpoints.
+        const head = text.trimStart();
+        if (head.startsWith(DSH_CHECKPOINT_PREAMBLE_PREFIX) || head.startsWith(DSH_CHECKPOINT_OPEN_TAG)) return true;
     }
     return false;
 }
@@ -265,7 +281,9 @@ export type Refusal = { status: number; body: unknown };
 const REFUSAL_MESSAGE =
     `dsh native compaction call refused by billion-context: bili owns compression on this lane (#1729, cf. #1772/#1206). ` +
     `A landed dsh compaction checkpoint durably shadows the raw conversation history, which destroys the proxy's compression substrate. ` +
-    `To run dsh native compaction on this lane anyway, opt in explicitly: "allowDshCompaction": true in the bili config or env BILI_ALLOW_DSH_COMPACTION=1 (#2028).`;
+    `No action is needed: your conversation is intact and bili compresses automatically as turns grow too large — if the session is currently over its window, it starts folding on the next turn (#3453). ` +
+    `This refusal is unconditional — the former allowDshCompaction opt-in was removed (#3651, superseding #2028); ` +
+    `to keep dsh-side checkpoints out entirely, apply host-side suppression instead (#3354/#2474).`;
 
 /** Protocol-shaped refusal body (mirrors the #554 side-request guard shape so
  * clients render it natively). 422: a policy refusal of this one request — not
