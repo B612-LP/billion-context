@@ -32,7 +32,7 @@
 
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -129,6 +129,33 @@ export function markerIsFresh(distDir, hash) {
 }
 
 /**
+ * Refresh every dist file's mtime to NOW after a cache HIT skips the build.
+ * Downstream staleness oracles compare mtimes (e.g. the golden-drive guard
+ * kernelDistStale(), #3325: dist/index.js must be NEWER than every
+ * kernel/src file — a checkout rewrites src mtimes, an actions/cache
+ * restore preserves the SAVE-time dist mtimes, so an untouched skip leaves
+ * dist "older" than src and the guard refuses to run even though the bytes
+ * are content-verified fresh). Touch is metadata-only: the marker hash
+ * covers INPUTS, not dist bytes, and the restored artifacts are already
+ * trusted by the byte-exact marker match.
+ */
+export function refreshDistMtimes(distDir, now = new Date()) {
+    let touched = 0;
+    const walk = (dir) => {
+        for (const e of readdirSync(dir, { withFileTypes: true })) {
+            const p = join(dir, e.name);
+            if (e.isDirectory()) walk(p);
+            else if (e.isFile()) {
+                utimesSync(p, now, now);
+                touched++;
+            }
+        }
+    };
+    walk(distDir);
+    return touched;
+}
+
+/**
  * The pretest loop. For each component: hash → fresh marker? HIT, skip :
  * MISS → run the real build → stamp the marker. `build`/`log` are test seams
  * (the CLI passes defaults); build failures propagate so the CLI exits 1 —
@@ -144,7 +171,11 @@ export function runPretestCache(opts = {}) {
         const hash = hashComponent(root, comp);
         const distDir = join(root, comp.dir, "dist");
         if (markerIsFresh(distDir, hash)) {
-            log(`pretest-cache: HIT (${comp.name}) — dist fresh for hash ${hash.slice(0, 12)}`);
+            // Content is verified fresh — but a cache restore preserves
+            // save-time mtimes while checkout rewrites src mtimes; make the
+            // dist tree look "just built" to every mtime oracle (#3325).
+            const touched = refreshDistMtimes(distDir);
+            log(`pretest-cache: HIT (${comp.name}) — dist fresh for hash ${hash.slice(0, 12)} (${touched} files' mtimes refreshed)`);
             results.push({ name: comp.name, hit: true, ms: 0 });
             continue;
         }

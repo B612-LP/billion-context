@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as cache from "../scripts/ci-pretest-cache.mjs";
@@ -87,6 +87,25 @@ test("cold → warm → tamper lifecycle (the #4360 CI sequence)", () => {
     // The exact log lines CI greps for (#4360).
     assert.ok(lines.some((l) => l.startsWith("pretest-cache: HIT (kernel)")));
     assert.ok(lines.some((l) => l.startsWith("pretest-cache: MISS (kernel) → rebuilding")));
+
+    // #3325 interplay: a cache HIT must leave the dist tree mtimes FRESH.
+    // A checkout rewrites src mtimes while actions/cache preserves the
+    // save-time dist mtimes — kernelDistStale() (tests/golden-storage-drive.ts)
+    // then refuses to run golden drives even though the bytes are verified.
+    // Simulate: backdate the kernel dist files, re-run (HIT), verify the
+    // mtimes came back to NOW.
+    const kernelComp = cache.COMPONENTS[0];
+    const old = new Date(Date.now() - 3_600_000);
+    const stale = cache.refreshDistMtimes(join(root, kernelComp.dir, "dist"), old);
+    assert.ok(stale > 0);
+    const backdatedIndex = join(root, kernelComp.dir, "dist", "index.js");
+    assert.equal(statSync(backdatedIndex).mtimeMs, old.getTime());
+    const seen4: string[] = [];
+    cache.runPretestCache({ root, build: fakeBuild(seen4), log });
+    assert.equal(seen4.length, 0); // still a HIT — content unchanged
+    assert.ok(statSync(backdatedIndex).mtimeMs > Date.now() - 60_000, "HIT path must refresh dist mtimes (#3325)");
+    // The refreshed log line names the touch so CI logs explain the mtimes.
+    assert.ok(lines.some((l) => l.includes("mtimes refreshed")));
 });
 
 test("marker must match byte-exactly — absent, stale, tampered, CRLF are decided by content", () => {
