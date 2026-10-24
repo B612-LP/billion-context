@@ -525,7 +525,12 @@ export function createOpenaiAdapter(requestBody: Record<string, unknown>, client
                 }
                 const delta = choice.delta as Record<string, unknown> | undefined;
                 const finishReason = typeof choice.finish_reason === "string" ? choice.finish_reason : undefined;
-                const frameToolCalls = delta?.tool_calls as Array<Record<string, unknown>> | undefined;
+                // #4466: an empty tool_calls array is truthy; gateways that emit
+                // `tool_calls: []` on every chunk would route all text into the
+                // absorb path and drop it (settle bails early, pending stays empty).
+                // Treat length-0 as absent — same guard as filterRealToolFragments.
+                const rawFrameToolCalls = delta?.tool_calls as Array<Record<string, unknown>> | undefined;
+                const frameToolCalls = rawFrameToolCalls?.length ? rawFrameToolCalls : undefined;
                 if (frameToolCalls) absorbToolCallDeltas(frameToolCalls);
 
                 if (finishReason) {
