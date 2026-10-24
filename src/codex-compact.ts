@@ -324,7 +324,7 @@ export function renderForgedSummary(block: Pick<CompressionBlock, "summary" | "t
 // #4600: one handoff-ledger entry. `blockId` carries provenance so superseded
 // entries can be pruned; legacy persisted states hold plain strings (entries
 // without provenance) that stay conservative forever.
-export interface ForgedSummaryEntry {
+interface ForgedSummaryEntry {
     text: string;
     blockId?: string;
 }
