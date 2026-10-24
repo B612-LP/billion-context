@@ -26,6 +26,10 @@ const ASSETS = join(ROOT, "website", "docs", "assets");
 const CRUMB = "文库 Articles";
 const SRC_BASE = "https://github.com/ranxianglei/billion-context/blob/master/";
 const ROOT_PREFIX = "../../";
+// Article pages live in docs/articles/ while copied media lands in docs/assets/ —
+// one level up from the page, not two (the site-root prefix above is the depth
+// to styles.css/topbar links, not to the sibling assets dir).
+const MEDIA_PREFIX = "../";
 
 function fail(msg) {
   console.error("[build-articles] " + msg);
@@ -57,7 +61,7 @@ function prepareMedia(md, relPath, slug) {
     const rel = relative(resolve(srcDir), abs).split(sep);
     mkdirSync(dirname(join(destDir, ...rel)), { recursive: true });
     copyFileSync(abs, join(destDir, ...rel));
-    return `${pre}(${ROOT_PREFIX}assets/${encPath(slug + "/" + rel.join("/"))})`;
+    return `${pre}(${MEDIA_PREFIX}assets/${encPath(slug + "/" + rel.join("/"))})`;
   });
 }
 
