@@ -5,6 +5,8 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+## [0.1.207] — 2026-10-24
+
 ### Storage — 行身份与史官化(#4390,storage review 四个 p2 + 三个顺路 p3)
 
 - **行身份去污染(D4-1)**:统一存储 messages 行新增 `identity` 列——跨保存 JOIN 键改为**位置无关**序列化(剥离 `id`/`wireIndex` 后哈希)。此前身份掺入 wire 位置元数据,客户端头部截断一条消息就会让后续全部行换血(旧行被清扫、seq 重铸、#4335 的区间账记随之抖动)。`content_hash` 保持字节忠实 CAS 键不变。存量库 v8 迁移:回填 identity 并合并 wireIndex 分裂世代(保最低 seq,重复行退还 CAS 引用)。MySQL 同款(information_schema 探测幂等 ALTER + 回填)。
