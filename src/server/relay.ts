@@ -724,13 +724,17 @@ export async function forward(
         // steering / chain-stamp / shed rewrites, so I1/I2 see the wire truth.
         // Advisory; never blocks. Replaces the pre-send hook (handle.ts) which
         // judged a pre-rewrite snapshot.
-        // #4241: on a snapshot-render turn the outbound prefix is server-rendered
-        // (transcript rows + summary carriers), not the raw inbound bytes — the
-        // judge must exempt that region and validate only the client tail. The
-        // boundary was recorded by prepare's maybeSnapshotView on the same session.
-        const renderTailStart = typeof prepared.session.metadata["snapshotRenderTailStart"] === "number"
-            ? (prepared.session.metadata["snapshotRenderTailStart"] as number)
-            : undefined;
+        // #4241 (union of #4531 + #4525's train): on a snapshot-render turn
+        // the judge's baseline IS the rendered view (judgeBaseline), so legacy
+        // I1/I2 stay fully armed against it — a dropped/rewritten rendered row
+        // still fires (teeth, tests/issue4241-judge-render-baseline.test.ts).
+        // The renderTailStart exemption was the older #4525-train design for
+        // the same false-positive (raw-inbound baseline); with the rendered
+        // baseline present it is redundant AND blinds I2 to rendered-prefix
+        // defects, so it must NOT be passed here. The judge keeps the
+        // renderTailStart API as the raw-inbound escape hatch (unit-pinned in
+        // tests/invariant-judge.test.ts), and maybeSnapshotView still records
+        // snapshotRenderTailStart for diagnostics.
         maybeRunInvariantJudge({
             // #4241: a render-lane turn's outbound is built from the SERVER
             // transcript (summary anchors + store rows), so its ground truth
@@ -743,7 +747,6 @@ export async function forward(
             body: sentBody,
             protocol: prepared.protocol,
             sessionId: prepared.session.id,
-            ...(renderTailStart !== undefined ? { renderTailStart } : {}),
         });
     }
     // #3148: round-level breaker — while the endpoint is provably dead, fail
