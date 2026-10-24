@@ -208,7 +208,7 @@ gate).
 ## Bugfix carve-out channel (release-bugfix.yml)
 
 Emergency hotfix path (#2011, first used for v0.1.182), **PR-gated since #2851**:
-publish a version cut from a **non-master ref** — today the standing `bugfix` lane
+publish a version cut from a **non-master ref** — today the live patch cycle
 (see Dual-lane releases below), or a hand-cut tag+one-fix branch — STRICTLY
 excluding the unreleased work that has since accumulated on master. It goes through
 a PR exactly like a normal release (human reviews and merges; CI publishes); the
@@ -230,9 +230,9 @@ nothing else.
    ```bash
    git checkout -b bugfix-release/v{VERSION}-{slug} v{LAST-RELEASED-TAG}
    ```
-   This is the LEGACY one-off form. The primary patch path is the standing `bugfix`
-   lane (next section): fixes land there as ordinary PRs and the one-click ship adds
-   the bump — no hand-crafted release branch.
+   This is the LEGACY one-off form. The primary patch path is the live
+   `patch/v*` cycle (Dual-lane releases below): fixes land there as ordinary
+   PRs and the one-click ship adds the bump — no hand-crafted release branch.
    The `bugfix-release/` name prefix is the carve-out MARKER, not a trigger: pushing
    such a branch no longer auto-publishes (#2851 removed the silent-push path). It is
    what `release.yml`'s detection deliberately does NOT match, so merging the PR
@@ -247,7 +247,7 @@ nothing else.
    PR. While it is open, the standard lane set already runs on the head sha
    (path-filtered `pull_request` triggers), which the publish gate reuses.
 3. On merge, `release-bugfix.yml` (`pull_request` closed trigger) validates
-   (merged, same-repo head, head branch = `bugfix` — the standing lane's ship
+   (merged, same-repo head, head branch = `patch/v*` — the live cycle's ship
    PR — or a legacy `bugfix-release/*` one-off), checks out the PRE-MERGE PR
    head tree, reads the target version from its `package.json` (before any gate) and
    enforces fail-closed guards:
@@ -276,116 +276,136 @@ tree again). Master advances independently on its next normal release, which MUS
 higher than the carve-out version (after v0.1.182 was cut off v0.1.181, the next
 normal release must be ≥ 0.1.183).
 
-## Dual-lane releases: the standing bugfix lane (dual-PR forwarding)
+## Dual-lane releases: patch cycles with dual-PR forwarding
 
-Operationalizes the carve-out channel into a **standing `bugfix` branch**, so
-small fixes ship fast WITHOUT blocking (or being blocked by) master's feature
-stream. Approved by the owner 2026-10-24 (replaces the 2026-10-24 patch-train
-experiment: label-bot cherry-picking had a structural blind spot — a conflicted
-backport was only a PR comment, and nothing at ship time could prove every
-labeled fix was actually on the train, #4474. In the fixed-branch model a fix
-is on the lane the moment its bugfix PR merges; there is nothing to miss).
+Operationalizes the carve-out channel into **patch cycles** — one short-lived
+branch per released version — so small fixes ship fast WITHOUT blocking (or
+being blocked by) master's feature stream. Approved by the owner 2026-10-24 in
+its final form ("every PR opens two at once": the fix PR + its master twin,
+opened automatically); it replaced the same-day fixed-`bugfix`-branch design
+because every patch release moves the base anyway — per-cycle branches make
+that move automatic and self-describing (the branch name IS its base tag),
+and they replace the 2026-10-24 patch-train experiment: label-bot
+cherry-picking had a structural blind spot — a conflicted backport was only a
+PR comment, and nothing at ship time could prove every labeled fix was
+actually on the train, #4474. In the dual-PR model a fix is on the cycle the
+moment its fix PR merges; there is nothing to miss.
 
 **The model:** master stays the single source of truth (features + big fixes
-merge there as always, nothing is frozen). In parallel, a long-lived `bugfix`
-branch — cut from the last released TAG — receives small fixes as ordinary
-PRs. A patch release ships the lane (tag + that batch of fixes, strictly no
-unreleased features) via the existing carve-out channel; merging the ship PR
-brings the fixes and the version bump back into master. Version numbers stay
-one strictly-increasing stream (0.1.206 lane, 0.1.207 feature, 0.1.208 lane …
-all legal).
+merge there as always, nothing is frozen). In parallel, a short-lived cycle
+branch `patch/v{LAST-RELEASED-TAG}` receives small fixes as ordinary PRs.
+A patch release ships the current cycle (its base tag + that batch of fixes,
+strictly no unreleased features) via the carve-out channel; merging the ship
+PR brings the fixes and the version bump back into master, and the ship's
+closeout immediately cuts the NEXT cycle (`patch/v{JUST-PUBLISHED}`) from the
+fresh tag — so there is always exactly ONE live cycle. Version numbers stay
+one strictly-increasing stream (0.1.206 cycle, 0.1.207 feature, 0.1.208
+cycle … all legal). If a regular master release ships while a cycle is still
+accumulating, the next one-click ship auto-recuts from the newer tag and
+replays whatever the old cycle carried that master lacks (recut-replay).
 
-**Every fix PR opens TWO PRs at once.** Cut the fix branch from the `bugfix`
-tip, open the PR against `bugfix` (the fast lane), and `fix-dual-pr.yml`
+**Every fix PR opens TWO PRs at once.** Cut the fix branch from the live
+cycle tip, open the PR against it (the fast lane), and `fix-dual-pr.yml`
 automatically cherry-picks the same commits onto master and opens the **master
 twin PR** (`twin/<fix-branch>`, base=master) with CORE CI dispatched on it.
-You merge BOTH: the bugfix PR ships it fast; the twin PR keeps master from
-regressing it. Neither merge is automatic — both are human decisions.
+You merge BOTH: the fix PR ships it fast at the next cycle ship; the twin PR
+keeps master from regressing it. Neither merge is automatic — both are human
+decisions.
 
-**Which lane a fix takes**: a fix belongs on the lane if it applies cleanly
-onto the tag-based lane and stands alone there (small, user-visible,
-independent of unreleased master work). The twin bot's cherry-pick onto master
-is the fast lane's shape probe in reverse: if the bugfix PR itself conflicts
-with the lane, the fix is not small — re-target the PR at master only. New
-features never take the lane.
+**Which lane a fix takes**: a fix belongs on the cycle if it applies cleanly
+onto the tag-based cycle and stands alone there (small, user-visible,
+independent of unreleased master work). If the fix PR itself conflicts with
+the cycle, the fix is not small — re-target the PR at master only. New
+features never take the cycle.
 
 **Mechanics:**
 
-1. **Route a fix onto the lane**: cut the fix branch from the `bugfix` tip,
-   push, open the PR with base=`bugfix`. `fix-dual-pr.yml` then:
-   - cherry-picks the PR's own commits (range `origin/bugfix..PR head`) onto
+1. **Route a fix onto the cycle**: cut the fix branch from the live
+   `patch/v*` tip, push, open the PR with that branch as base. If the base
+   predates the newest released tag (a cycle got superseded while your PR was
+   open), the bot comments a warning — nothing is lost (recut-replay carries
+   merged fixes at the next ship), but re-targeting at the fresh cycle is
+   cleaner. `fix-dual-pr.yml` then:
+   - cherry-picks the PR's own commits (range `origin/<cycle>..PR head`) onto
      `origin/master`, pushes `twin/<fix-branch>`, opens the twin PR
      (base=master) with the picked-commit list, dispatches CORE CI on the twin
      ref (#772: bot-authored PRs' own runs sit in action_required), and
-     comments the twin link on the bugfix PR;
+     comments the twin link on the fix PR;
    - rebuilds the twin from scratch on every synchronize push, so the twin is
      always exactly master + this PR's commits;
-   - closes the twin and deletes its branch if the bugfix PR closes unmerged;
+   - closes the twin and deletes its branch if the fix PR closes unmerged;
      nudges it ("now the only thing keeping master from regressing the fix")
-     if the bugfix PR merges first;
+     if the fix PR merges first;
    - refuses (with a how-to comment) if the PR carries >20 commits vs the
-     lane — that is a master-based branch accidentally targeting the lane,
+     cycle — that is a master-based branch accidentally targeting the cycle,
      and replaying it would leak master's unreleased delta.
    A twin cherry-pick conflict means master moved under the fix: the comment
-   on the bugfix PR carries the manual repair command (pick the commits by
-   hand onto a branch off master). Only MERGE-COMMIT merges into the lane are
+   on the fix PR carries the manual repair command (pick the commits by hand
+   onto a branch off master). Only MERGE-COMMIT merges into the cycle are
    conventional; keep fix PRs linear.
-2. **Ship the lane** (the one owner decision — releases are owner-gated,
-   #2910): **Actions → "Release (one-click)" → Run workflow → tick `bugfix`**.
-   That does the whole dance: checks out the `bugfix` branch, drift-guards
-   (lane version must equal npm latest), adds the isolated `release v{NEXT}`
-   commit (package.json + lock only), pushes it to the lane, dispatches the
-   FULL CI set at the lane head, audits forward coverage (below), and opens
-   the ship PR against master with a generated changelog. You merge the PR;
-   `release-bugfix.yml` then publishes the PRE-MERGE head tree (tag + fixes).
-   The lane stays where it is — after the ship it equals the fresh tag, so
-   the next fix PRs cut from its tip ride the NEXT patch ship.
-   ⚠ Severe fixes riding a lane ship: include the release-notes entry (#1870)
-   in the fix PR itself, so it is on the lane with the fix — the publish-time
+2. **Ship the cycle** (the one owner decision — releases are owner-gated,
+   #2910): **Actions → "Release (one-click)" → Run workflow → tick `bugfix`**
+   (the input keeps its legacy name). That does the whole dance:
+   resolves the LIVE CYCLE — finds `patch/v<latest-tag>`, and if it does not
+   exist yet (or the newest tag moved) cuts it from the newest tag, replaying
+   every previously-merged fix not yet on master (`git cherry` vs origin/
+   master, skipping `release v*` bumps; a replay conflict aborts the ship
+   loudly — resolve manually), drift-guards (cycle version must equal npm
+   latest), adds the isolated `release v{NEXT}` commit (package.json + lock
+   only), pushes it to the cycle, dispatches the FULL CI set at the cycle
+   head, audits forward coverage (below), and opens the ship PR against
+   master with a generated changelog. You merge the PR; `release-bugfix.yml`
+   then publishes the PRE-MERGE head tree (tag + fixes) and cuts the NEXT
+   cycle from the fresh tag right away. Superseded cycle branches are left in
+   place for inspection (delete them yourself once convinced); open fix PRs
+   still targeting one must be re-targeted manually — nothing is auto-closed.
+   ⚠ Severe fixes riding a cycle ship: include the release-notes entry (#1870)
+   in the fix PR itself, so it is on the cycle with the fix — the publish-time
    gate checks the entry ON THE REF.
 
    **Ship-time forward audit**: before opening the ship PR, the one-click run
-   lists every lane commit since the lane's base tag that has no
+   lists every cycle commit since the cycle's base tag that has no
    patch-equivalent on master (patch-id via `git cherry`) — i.e. fixes whose
    twin PRs are still open. Rendered as a prominent ⚠️ section at the top of
    the ship PR body. It never fails the run (master catching up on its own
    schedule is legitimate), but you will see the backlog before you merge —
-   and the next lane re-cut drops whatever master never got.
+   and note recut-replay only carries fixes MERGED into a superseded cycle;
+   an unmerged fix whose PR dies is lost unless re-landed.
 
-**Lane hygiene:**
+**Cycle hygiene:**
 
-- **Never merge master into the lane.** The lane ships wholesale; one master
-  merge ships every unreleased feature. `bugfix-leak-guard.yml` inspects
-  every merge commit on the lane and alarms when any second parent is
-  master-side history. Recovery: re-cut the lane from the latest tag and
-  re-land the fix PRs.
-- **Re-cut after a master release overtakes the lane.** After any regular
-  release ships a version ≥ the lane's, the drift guard (lane version ≠ npm
-  latest) blocks the next lane ship until the lane is re-cut from the newest
-  tag. Fix PRes already on master land in the new base automatically; fixes
-  whose twins never merged are dropped by the re-cut — merge the twins first
-  (the forward audit shows them).
+- **Never merge master into a cycle branch.** It ships wholesale; one master
+  merge ships every unreleased feature. `patch-leak-guard.yml` inspects every
+  merge commit on a pushed `patch/v*` branch and alarms when any second
+  parent is master-side history. Recovery: discard the poisoned cycle (its
+  unmerged fixes get re-landed on the fresh cycle) — cycles are cheap to
+  throw away because recut-replay exists.
+- **No manual re-cutting in normal operation.** Closeout cuts the next cycle
+  automatically after every patch ship; a mid-cycle master release just makes
+  the next ship's resolve step recut+replay automatically. Manual force-pushes
+  exist only as recovery tools:
   ```bash
-  # re-cut the lane from the newest tag (after merging all open twins):
-  git push origin --force-with-lease $(git tag --list 'v[0-9]*' --sort=-v:refname | head -1):bugfix
+  # emergency: reset the live cycle to the newest tag (drop whatever it had):
+  git push origin --force-with-lease $(git tag --list 'v[0-9]*' --sort=-v:refname | head -1):refs/heads/patch/v{TAG}
   ```
-  (Force-push needs a temporary ruleset bypass — the lane is protected
+  (Force-push needs a temporary ruleset bypass — `patch/*` is protected
   against force-push/deletion.)
-- **Cutting the lane initially**: `git push origin v{LAST}:refs/heads/bugfix`.
+- **Cutting the very first cycle** happened once at model migration:
+  `git push origin <train-tip>:refs/heads/patch/v{LAST}`.
 
 **Why cherry-picked twins instead of merging the fix branch into both:** the
-fix branch is based on the lane; a git merge into master would carry the
-lane's whole post-tag delta over the merge-base. The re-picked twin is the
+fix branch is based on the cycle; a git merge into master would carry the
+cycle's whole post-tag delta over the merge-base. The re-picked twin is the
 price of leak safety on both directions.
 
-**CI wiring**: pushes to `bugfix` and PRs into it run the CORE matrix (ci.yml
-trigger filters include the branch); the FULL matrix at ship time comes from
-the one-click lane run's all-lanes dispatch. Twin PRs are bot-authored: their
-own pull_request runs sit in action_required, so fix-dual-pr dispatches CORE
-CI on the twin ref (#772/#1744 pattern); the plan job scopes twin/** heads to
-CORE even though a bot authors them. Branch protection for `bugfix` (no
-force-push, no deletion) keeps the lane from being rewritten; required checks
-mirror master's.
+**CI wiring**: pushes to `patch/v*` and PRs into them run the CORE matrix
+(ci.yml trigger filters include the glob); the FULL matrix at ship time comes
+from the one-click cycle run's all-lanes dispatch. Twin PRs are bot-authored:
+their own pull_request runs sit in action_required, so fix-dual-pr dispatches
+CORE CI on the twin ref (#772/#1744 pattern); the plan job scopes twin/**
+heads to CORE even though a bot authors them. Branch protection for `patch/*`
+(no force-push, no deletion) keeps cycles from being rewritten; required
+checks mirror master's.
 
 ## CI publish mechanism (what release.yml does)
 

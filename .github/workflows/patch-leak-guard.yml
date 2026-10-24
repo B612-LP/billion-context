@@ -1,0 +1,56 @@
+name: patch-branch leak guard
+
+# Dual-lane release model, per-cycle form (2026-10-24): each cycle branch
+# `patch/v<tag>` must only ever contain its base tag plus small fix PRs
+# merged into it. Master's UNRELEASED work must never flow onto the cycle
+# branch — that is the whole point of the model (a patch ship publishes the
+# cycle tree wholesale, so one leaked master merge would ship unreleased
+# features). The canonical leak vector is a human running `git merge master`
+# into the cycle branch (or clicking "update branch" against a master-based
+# PR): this guard inspects every merge commit on the pushed cycle branch
+# that is not yet in a release tag and alarms when any of them has a second
+# parent that is an ancestor of origin/master — i.e. it merged master-side
+# history into the cycle. Fix PR merges never trip it: their second parent
+# is the fix branch (cut from the cycle branch, never from master).
+# Superseded cycles are cheap to discard — the recut-replay at the next
+# ship rescues anything worth keeping.
+
+on:
+  push:
+    branches: ["patch/v*"]
+
+concurrency:
+  group: patch-leak-guard-${{ github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Alarm on master-side merges into the cycle branch
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          git fetch -q origin "+refs/heads/${BRANCH}:refs/remotes/origin/${BRANCH}" --tags
+          LEAKS=""
+          for M in $(git log --merges --not --tags "refs/remotes/origin/${BRANCH}" --format='%H'); do
+            P2="$(git rev-parse -q --verify "$M^2" 2>/dev/null || true)"
+            [ -z "$P2" ] && continue
+            if git merge-base --is-ancestor "$P2" origin/master 2>/dev/null; then
+              LEAKS="${LEAKS}- merge ${M:0:12} ($(git log -1 --format='%s' "$M")) pulls master-side history into the cycle"$'\n'
+            fi
+          done
+          if [ -n "$LEAKS" ]; then
+            echo "::error::master content leaked onto ${BRANCH}:$LEAKS"
+            echo "A cycle branch ships wholesale on its patch release — master's unreleased work must never land here. Discard this cycle (its unmerged fixes get replayed onto the fresh cycle at the next ship) or re-land them as PRs onto the current cycle branch. See reference/release.md, Dual-lane releases."
+            exit 1
+          fi
+          echo "✓ no master-side merges on ${BRANCH}"

@@ -34,6 +34,12 @@ name: Bugfix Release (carve-out)
 # Master interaction: merging the carve-out PR brings the version bump INTO
 # master (master then equals npm latest). Master advances independently on its
 # next normal release, which MUST be higher than the carve-out version.
+#
+# Dual-lane model (per-cycle form, 2026-10-24): the primary use is now the
+# PATCH CYCLE ship — ship PRs carry head=`patch/v<tag>` (see
+# reference/release.md, Dual-lane releases). After publishing, the closeout
+# step below cuts the NEXT cycle branch (`patch/v<just-published>`) from the
+# fresh tag so the next fix PRs have a live target immediately.
 
 on:
   pull_request:
@@ -71,17 +77,17 @@ jobs:
               exit 0
             fi
             case "$BRANCH" in
-              bugfix)
-                # Fixed bugfix lane (dual-lane model, fixed-branch form
-                # 2026-10-24): the ship PR carries head=bugfix.
+              patch/v*)
+                # Per-cycle dual-lane model (2026-10-24): the ship PR carries
+                # head=patch/v<tag>, one branch per released tag.
                 ;;
               bugfix-release/*)
                 # Legacy single-fix emergency carve-out (#2011): still
-                # accepted for hand-cut one-off branches; the standing lane
+                # accepted for hand-cut one-off branches; the patch cycle
                 # above is the primary path.
                 ;;
               *)
-                echo "::notice::head branch '$BRANCH' is not the bugfix lane (or a legacy carve-out branch) — nothing to publish"
+                echo "::notice::head branch '$BRANCH' is not a patch cycle branch (or a legacy carve-out branch) — nothing to publish"
                 exit 0
                 ;;
             esac
@@ -305,14 +311,30 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/releases" \
             -d @"$RUNNER_TEMP/release.json"
 
-      - name: Close the bugfix-lane cycle (notice — the lane stays put)
-        # Fixed-branch dual-lane model: the `bugfix` branch is long-lived.
-        # Publishing just tagged its current tree, so lane == tag content —
-        # the next fix PRs cut from the lane tip ride the NEXT patch ship
-        # with no re-cut ceremony. The lane only needs re-cutting when a
-        # MASTER release overtakes it (drift guard blocks the next ship
-        # until then; see reference/release.md, Dual-lane releases).
+      - name: Cut the next patch cycle from the fresh tag
+        # Per-cycle dual-lane model: shipping tagged this tree, so the just-
+        # published version IS the new base — cut `patch/v<version>` from it
+        # right here so fix PRs have a live target without waiting for the
+        # next ship's on-demand recut. Everything merged into the shipped
+        # cycle is already on master via the ship PR merge, so no replay is
+        # needed; if master later releases normally mid-cycle, the next
+        # ship's resolve step handles that (recut-replay).
         if: steps.resolve.outputs.proceed == 'true'
         run: |
+          set -euo pipefail
           BRANCH="${{ steps.resolve.outputs.branch }}"
-          echo "::notice::shipped '$BRANCH' — the lane now equals tag v$(node -p "require('./package.json').version"); fix PRs continue from the lane tip"
+          case "$BRANCH" in patch/v*) ;; *) exit 0 ;; esac   # legacy one-offs cut no cycle
+          VER="$(node -p "require('./package.json').version")"
+          NEXT="patch/v${VER}"
+          if [ "$NEXT" = "$BRANCH" ]; then
+            echo "::notice::shipped $BRANCH — no new cycle name expected (same tag); nothing to cut"
+            exit 0
+          fi
+          git fetch -q origin "+refs/heads/${NEXT}:refs/remotes/origin/${NEXT}" 2>/dev/null || true
+          if git show-ref --verify --quiet "refs/remotes/origin/${NEXT}"; then
+            echo "::notice::cycle $NEXT already exists on origin — leaving it untouched"
+            exit 0
+          fi
+          git checkout --quiet -b "$NEXT" "refs/tags/v${VER}"
+          git push -q origin "HEAD:${NEXT}"
+          echo "::notice::shipped v${VER} from $BRANCH — next cycle $NEXT cut from v${VER}; new fix PRs target it"

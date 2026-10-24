@@ -1,21 +1,25 @@
-name: Fix dual-PR (bugfix twin)
+name: Fix dual-PR (patch-branch twin)
 
-# Dual-lane release model, fixed-branch form (2026-10-24): the standing
-# `bugfix` branch is the fast ship lane (cut from the latest release tag;
-# only small fixes land on it via PRs). Every PR INTO `bugfix` gets its
-# master twin opened automatically: the fix commits are cherry-picked onto
-# origin/master, pushed as `twin/<fix-branch>`, and a PR base=master is
-# opened (or its branch force-updated on synchronize). The owner merges BOTH:
-# the bugfix PR ships it fast; the twin PR keeps master from regressing.
-# This replaces backport.yml (label-bot cherry-picking onto per-cycle
-# bugfix-release/* trains) — the "did it make the train?" blind spot dies
-# with it: a fix is on the lane the moment its bugfix PR merges, and the
-# twin PR is a first-class reviewable object instead of a comment trail.
+# Dual-lane release model, per-cycle form (2026-10-24): each patch cycle
+# has its own branch `patch/v<latest-release-tag>` — cut from THAT tag by
+# the ship closeout (release-bugfix.yml) or on demand (release-manual.yml),
+# so it always sits exactly on top of its base tag plus the fixes merged
+# since. Small user-facing fixes land there via PRs; every PR INTO
+# `patch/v*` gets its master twin opened automatically: the fix commits are
+# cherry-picked onto origin/master, pushed as `twin/<fix-branch>`, and a PR
+# base=master is opened (or its branch force-updated on synchronize). The
+# owner merges BOTH: the patch PR ships it fast; the twin PR keeps master
+# from regressing. When master releases a normal version mid-cycle, the
+# next ship auto-recuts from the newer tag and replays any fixes not yet
+# on master (release-manual.yml recut-replay). This replaces backport.yml
+# (label-bot cherry-picking onto per-cycle trains) — the "did it make the
+# train?" blind spot dies with it: a fix is on the cycle branch the moment
+# its patch PR merges, and the twin is a first-class reviewable object.
 
 on:
   pull_request:
     types: [opened, synchronize, reopened, closed]
-    branches: [bugfix]
+    branches: ["patch/v*"]
 
 concurrency:
   group: fix-dual-pr-${{ github.event.pull_request.number }}
@@ -41,6 +45,7 @@ jobs:
           PR_HEAD_SHA="$(jq -r '.pull_request.head.sha' "$J")"
           PR_TITLE="$(jq -r '.pull_request.title' "$J")"
           PR_MERGED="$(jq -r '.pull_request.merged' "$J")"
+          PR_BASE_REF="$(jq -r '.pull_request.base.ref' "$J")"
           {
             echo "action=$PR_ACTION"
             echo "number=$PR_NUM"
@@ -48,6 +53,7 @@ jobs:
             echo "head_sha=$PR_HEAD_SHA"
             echo "title=$PR_TITLE"
             echo "merged=$PR_MERGED"
+            echo "base_ref=$PR_BASE_REF"
             echo "twin_branch=twin/$PR_HEAD_REF"
           } >> "$GITHUB_OUTPUT"
 
@@ -80,9 +86,9 @@ jobs:
                 -H "Authorization: Bearer $GH_TOKEN" \
                 -H "Accept: application/vnd.github+json" \
                 "https://api.github.com/repos/${{ github.repository }}/issues/${TWIN_NUM}/comments" \
-                -d "$(jq -n --arg b "The bugfix-lane PR #${PR_NUM} was merged — this twin is now the only thing keeping master from regressing the fix. Merge it at your convenience (rebase-free; conflicts here mean master moved under the fix and the pick must be redone manually)." '{body:$b}')"
+                -d "$(jq -n --arg b "The patch-branch PR #${PR_NUM} was merged — this twin is now the only thing keeping master from regressing the fix. Merge it at your convenience (rebase-free; conflicts here mean master moved under the fix and the pick must be redone manually)." '{body:$b}')"
             fi
-            echo "bugfix PR merged — twin (if any) nudged, nothing else to do"
+            echo "patch PR merged — twin (if any) nudged, nothing else to do"
             exit 0
           fi
           if [ -n "$TWIN_NUM" ]; then
@@ -99,10 +105,13 @@ jobs:
         # Rebuilt from scratch on every event: the twin is always
         # origin/master + exactly this PR's commits, so a synchronize push
         # (new commits, force-push, rebase) just re-picks the current range.
-        # Range = origin/bugfix..PR head — the PR's OWN commits only, which
-        # requires the fix branch to be cut from the bugfix lane (repo
-        # convention). A master-based branch would replay master's whole
-        # unreleased delta — rejected by the commit-count guard below.
+        # Range = origin/<patch branch>..PR head — the PR's OWN commits
+        # only, which requires the fix branch to be cut from the CURRENT
+        # cycle's patch branch (repo convention). A master-based branch
+        # would replay master's whole unreleased delta — rejected by the
+        # commit-count guard below. A SUPERSEDED patch branch (predating
+        # the newest released tag) only gets a loud warning here: the
+        # recut-replay at the next ship rescues anything merged into it.
         if: steps.ctx.outputs.action != 'closed'
         id: pick
         env:
@@ -111,23 +120,36 @@ jobs:
           PR_HEAD_REF: ${{ steps.ctx.outputs.head_ref }}
           PR_NUM: ${{ steps.ctx.outputs.number }}
           TWIN_BRANCH: ${{ steps.ctx.outputs.twin_branch }}
+          BASE_REF: ${{ steps.ctx.outputs.base_ref }}
         run: |
           set -euo pipefail
-          git fetch -q origin master bugfix --tags
+          git fetch -q origin master --tags
+          git fetch -q origin "+refs/heads/${BASE_REF}:refs/remotes/origin/${BASE_REF}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           case "$PR_HEAD_REF" in
-            twin/*) echo "::notice::twin PRs never re-enter the bugfix lane (head ${PR_HEAD_REF}) — nothing to do"; exit 0 ;;
+            twin/*) echo "::notice::twin PRs never re-enter the patch lane (head ${PR_HEAD_REF}) — nothing to do"; exit 0 ;;
           esac
+          LATEST_TAG="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)"
+          if ! git merge-base --is-ancestor "refs/tags/${LATEST_TAG}" "refs/remotes/origin/${BASE_REF}" 2>/dev/null; then
+            NEW_CYCLE="patch/v${LATEST_TAG#v}"
+            BODY="⚠️ This PR targets \`${BASE_REF}\`, which predates ${LATEST_TAG} — a newer patch cycle has already started. Nothing is lost: fixes merged here are REPLAYED onto the fresh cycle branch at the next ship (auto-recut). Cleaner to re-target now at \`${NEW_CYCLE}\` though."
+            curl -sS -f -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
+              -d "$(jq -n --arg b "$BODY" '{body:$b}')" || true
+            echo "::warning::target patch branch predates ${LATEST_TAG} (recut-replay will rescue it at ship time)"
+          fi
           echo "forwarded=false" >> "$GITHUB_OUTPUT"
           git rev-parse --verify --quiet "${PR_HEAD_SHA}^{commit}" >/dev/null || git fetch -q origin "$PR_HEAD_SHA"
-          RANGE_COUNT="$(git rev-list --count --no-merges origin/bugfix.."$PR_HEAD_SHA" || echo 0)"
+          RANGE_COUNT="$(git rev-list --count --no-merges origin/"${BASE_REF}".."${PR_HEAD_SHA}" || echo 0)"
           if [ "$RANGE_COUNT" -eq 0 ]; then
-            echo "::notice::no own commits vs origin/bugfix — nothing to forward (already merged?)"
+            echo "::notice::no own commits vs origin/${BASE_REF} — nothing to forward (already merged?)"
             exit 0
           fi
           if [ "$RANGE_COUNT" -gt 20 ]; then
-            BODY="The PR carries ${RANGE_COUNT} commits vs the bugfix lane — it looks cut from **master**, not from \`bugfix\`. The twin bot refuses to replay master's unreleased delta. Re-cut the fix branch from the latest \`bugfix\` tip and re-push."
+            BODY="The PR carries ${RANGE_COUNT} commits vs the patch branch — it looks cut from **master**, not from a \`patch/v*\` cycle branch. The twin bot refuses to replay master's unreleased delta. Re-cut the fix branch from the current cycle's patch branch tip and re-push."
             curl -sS -f -X POST \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" \
@@ -137,7 +159,7 @@ jobs:
             exit 1
           fi
           git checkout --quiet -B "$TWIN_BRANCH" origin/master
-          for C in $(git rev-list --reverse --no-merges origin/bugfix.."$PR_HEAD_SHA"); do
+          for C in $(git rev-list --reverse --no-merges origin/"${BASE_REF}".."${PR_HEAD_SHA}"); do
             git cherry-pick -x "$C"
           done
           git push -q --force origin "HEAD:${TWIN_BRANCH}"
@@ -168,7 +190,7 @@ jobs:
             echo "::notice::twin PR already open (#$(jq -r '.[0].number' <<<"$EXISTING")) — branch force-update carries the new commits"
             exit 0
           fi
-          BODY="$(printf 'Auto-opened master twin of the bugfix-lane PR #%s (fix-dual-pr bot). Merge the bugfix PR to ship it fast; merge THIS PR to keep master from regressing it — both sides must merge eventually.\n\nPicked commits:\n%s' "$PR_NUM" "$PICKED")"
+          BODY="$(printf 'Auto-opened master twin of the patch-branch PR #%s (fix-dual-pr bot). Merge the patch PR to ship it fast; merge THIS PR to keep master from regressing it — both sides must merge eventually.\n\nPicked commits:\n%s' "$PR_NUM" "$PICKED")"
           PAYLOAD="$(jq -n --arg t "${PR_TITLE} (master twin)" --arg h "$TWIN_BRANCH" --arg b "$BODY" '{title:$t, head:$h, base:"master", body:$b}')"
           HTTP_CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
             -H "Authorization: Bearer $GH_TOKEN" \
