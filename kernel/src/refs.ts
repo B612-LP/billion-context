@@ -63,6 +63,9 @@ export interface AssignRefsResult {
   map: MessageRefMap;
   nextIndex: number;
   newlyAssigned: number;
+  /** Ids whose stale BLOCKED entry migrated to a fresh numeric ref this pass
+   *  (#2607). The caller defers their carrier re-render (#3939 ②/#3805). */
+  migratedIds: string[];
 }
 
 export interface AssignRefsOptions {
@@ -85,6 +88,18 @@ export function assignRefs(
       ? options.nextIndex
       : MIN_INDEX;
   let newlyAssigned = 0;
+  const migratedIds: string[] = [];
+
+  // #3945: a BLOCKED binding is keyed by id but SHARED by every message
+  // carrying that id, while protection is decided per message. Migrating the
+  // binding the moment ONE sibling loses protection would re-tag a
+  // still-protected sibling's already-sent bytes. Migration requires that NO
+  // message with that id is protected this pass.
+  const siblingProtected = new Set<string>();
+  for (const message of messages) {
+    if (!message.id || options.shouldSkip?.(message)) continue;
+    if (options.isProtected?.(message)) siblingProtected.add(message.id);
+  }
 
   for (const message of messages) {
     if (!message.id || options.shouldSkip?.(message)) continue;
@@ -96,13 +111,42 @@ export function assignRefs(
       // is lifted (#2607: #1188 pinned all media; archivable images now fold
       // and must be citable via decompress({ imageRef })). Fresh number only —
       // the id-never-reused contract holds.
-      if (prev === BLOCKED_REF && !protectedNow) delete map.byRaw[message.id];
-      else continue;
+      if (
+        prev === BLOCKED_REF &&
+        !protectedNow &&
+        !siblingProtected.has(message.id)
+      ) {
+        delete map.byRaw[message.id];
+        migratedIds.push(message.id);
+      } else continue;
     }
 
     if (protectedNow) {
       map.byRaw[message.id] = BLOCKED_REF;
       continue;
+    }
+
+    // #4316 layer 3: store-served views stamp ledgerSeq — the unified
+    // transcript position, assigned once and never re-minted. The ref IS the
+    // ledger number (direct display), so byte churn cannot renumber
+    // citations. Collisions (should be impossible — (session, seq) is a PK)
+    // fall through to the counter path; the cursor advances past the stamp so
+    // later counter-allocated refs never collide with future stamps either.
+    const ledgerSeq: number | undefined = message.ledgerSeq;
+    if (
+      typeof ledgerSeq === "number" &&
+      Number.isInteger(ledgerSeq) &&
+      ledgerSeq >= MIN_INDEX &&
+      ledgerSeq <= MAX_INDEX
+    ) {
+      const text = indexToRef(ledgerSeq);
+      if (!map.byRef[text]) {
+        map.byRaw[message.id] = text;
+        map.byRef[text] = message.id;
+        newlyAssigned++;
+        if (ledgerSeq >= cursor) cursor = ledgerSeq + 1;
+        continue;
+      }
     }
 
     const ref = allocateFreeRef(map, cursor);
@@ -112,7 +156,7 @@ export function assignRefs(
     newlyAssigned++;
   }
 
-  return { map, nextIndex: cursor, newlyAssigned };
+  return { map, nextIndex: cursor, newlyAssigned, migratedIds };
 }
 
 function allocateFreeRef(

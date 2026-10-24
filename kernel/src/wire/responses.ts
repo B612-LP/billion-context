@@ -6,6 +6,7 @@ import {
   canonicalOpaqueSeed,
   canonicalToolArgs,
   deriveCanonicalMessageId,
+  imageMediaFingerprint,
 } from "./identity.js";
 import type { ConversationIdentity } from "./util.js";
 import { hashId } from "./util.js";
@@ -127,6 +128,39 @@ function partText(part: ResponseContentPart): string {
   return "";
 }
 
+/** #4166: text view of a system/developer message item's content — same
+ *  flatten responsesToCore applies (string, or parts joined with "\n"). */
+function responsesTextOf(content: unknown): string {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content
+    .map((part) =>
+      part && typeof part === "object" && typeof (part as { text?: unknown }).text === "string"
+        ? (part as { text: string }).text
+        : "",
+    )
+    .join("\n");
+}
+
+/** #4166: true when content is a plain string or an all-text parts array —
+ *  the shapes whose bytes live entirely in `text`, so a kernel text rewrite
+ *  can re-lay them out without losing anything. */
+function isPlainResponsesContent(content: unknown): boolean {
+  if (content == null || typeof content === "string") return true;
+  return (
+    Array.isArray(content) &&
+    content.length > 0 &&
+    content.every(
+      (p) =>
+        p &&
+        typeof p === "object" &&
+        ((p as { type?: string }).type === "input_text" ||
+          (p as { type?: string }).type === "output_text") &&
+        typeof (p as { text?: unknown }).text === "string",
+    )
+  );
+}
+
 function messageContent(content: string | ResponseContentPart[]): string {
   return typeof content === "string"
     ? content
@@ -212,6 +246,7 @@ export function responsesToCore(
       stringInput: { original: body.input, coreId: id },
     };
   }
+  let sysDevHead = true;
   for (const [wireIndex, raw] of body.input.entries()) {
     const item = normalizeEasyInputItem(raw);
     let coreId: string | undefined;
@@ -251,9 +286,31 @@ export function responsesToCore(
         const message = item as ResponseInputMessage;
         const text = messageContent(message.content);
         if (message.role === "system" || message.role === "developer") {
-          systemParts.push(text);
-          idx++;
-          continue;
+          if (sysDevHead) {
+            systemParts.push(text);
+            idx++;
+            continue;
+          }
+          // #4166 (mirror of #3992): a MID-history system/developer item is
+          // client data — position-preserve it as a sidecar core instead of
+          // hoisting into systemParts (position destroyed + parts flattened).
+          // The host #1638 re-typing trick covered plugin/codex clients only;
+          // this is codec-native for every mode. Leading prefix still hoists
+          // (strict single-system upstreams keep their merged head, #377).
+          const midBase = deriveCanonicalMessageId(
+            message.role,
+            "text",
+            text,
+          );
+          msgs.push({
+            id: clusters.next(midBase),
+            role: "system",
+            contentType: "text",
+            text,
+            originalRole: message.role,
+            rawResponsesItem: item,
+          });
+          break;
         } else if (
           message.role === "user" ||
           (message.role === "assistant" && text)
@@ -309,12 +366,18 @@ export function responsesToCore(
                 part.type === "input_image" &&
                 typeof part.image_url === "string"
               ) {
+                const image = parseDataUrl(part.image_url);
                 const base = deriveCanonicalMessageId(
                   "user",
                   "text",
                   CANONICAL_IMAGE_TEXT,
+                  {
+                    // #3751: payload-addressed ids — base64 payload when present, else URL.
+                    mediaFingerprint: imageMediaFingerprint(
+                      image ? image.base64 : part.image_url,
+                    ),
+                  },
                 );
-                const image = parseDataUrl(part.image_url);
                 msgs.push({
                   id: clusters.next(base),
                   role: "user",
@@ -374,8 +437,30 @@ export function responsesToCore(
               role === "user"
                 ? userDisplayText(message.content, effText)
                 : effText;
+            // #3751: payload-addressed ids — every input_image in the merged
+            // shape contributes its fingerprint in order (single image ⇒ one
+            // fingerprint, byte-identical to the split path's image core so
+            // both forms of one logical message share one id; text-only legacy
+            // cores keep their ids verbatim).
+            const mediaFingerprint = Array.isArray(message.content)
+              ? message.content
+                  .flatMap((part) => {
+                    if (
+                      part?.type === "input_image" &&
+                      typeof part.image_url === "string"
+                    ) {
+                      const raw = part.image_url;
+                      const decoded = parseDataUrl(raw);
+                      return [imageMediaFingerprint(decoded ? decoded.base64 : raw)];
+                    }
+                    return [];
+                  })
+                  .join(",") || undefined
+              : undefined;
             coreId = clusters.next(
-              deriveCanonicalMessageId(role, "text", displayText),
+              deriveCanonicalMessageId(role, "text", displayText, {
+                mediaFingerprint,
+              }),
             );
             const imageUrl = Array.isArray(message.content)
               ? message.content.find(
@@ -529,6 +614,22 @@ export function responsesToCore(
     for (let k = before; k < msgs.length; k++) {
       msgs[k]!.wireIndex = wireIndex;
     }
+    // #4166: the sys/dev hoisting head lasts only until the first
+    // CONVERSATION item lands — mirroring the host #1638 head rule:
+    // sys/dev message items and the head-neutral tooling declarations
+    // (additional_tools / mcp_list_tools) do not break the head; anything
+    // else does. Mid-history system/developer items after that become
+    // positioned sidecar cores.
+    const role = (item as { role?: unknown }).role;
+    const isSysDevMsgItem =
+      (item.type === undefined || item.type === "message") &&
+      (role === "system" || role === "developer");
+    if (
+      !isSysDevMsgItem &&
+      item.type !== "additional_tools" &&
+      item.type !== "mcp_list_tools"
+    )
+      sysDevHead = false;
     const produced = msgs.slice(before).map((m) => m.id);
     layout.push({
       original: item,
@@ -815,11 +916,43 @@ export function coreToResponses(
     const biliMessage = message as BiliMessage;
     const raw = biliMessage.rawResponsesItem as ResponseInputItem | undefined;
     if (message.role === "system") {
-      out.push({
-        type: "message",
-        role: "developer",
-        content: message.text ?? "",
-      });
+      // #4166: a client mid-history system/developer item re-emits its raw
+      // item byte-exact (position + structured parts). Kernel text rewrites
+      // (emergency truncation) re-lay plain-text content; structured items
+      // are unfoldable-by-protection, so verbatim still. Cores WITHOUT a
+      // sidecar are kernel-rendered summary carriers — keep the legacy
+      // developer rebuild (their wire shape is golden-pinned).
+      const rawMsg = raw as
+        | { type?: string; role?: string; content?: unknown }
+        | undefined;
+      const isSysDevRaw =
+        rawMsg != null &&
+        (rawMsg.type === undefined || rawMsg.type === "message") &&
+        (rawMsg.role === "system" || rawMsg.role === "developer");
+      if (isSysDevRaw) {
+        const text = message.text ?? "";
+        if (
+          text !== responsesTextOf(rawMsg.content) &&
+          isPlainResponsesContent(rawMsg.content)
+        ) {
+          out.push({
+            type: "message",
+            role: rawMsg.role,
+            content:
+              typeof rawMsg.content === "string"
+                ? text
+                : [{ type: "input_text", text }],
+          } as ResponseInputItem);
+        } else {
+          out.push(raw as ResponseInputItem);
+        }
+      } else {
+        out.push({
+          type: "message",
+          role: "developer",
+          content: message.text ?? "",
+        });
+      }
       } else if (message.role === "assistant") {
       if (message.contentType === "text") {
         out.push({
