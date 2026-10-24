@@ -149,6 +149,7 @@
 | `BILI_CLIENT_BIN` | native 可执行文件覆盖（probe 契约同 launcher） |
 | `BILI_CONVERSATION_ID` | codex spawn 期会话注册（CLAUDE_CODE_SESSION_ID 优先） |
 | `BILI_MCP_PROXY` | codex MCP shell 用的 proxy origin（含发现回退） |
+| `BILI_CODEX_STATE_MODE` | codex 状态处理 auto/shared/legacy（#2222/#3203）：auto = 新版 codex（≥0.147.0）走 CODEX_SQLITE_HOME 共享库、旧版回退 overlay 副本；shared = 最多 16 个并发会话各占一个 overlay 槽位；legacy = 每 home 一个独占 overlay（未识别值告警并落回 auto，src/launcher.ts:3666） |
 | `BILI_MCP_DEFAULT_ORIGIN` | zcode MCP entry 默认 origin（http://127.0.0.1:8787） |
 | `BILI_MCP_NO_ORPHAN_ADOPT` | `=1` 多宿主共享一个 proxy 时禁用孤儿 adopt |
 | `BILI_UPSTREAM_PROXY` / `BILI_UPSTREAM_PROXY_MODE` | 上游出口代理及 manual/auto 模式（默认直连是有意设计，#346/#357） |
@@ -216,4 +217,5 @@
 
 - **2026-10-15 远端分支卫生（#3249 执行）**：删除 origin 已合并远端分支 **1394 条**（1386 条 = 已合并 PR 的同仓 head 分支 + 8 条 = 完全并入 master 但无对应 PR 记录：`2026-08-08_release-v0.1.14`、`2026-09-26_opencode-zen-mitm`、`2026-09-30_responses-side-compaction`、`2026-10-04_plugin-fork-context-provenance`、`2026-10-13_lastmessages-tabling`、`chore/pages-enablement`、`fix/codex-custom-tool-call-text-protocol`、`revert-3189-pages-enablement`）。删除前核对：与 open PR head 交集为空。删除后 origin 剩 361 个 head（其中 128 条为 open PR 分支、201 条 closed-unmerged 且未并入 master、30 条无 PR 未并入 = 废弃工作，均不动）。另执行一次 `git worktree prune` 清掉失效 worktree 登记。
 - **2026-10-20 台账补登（本 PR）**：#3249 落地本台账时 `src/` 实际读取数已比登记数多 22（#3955 mysql、guardrails、#3128 网络预算、#3400 图像缩放、#3619 错峰、#3733 dsh compaction、#3756 snapshot shadow 等），守卫上线即全线红（master run 均被后续 push 取消所以未暴露）。本次 22 条全部补登（3 条 §1 + 19 条 §2）。
+- **2026-10-24 台账补登（#4541 分析时发现）**：`BILI_CODEX_STATE_MODE`（codex 共享状态车道 #2222/#3203）由 #4525 train 带入 master 时漏立账，lifecycle-ledger-guard 全线红；补登 §2.6。
 - **机器侧纪律（owner 手工做过，记录备查，不做自动化）**：2026-10-15 手工清理 11 个陈年 bili 进程（全部零活跃连接才杀）/ /tmp 清 2.2GB / master-wt worktree 421MB / 20 个已合并本地分支 / index.db 旧归档。**杀进程保持人工**（需要人眼判断连接归属，自动化风险大于收益），每次大版本装机后人工过一遍。
