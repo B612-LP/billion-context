@@ -153,14 +153,18 @@ function escapeRegExp(s: string): string {
  * vector the other primitives did not cover: #3959 proved an absolute user path
  * reached a public issue body through exactly this flow.
  *
- * Anchored on BOTH flanks so it never corrupts a neighbour token:
+ * Anchored on both flanks so word-embedded neighbours are never touched:
  *   - LEFT — the char before the home prefix must not be a word char or `/`.
  *     Rejects relative paths (`foo/home/<user>`) and URL pathnames, whose
  *     preceding segment ends in a hostname word-char (and, after
  *     maskUrlsForPublish runs first, query/hash are already dropped and hosts
  *     masked, so a home-shaped segment inside a URL is left alone);
- *   - RIGHT — the char after it must not be a word char. Rejects sibling homes
- *     (`/home/<user>2` when $HOME=/home/<user>).
+ *   - RIGHT — the char after it must not be a word char. Rejects word-suffixed
+ *     sibling homes (`/home/<user>2` when $HOME=/home/<user>). Dot/hyphen
+ *     siblings (`/home/<user>.bak`, `/home/<user>-bob`) DO get rewritten to
+ *     `~…`: deliberate safe-side over-masking — widening the anchor to spare
+ *     them would under-mask a real home followed by punctuation (e.g. the
+ *     sentence-final period in `path /home/<user>.`).
  */
 export function maskPathsForPublish(text: string): string {
     if (!text) return text;

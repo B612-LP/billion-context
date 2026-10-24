@@ -686,7 +686,7 @@ test("maskIpsInText: non-loopback IP literals scrubbed from free-form text (#171
 
 // #4499: publish-path $HOME stripping — the bare-absolute-path vector #3959 proved
 // reached a public issue body. Rewrites ONLY the live home prefix, anchored on both
-// flanks so sibling homes, relative paths and URL pathnames survive untouched.
+// flanks so word-suffixed siblings, relative paths and URL pathnames survive untouched.
 test("maskPathsForPublish: rewrites the $HOME prefix to ~ and only that", () => {
     const home = os.homedir();
     assert.equal(maskPathsForPublish(`delete ${home}/.cache/bili/x.json and restart`), "delete ~/.cache/bili/x.json and restart");
@@ -700,6 +700,10 @@ test("maskPathsForPublish: rewrites the $HOME prefix to ~ and only that", () => 
     assert.equal(maskPathsForPublish(`https://relay.internal/api${home}/file`), `https://relay.internal/api${home}/file`);
     // no home present -> verbatim
     assert.equal(maskPathsForPublish("/etc/hosts unchanged"), "/etc/hosts unchanged");
+    // dot/hyphen siblings over-mask to ~ — pinned as deliberate safe-side direction
+    // (wider anchoring would under-mask a real home followed by punctuation)
+    assert.equal(maskPathsForPublish(`${home}.bak/x`), `~.bak/x`);
+    assert.equal(maskPathsForPublish(`${home}-bob/x`), `~-bob/x`);
 });
 
 // #4499: THE single publish-boundary scrubber — secrets -> non-public hosts -> $HOME
