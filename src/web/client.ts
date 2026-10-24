@@ -1132,11 +1132,60 @@ function changelogCatOf(rawLine) {
             if (sp && typeof sp.pid === "number") {
                 spb.hidden = false;
                 spb.classList.add("show");
-                spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
+                // #3923/#3959: a known bili instance of a DIFFERENT lane sharing
+                // the machine-global sessions dir is the supported topology —
+                // informational styling, not a corruption alarm.
+                if (sp.benign === true) {
+                    spb.classList.remove("warn");
+                    spb.classList.add("info");
+                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_cross_lane_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_cross_lane", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
+                } else {
+                    spb.classList.remove("info");
+                    spb.classList.add("warn");
+                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
+                }
             } else {
                 spb.hidden = true;
                 spb.classList.remove("show");
                 spb.innerHTML = "";
+            }
+        }
+        const sbb = $("split-brain-banner");
+        if (sbb) {
+            // #3923/#3959: a REAL contest — session id + title + both sides'
+            // pid/lane, with a dismiss action that clears the surfaced entry.
+            const sb = d.storage && typeof d.storage === "object" ? d.storage.splitBrain : null;
+            if (sb && typeof sb.sessionId === "string" && sb.self && typeof sb.self.pid === "number" && sb.peer && typeof sb.peer.pid === "number") {
+                sbb.hidden = false;
+                sbb.classList.add("show");
+                const laneOf = (x) => (x && typeof x.lane === "string" && x.lane ? x.lane : t("sys.split_brain_lane_undeclared"));
+                sbb.innerHTML = "<strong>" + escapeHtml(t("sys.split_brain_title")) + "</strong> "
+                    + escapeHtml(t("sys.split_brain", {
+                        title: typeof sb.title === "string" && sb.title ? sb.title : sb.sessionId.slice(0, 8),
+                        sid: sb.sessionId.slice(0, 8),
+                        selfPid: String(sb.self.pid),
+                        selfLane: laneOf(sb.self),
+                        peerPid: String(sb.peer.pid),
+                        peerLane: laneOf(sb.peer),
+                    }))
+                    + '<div style="margin-top:8px"><button id="split-brain-ack-btn" class="btn sm">' + escapeHtml(t("sys.split_brain_ack_btn")) + "</button></div>";
+                const ackBtn = $("split-brain-ack-btn");
+                if (ackBtn) ackBtn.addEventListener("click", async () => {
+                    busy(ackBtn, true);
+                    try {
+                        await json(API_ROOT + "/storage/split-brain/ack", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sb.sessionId }) });
+                        toast(t("sys.split_brain_acked"), "ok");
+                        await loadOverview(true);
+                    } catch (e) {
+                        toast(e instanceof Error ? e.message : String(e), "err");
+                    } finally {
+                        busy(ackBtn, false);
+                    }
+                });
+            } else {
+                sbb.hidden = true;
+                sbb.classList.remove("show");
+                sbb.innerHTML = "";
             }
         }
         const pt = $("passthrough-banner");
@@ -1807,7 +1856,7 @@ function changelogCatOf(rawLine) {
     }
     const chartZooms = [];   // live instances — Esc resets any zoomed chart (#2489 behavior)
     function makeChartZoom(cfg) {
-        // cfg: { elId, statusId, resetId, render(lines, folds, seams) -> svg }
+        // cfg: { elId, statusId, resetId, render(lines, folds, seams) -> svg, link?: { members } }
         const z = { range: null, drag: null, state: null, cfg };
         z.visible = function visible() {
             if (!z.state) return null;
@@ -1855,8 +1904,15 @@ function changelogCatOf(rawLine) {
             updateStatus(v);
         };
         z.setRange = function setRange(r) {
-            z.range = r && r[1] > r[0] ? [r[0], r[1]] : null;
+            const nr = r && r[1] > r[0] ? [r[0], r[1]] : null;
+            const same = (nr === null && z.range === null) || (nr !== null && z.range !== null && nr[0] === z.range[0] && nr[1] === z.range[1]);
+            if (same) return;
+            z.range = nr;
             z.render();
+            // #4317: linked charts share ONE brush window — a selection or reset on either
+            // re-renders its peers over the same sample indices. The length guard keeps a
+            // stale peer bound to another session's ledger out of the propagation.
+            if (cfg.link && z.state) cfg.link.members.forEach((m) => { if (m !== z && m.state && m.state.lines.length === z.state.lines.length) m.setRange(nr); });
         };
         function localX(wrap, ev) {
             const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
@@ -1922,11 +1978,15 @@ function changelogCatOf(rawLine) {
             z.render();
         };
         chartZooms.push(z);
+        if (cfg.link) cfg.link.members.push(z);
         return z;
     }
     const trajAux = { win: 0, baseIn: 0 };
-    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
-    const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
+    // #4317: both detail charts plot the SAME request timeline in two projections —
+    // one shared brush window keeps them in lockstep (select on either, both follow).
+    const detailChartLink = { members: [] };
+    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", link: detailChartLink, render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
+    const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", link: detailChartLink, render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
     function bindTrajectoryBrush(d) {
         const ledger = d.ledger || {};
         const lines = (ledger.lines || []).filter((l) => Boolean(l));
@@ -1945,6 +2005,7 @@ function changelogCatOf(rawLine) {
     window.bili_hitSvg = hitRateSvg;
     window.bili_causes = classifyLineCauses;
     window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => trajZoom.visible(), range: () => trajZoom.range };
+    window.bili_hitZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => hitZoom.visible(), range: () => hitZoom.range };
     function blockTopic(b) {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
@@ -2536,6 +2597,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             parts.push('<div class="dim small" style="margin-top:10px">' + t("common.context") + ctxMark + ": " + fmtW(ctxVal) + "</div>");
         }
         if ((d.retrieveCalls || 0) > 0) parts.push('<div class="dim small" style="margin-top:10px">' + t("det.ccr") + ' · <span class="mono">' + t("det.ccr_detail", { calls: d.retrieveCalls, hits: d.retrieveHits || 0, misses: d.retrieveMisses || 0 }) + "</span></div>");
+        if ((d.wholeBlockRestores || 0) > 0 || (d.rangeRestores || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.decompress") + ' · <span class="mono">' + t("det.decompress_detail", { blocks: d.wholeBlockRestores || 0, precise: d.wholeBlockRestoresPreciseAvailable || 0, ranges: d.rangeRestores || 0 }) + "</span></div>");
         if ((d.storedBytes || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.store") + ' · <span class="mono">' + fmtB(d.storedBytes) + ((d.storeBytesSaved || 0) > 0 ? " / " + fmtB(d.storeBytesSaved) + " " + t("common.saved") : "") + "</span></div>");
         parts.push("</div></div>");
         const ledger = d.ledger || {};
@@ -3471,6 +3533,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
             const m = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
             mitmInp.value = (m && Array.isArray(m.domains)) ? m.domains.filter((x) => typeof x === "string").join(", ") : "";
+            const ds = (draft.dsh && typeof draft.dsh === "object" && !Array.isArray(draft.dsh)) ? draft.dsh : null;
+            dshCtxRow.inp.checked = ds ? ds.contextTab !== false : true;
+            dshLblInp.value = (ds && typeof ds.contextTabLabel === "string") ? ds.contextTabLabel : "";
         }
         function commit(mutate) {
             const fresh = freshDraft();
@@ -3532,6 +3597,25 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         imgHint.className = "dim small";
         imgHint.textContent = t("cfg.q_imgrescale_hint");
         imgRow.ctl.appendChild(imgHint);
+        const dshCtxRow = row("quick-dsh-ctxtab", t("cfg.q_dsh_ctxtab"));
+        qCtrls.push(dshCtxRow.inp);
+        dshCtxRow.inp.addEventListener("change", () => commit((d) => {
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (dshCtxRow.inp.checked) delete ds.contextTab; else ds.contextTab = false;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
+        const dshCtxHint = document.createElement("span");
+        dshCtxHint.className = "dim small";
+        dshCtxHint.textContent = t("cfg.q_dsh_ctxtab_hint");
+        dshCtxRow.ctl.appendChild(dshCtxHint);
+        const dshLblInp = textRow("quick-dsh-ctxtab-label", t("cfg.q_dsh_ctxtab_label"));
+        qCtrls.push(dshLblInp);
+        dshLblInp.addEventListener("change", () => commit((d) => {
+            const v = dshLblInp.value.trim();
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (v.length > 0) ds.contextTabLabel = v; else delete ds.contextTabLabel;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
         const abRow = row("quick-absorb", t("cfg.q_absorb"));
         qCtrls.push(abRow.inp);
         abRow.inp.addEventListener("change", () => commit((d) => {

@@ -6,7 +6,7 @@ import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unres
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
 import { loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
-import { applyCompressSettings } from "../compress-settings.js";
+import { applyCompressSettings, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
 import { detectCostAdvisories } from "../plugin-advisory.js";
@@ -36,7 +36,7 @@ import { handleChangelogGet } from "../web/changelog.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
-import { storageStatusWire } from "../storage/runtime-status.js";
+import { ackSplitBrainContest, storageStatusWire } from "../storage/runtime-status.js";
 import { snapshotShadowStatusWire } from "../server/snapshot-render.js";
 import { attributionStatusWire } from "./attribution-status.js";
 
@@ -169,6 +169,24 @@ export function isManagementPath(url: string | undefined): boolean {
 // #2170 split-session canary: one log line per conversation base per process.
 const splitWarnedBases = new Set<string>();
 
+/** The proxy an AUX (blind-tunnel) request would take (#1012's inherited tier
+ *  included), reported on health so the launcher can hand a child process the
+ *  egress the user gives every other shell command. Deliberately not the
+ *  model-path decision: /__bili/upstream answers for opts.upstream, where the
+ *  provider route and model fallback tiers outrank the env tier and
+ *  `explicitDirect` can short-circuit — a different proxy for the same
+ *  instance. No target: this answers "what would ANY host resolve to".
+ *  Errors resolve to null rather than failing health, which every attacher and
+ *  spawn-wait keys on. */
+function auxProxyShot(opts: ProxyOptions): { proxy: string | null; source: string | null } {
+    try {
+        const decision = resolveProxyDecision(opts.routes, opts.proxy, undefined, opts.auxProxyFallback ?? opts.proxyFallback);
+        return { proxy: decision.proxy ?? null, source: decision.source };
+    } catch {
+        return { proxy: null, source: null };
+    }
+}
+
 export async function handleAdminRoute(req: http.IncomingMessage, res: http.ServerResponse, ctx: AdminCtx): Promise<void> {
     const { opts, core, config, log, instanceId, instanceStartedAt, proxyWatchers, initialWatcherPid, watcherLastSeen } = ctx;
     // SECURITY: the /__bili/ management endpoints (config read/write, reload,
@@ -239,6 +257,19 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
         return;
     }
+    // #3536: browsers probing the proxy origin for a favicon (the dsh desktop
+    // settings panel frames /__bili/ and the frame fires GET /favicon.ico at
+    // the ORIGIN ROOT) must be answered locally with 204 — falling through to
+    // the relay would rewrite the host onto the configured upstream, burning a
+    // request there and logging a 403 for a static asset no model client ever
+    // asks for. The panel page itself also declares an empty icon (page.ts) so
+    // well-behaved browsers never send the probe at all; this is the backstop
+    // for browsers/timings that still do (probe before redirect, direct visits).
+    if (req.method === "GET" && req.url?.split("?", 2)[0] === "/favicon.ico") {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
     if (req.method === "GET" && req.url === "/__bili/health") {
         // #2941: 503 while registration is still pending — every consumer
         // (launcher spawn-wait, attach discovery, host-native respawn) keys on
@@ -253,7 +284,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // #1322: watchdog state is part of the health contract — attachers and
         // operators can see whether this proxy dies with its sessions (armed)
         // or outlives them all (daemon squatting a stable port).
-        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
+        const aux = auxProxyShot(opts);
+        res.end(JSON.stringify({ ok: true, upstream: opts.upstream, version: VERSION, commit: BUILD_COMMIT, instanceId, pid: process.pid, startedAt: instanceStartedAt, blindTunnels: getBlindTunnelStats(), auxProxy: aux.proxy, auxProxySource: aux.source, watchdog: { armed: initialWatcherPid !== null, parentPid: initialWatcherPid ?? undefined, watchers: [...proxyWatchers] } }));
         return;
     }
     // Web config UI (served as HTML, separate from the JSON health check above).
@@ -343,6 +375,8 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     if (req.method === "POST" && req.url?.startsWith("/__bili/conflicts/clear")) return handleConflictsClear(req.url, res, log);
     // #2861: silence a known host-side plugin notice for this environment.
     if (req.method === "POST" && req.url === "/__bili/host-plugins/dismiss") return handleHostPluginDismiss(req, res, log);
+    // #3923/#3959: dismiss the surfaced split-brain notice (body {"sessionId": string}).
+    if (req.method === "POST" && req.url === "/__bili/storage/split-brain/ack") return handleSplitBrainAck(req, res, log);
     if (req.method === "GET" && req.url === "/__bili/upstream") {
         const target = opts.upstream;
         const decision = resolveProxyDecision(opts.routes, opts.proxy, target, opts.proxyFallback);
@@ -408,7 +442,12 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // (DEFAULT_CCR_CONFIG et al. inside applyCompressSettings); per-request/route overrides
         // are still enforced at execution time, so the manifest stays conservative as #1192
         // requires. Do not "simplify" this back to `config`.
-        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} }));
+        // #3243: pass the pack surface's tool descriptions too — resolved from the SAME
+        // global settings (no route/model context exists at manifest time), so registered
+        // tool descriptions follow the top-level promptPack while per-request system prompts
+        // may still honor deeper provider/model levels.
+        const packSurface = resolveCompressSurfaceDetailed(opts.compress ?? {});
+        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} }), packSurface.surface.toolPrompts);
     }
     if (req.method === "GET" && req.url?.split("?")[0] === "/__bili/plugin/snapshot") {
         return await handlePluginSnapshot(new URL(req.url, "http://localhost").searchParams.get("conversationId") ?? "", res);
@@ -914,6 +953,27 @@ async function handleHostPluginDismiss(req: http.IncomingMessage, res: http.Serv
     res.end(JSON.stringify({ ok: true }, null, 2));
 }
 
+// #3923/#3959: dismiss the surfaced split-brain notice (body {"sessionId": string}).
+async function handleSplitBrainAck(req: http.IncomingMessage, res: http.ServerResponse, log: (level: string, msg: string) => void): Promise<void> {
+    let sessionId = "";
+    try {
+        const doc: unknown = JSON.parse((await readBody(req)).toString("utf8"));
+        if (doc && typeof doc === "object" && typeof (doc as { sessionId?: unknown })["sessionId"] === "string") sessionId = (doc as { sessionId: string })["sessionId"];
+    } catch {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: 'expected JSON body {"sessionId": "<session id>"}' }, null, 2));
+        return;
+    }
+    if (!ackSplitBrainContest(sessionId)) {
+        res.writeHead(400, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: `no surfaced split-brain entry for session: ${sessionId}` }, null, 2));
+        return;
+    }
+    log("info", `[storage] split-brain notice for session ${sessionId.slice(0, 8)} acknowledged via web UI`);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true }, null, 2));
+}
+
 // ---- #2671 Phase 2: replica (checkpoint) helpers --------------------------
 
 /** checkpoints row (snake_case) → HTTP payload (camelCase). */
@@ -1032,6 +1092,14 @@ function sendStats(res: http.ServerResponse): void {
             promptSwitchMissedTokens: ps?.missedTokens ?? 0,
             projSwitches: js?.count ?? 0,
             projSwitchMissedTokens: js?.missedTokens ?? 0,
+            // #3671 direction 4: decompress usage — the model side already sees
+            // this via acp_status RETRIEVAL QUALITY (#1336); humans never did.
+            // `blocks` (same definition as the web list) is the fold-count
+            // denominator so the restore:fold ratio is computable from one endpoint.
+            wholeBlockRestores: s.stats.wholeBlockRestores ?? 0,
+            wholeBlockRestoresPreciseAvailable: s.stats.wholeBlockRestoresPreciseAvailable ?? 0,
+            rangeRestores: s.stats.rangeRestores,
+            blocks: s.state.blocks.length,
             // #901: window credibility — trusted (configured/registry) window vs the
             // largest input recent successful turns actually got through. A wide gap
             // means the provider overstates its window.
