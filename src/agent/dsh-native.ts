@@ -1284,8 +1284,10 @@ function noteForkVerdict(verdict: Extract<ForkChildVerdict, { ok: false }>): voi
             // exactly what #4215 needs named in the log (C10b).
             if (noticedForkBlindSpot) return;
             noticedForkBlindSpot = true;
-            const scoped = sidScope.getStore();
-            const scopedActive = typeof scoped === "string" && scoped.length > 0;
+            // #4491 generalized the scope to LlmDispatchScope (dispatchScope);
+            // scoped attribution is active when that store carries a sid.
+            const scopedStore = dispatchScope.getStore();
+            const scopedActive = scopedStore !== undefined && typeof scopedStore.sid === "string" && scopedStore.sid.length > 0;
             const shape =
                 verdict.reason === "initiator-threw" ? `threw (${verdict.detail ?? "unknown"})`
                     : verdict.reason === "initiator-missing" ? "returned no agent"
