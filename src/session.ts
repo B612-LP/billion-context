@@ -346,6 +346,15 @@ export type Session = {
         /** #3450: one-time mismatch warning already emitted for this session
          *  (upstream-stated window ≠ window in use). Provenance only. */
         overflowArmMismatchWarned?: boolean;
+        /** #4124: per-origin learned per-prompt image-count caps, from upstream
+         *  rejections ("Too many images in request: N > M"). Key =
+         *  normalizeUpstreamOrigin(url) — the same origin stamping as the token
+         *  overflow arm (#2313), because the cap belongs to the ROUTE, not the
+         *  session. Separate from overflowArmTokens by construction: that channel
+         *  rejects sub-1000 numbers and drives TOKEN-space shrink; an image cap
+         *  is a count. Persisted with the session; no TTL — a stale (too low) cap
+         *  can only over-shed, never under-shed. */
+        imageCountCaps?: Record<string, number>;
         /** Tokens compressed THIS turn whose fold has not yet materialized in
          *  an upstream usage report (the post-compress re-request re-sends the
          *  UNFOLDED history for prefix-cache reasons, so its usage report
