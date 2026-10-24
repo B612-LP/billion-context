@@ -296,13 +296,13 @@ export type CompressSettings = {
       *  boundary with an auditable warning, and a range entirely inside it is
       *  rejected. 0 or unset = off. Deepest level wins across global →
       *  provider → model, like the other compress fields. Maps to kernel
-      *  `preserveRecentTurns` (acp-kernel >= 0.0.152). */
+      *  `preserveRecentTurns` (acp-kernel >= 0.0.164). */
     preserveRecentTurns?: number;
     /** #4593: hard-protect every user text message (kernel
       *  `protectUserMessages`). User instructions are the only non-regenerable
       *  input in a session — once folded into a summary they can no longer be
       *  checked verbatim. Off unless explicitly enabled at some level. Maps to
-      *  kernel `protectUserMessages` (acp-kernel >= 0.0.152). */
+      *  kernel `protectUserMessages` (acp-kernel >= 0.0.164). */
     protectUserMessages?: boolean;
     /** Minimum compressible range size, in CHARACTERS (not tokens); smaller
      *  ranges are skipped. English/code averages ~4 chars per token, CJK
