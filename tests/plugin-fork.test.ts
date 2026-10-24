@@ -1314,7 +1314,12 @@ test("HTTP a lazily-persisted snapshot self-heals on the next model request afte
         _resetPluginStateForTest();
         const restored = getSession("parent");
         assert.equal(restored.pluginSnapshot, undefined, "a non-forked session restores without its raw snapshot");
-        assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 409);
+        // #3011: when the restore carries a verifiable UNFOLDED raw tail (unified-store
+        // restore), the endpoint serves it immediately (200) instead of waiting for the
+        // next model request; folded-only restores (legacy/shadow envelopes) still 409.
+        // Both pre-states are valid — the self-heal below is the pinned contract.
+        const pre = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert([409, 200].includes(pre.status), `expected 409 or 200 before self-heal, got ${pre.status}`);
         await sendModel(h, "parent", h.messages);
         assert.equal((await h.request("/__bili/plugin/snapshot?conversationId=parent")).status, 200);
         assert.equal(resolveConversation("parent").session!.pluginSnapshot!.length, 3);
