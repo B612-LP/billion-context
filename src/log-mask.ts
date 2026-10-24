@@ -134,7 +134,7 @@ function maskUrlForPublish(url: string): string {
  *  unconditionally (see maskUrlForPublish). Catches URLs wherever they appear
  *  in serialized text — object values AND object keys (the providers table
  *  uses upstream URLs as keys). */
-export function maskUrlsForPublish(text: string): string {
+function maskUrlsForPublish(text: string): string {
     return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => maskUrlForPublish(m));
 }
 
