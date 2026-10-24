@@ -99,7 +99,7 @@ test("cold → warm → tamper lifecycle (the #4360 CI sequence)", () => {
     const stale = cache.refreshDistMtimes(join(root, kernelComp.dir, "dist"), old);
     assert.ok(stale > 0);
     const backdatedIndex = join(root, kernelComp.dir, "dist", "index.js");
-    assert.equal(statSync(backdatedIndex).mtimeMs, old.getTime());
+    assert.ok(Math.abs(statSync(backdatedIndex).mtimeMs - old.getTime()) < 5, "backdate must stick (mtimeMs rounds to ms)");
     const seen4: string[] = [];
     cache.runPretestCache({ root, build: fakeBuild(seen4), log });
     assert.equal(seen4.length, 0); // still a HIT — content unchanged
