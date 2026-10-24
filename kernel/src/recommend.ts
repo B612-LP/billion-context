@@ -72,8 +72,9 @@ function isSyntheticOrPruned(
  *   3. Last visible user message (couples to Rule 1)
  *   4. Per-turn retention (#4593): the last N user-initiated turns form a
  *      positional protected suffix (`config.preserveRecentTurns`; recomputed
- *      every turn — see turn-retention.ts). Ranges overlapping it are
- *      rejected by projectUnit, not truncated like Rules 1-3.
+ *      every turn — see turn-retention.ts). A submitted range overlapping it
+ *      is carved there with an auditable receipt (like Rules 1-3); a range
+ *      entirely inside it is rejected by projectUnit.
  *
  * Then closes the tool-pair gap (#2886): if either half of a (tool-call,
  * tool-result) pair is protected, both are. Without this, `neverPreserveRecentTools`

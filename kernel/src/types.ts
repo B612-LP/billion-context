@@ -514,14 +514,16 @@ export interface Config {
   /** #4593: per-turn retention — the last N user-initiated turns stay
    *  verbatim on the wire. A turn boundary is a visible user message (not a
    *  summary carrier, not already covered by an active block); consecutive
-   *  user messages count as ONE boundary. Everything at or after the index
-   *  right past the (N+1)-th-from-last boundary is protected; when fewer than
+   *  user messages count as ONE boundary. Everything at or after the
+   *  (N+1)-th-from-last boundary (inclusive) is protected; when fewer than
    *  N+1 boundaries exist the ENTIRE conversation is retained. Recomputed
    *  every turn (the window slides with each new user message), so it rides
-   *  the soft-protection set rather than the permanent BLOCKED-ref decision
-   *  — and a submitted range that overlaps it is REJECTED (it is explicit
-   *  user intent, stronger than the advisory recent-zone truncation of
-   *  #3953). `0`/unset = off. */
+   *  the soft-protection set rather than the permanent BLOCKED-ref decision;
+   *  projectUnit enforces it in two tiers — a submitted range PARTIALLY
+   *  overlapping the window is carved at the boundary with an auditable
+   *  receipt warning, a range ENTIRELY inside it is REJECTED (explicit user
+   *  intent aimed at protected content). Fractional N floors (host parse and
+   *  kernel agree). `0`/unset = off. */
   preserveRecentTurns?: number;
   /** #4593: hard-exclude every ordinary user text message from compression
    *  (BLOCKED ref, same semantics as protectedTools): user instructions are

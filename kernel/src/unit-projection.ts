@@ -322,7 +322,7 @@ export function projectUnit(input: UnitProjectionInput): UnitProjection {
     const retention = computeTurnRetention(input.messages, input.state, input.config);
     let turnRetainedCount = 0;
     if (retention) {
-      zoneParts.push(`the last ${input.config.preserveRecentTurns} turns`);
+      zoneParts.push(`the last ${retention.turns} turns`);
       const retained = new Set<string>();
       for (let i = retention.boundaryIndex; i < input.messages.length; i++) {
         retained.add(input.messages[i]!.id);

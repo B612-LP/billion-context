@@ -90,6 +90,14 @@ test("computeTurnRetention: the window starts AT the (N+1)-th-from-last user mes
   });
 });
 
+test("computeTurnRetention: fractional N floors like host parse (#4593)", () => {
+  const state = createInitialState();
+  assert.deepEqual(computeTurnRetention(FIVE_TURNS, state, { preserveRecentTurns: 1.9 }), {
+    boundaryIndex: 8,
+    turns: 1,
+  });
+});
+
 test("computeTurnRetention: fewer than N+1 turns protects everything (#4593)", () => {
   const state = createInitialState();
   assert.deepEqual(computeTurnRetention(FIVE_TURNS, state, { preserveRecentTurns: 6 }), {

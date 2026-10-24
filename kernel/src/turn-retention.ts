@@ -20,14 +20,17 @@ import { SUMMARY_HEADER } from "./prune.js";
  * (an aged-out message would stay blocked forever, or force per-turn
  * BLOCKED→numeric migration = prefix-cache churn). It recomputes every turn:
  * computeProtectedRefs unions the refs into the soft-protection set, and
- * projectUnit rejects submitted ranges that overlap it.
+ * projectUnit enforces it in two tiers — a submitted range PARTIALLY
+ * overlapping the window is carved there (auditable receipt warning naming
+ * the turn zone), while a range ENTIRELY inside it is rejected (the range is
+ * explicit user intent aimed at protected content).
  */
 
 export interface TurnRetention {
   /** Smallest messages-array index inside the retained suffix; everything at
    *  or after it is protected. 0 = the entire conversation is retained. */
   boundaryIndex: number;
-  /** The configured N (for error wording). */
+  /** The effective (floored) N (for error wording). */
   turns: number;
 }
 
@@ -36,8 +39,12 @@ export function computeTurnRetention(
   state: CompressionState,
   config: Pick<Config, "preserveRecentTurns">,
 ): TurnRetention | null {
-  const turns = config.preserveRecentTurns;
-  if (turns === undefined || !Number.isFinite(turns) || turns < 1) return null;
+  const raw = config.preserveRecentTurns;
+  if (raw === undefined || !Number.isFinite(raw) || raw < 1) return null;
+  // The host floors at parse time (src/config.ts); the kernel must be
+  // self-consistent for direct API users — a fractional N would otherwise
+  // index boundaries[] fractionally and silently degrade to off.
+  const turns = Math.floor(raw);
   const covered = coveredMessageIds(state);
   const boundaries: number[] = [];
   for (let i = 0; i < messages.length; i++) {
