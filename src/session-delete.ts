@@ -40,10 +40,9 @@ export async function deleteSessionArtifacts(sessionId: string): Promise<DeleteS
     }
     if (resident) dropSessionForGc(sessionId);
     if (store.enabled) {
-        await store.removeSessionFiles(
-            sessionId,
-            resident ? { protocol: resident.meta.protocol, upstreamOrigin: resident.meta.upstreamOrigin } : undefined,
-        );
+        // #3928 full cascade: clears the unified-store rows too — removeSessionFiles
+        // alone leaves index.db rows that loadSync still serves from (#2935/master-drift).
+        await store.removeSession(sessionId);
     }
     try {
         await rm(restoreExportDir(sessionId), { recursive: true, force: true });
