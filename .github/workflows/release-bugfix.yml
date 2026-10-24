@@ -71,9 +71,17 @@ jobs:
               exit 0
             fi
             case "$BRANCH" in
-              bugfix-release/*) ;;
+              bugfix)
+                # Fixed bugfix lane (dual-lane model, fixed-branch form
+                # 2026-10-24): the ship PR carries head=bugfix.
+                ;;
+              bugfix-release/*)
+                # Legacy single-fix emergency carve-out (#2011): still
+                # accepted for hand-cut one-off branches; the standing lane
+                # above is the primary path.
+                ;;
               *)
-                echo "::notice::head branch '$BRANCH' is not a bugfix-release/* carve-out branch — nothing to publish"
+                echo "::notice::head branch '$BRANCH' is not the bugfix lane (or a legacy carve-out branch) — nothing to publish"
                 exit 0
                 ;;
             esac
@@ -297,15 +305,14 @@ jobs:
             "https://api.github.com/repos/${{ github.repository }}/releases" \
             -d @"$RUNNER_TEMP/release.json"
 
-      - name: Close the patch-train cycle (notice — the state is derived, nothing to clear)
-        # Dual-lane model: the open train is DERIVED (newest bugfix-release/*
-        # strictly above the latest v* tag), never stored — GITHUB_TOKEN
-        # cannot touch the actions-variables API, which is why the earlier
-        # variable pointer was removed. Publishing just created the tag that
-        # catches up to the train's base version, so the train auto-derives
-        # as closed: the next 'backport' label cuts a fresh train from the
-        # new tag (fully automatic lifecycle, zero stored state).
+      - name: Close the bugfix-lane cycle (notice — the lane stays put)
+        # Fixed-branch dual-lane model: the `bugfix` branch is long-lived.
+        # Publishing just tagged its current tree, so lane == tag content —
+        # the next fix PRs cut from the lane tip ride the NEXT patch ship
+        # with no re-cut ceremony. The lane only needs re-cutting when a
+        # MASTER release overtakes it (drift guard blocks the next ship
+        # until then; see reference/release.md, Dual-lane releases).
         if: steps.resolve.outputs.proceed == 'true'
         run: |
           BRANCH="${{ steps.resolve.outputs.branch }}"
-          echo "::notice::shipped '$BRANCH' — the fresh tag closes the patch-train cycle by derivation; the next 'backport' label cuts a fresh train"
+          echo "::notice::shipped '$BRANCH' — the lane now equals tag v$(node -p "require('./package.json').version"); fix PRs continue from the lane tip"

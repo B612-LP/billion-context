@@ -9,17 +9,23 @@ on:
     # PRs are gated there) (#772). Note: pushes made with GITHUB_TOKEN from
     # within Actions deliver NO push events — for those, the one-click
     # workflow compensates via workflow_dispatch below.
-    # Patch trains (dual-lane release model, 2026-10-24): human pushes to a
-    # bugfix-release/** train get the CORE matrix directly; backport.yml's
-    # token pushes compensate by dispatching this workflow on the train ref.
-    branches: [master, "*_release-v*", "bugfix-release/**"]
+    # Dual-lane release model (fixed-branch form, 2026-10-24): human pushes
+    # to a bugfix-release/** one-off branch get the CORE matrix directly;
+    # fix-dual-pr.yml's token pushes compensate by dispatching this workflow
+    # on the twin ref.
+    # The standing `bugfix` lane (fixed-branch dual-lane model) follows the
+    # same rule: human/agent pushes fire CI; the ship flow's GITHUB_TOKEN
+    # pushes fire nothing (release-manual dispatches full CI itself).
+    branches: [master, "*_release-v*", "bugfix-release/**", "bugfix"]
   pull_request:
     # agent-relay: #3468 agent PRs target the relay branch.
     # bugfix-release/**: PRs INTO a train (manual fixes landing on the train
     # directly, and the train's own ship PR lives under pull_request→master
     # anyway) run the CORE matrix; the full-suite gate at ship time is
-    # release-bugfix.yml's dispatch, not this trigger.
-    branches: [master, agent-relay, "bugfix-release/**"]
+    # release-bugfix.yml's dispatch, not this trigger. The standing `bugfix`
+    # lane is the same deal: fix PRs into it run CORE; fix-dual-pr.yml
+    # opens the master twin whose CI this also carries.
+    branches: [master, agent-relay, "bugfix-release/**", "bugfix"]
     # three-layer CI (#3295): synchronize keeps the CORE matrix blocking on
     # every push; `labeled` lets the `ci:full` label widen a PR to the FULL
     # matrix without a re-push (other labels no-op in the plan job).
@@ -179,6 +185,15 @@ jobs:
               elif grep -qw ci:full <<<"$PR_LABELS"; then
                 scope=full
               elif
+                # fix-dual-pr twins (twin/** heads, fixed bugfix lane): bot-
+                # authored ORDINARY fixes, not one-click release PRs — the
+                # #3688 bot-author rule below would needlessly pay the FULL
+                # matrix on every fix. CORE (the ci:full label was already
+                # given its chance above).
+                case "${PR_HEAD_REF:-}" in twin/*) true ;; *) false ;; esac
+              then
+                scope=core
+              elif
                 # #3688: release PRs are born full-scope. The merge is the
                 # publish trigger, so the full matrix must exist at the PR
                 # head BEFORE the human merges — waiting on a manual label
@@ -186,9 +201,10 @@ jobs:
                 # matrix cancelled). bot author = the one-click fallback PR
                 # (app/github-actions); branch glob = the one-click naming
                 # scheme (2026-10-18_release-v0.1.200); titles cover manual
-                # release PRs. bugfix-release/* carve-out branches are
-                # deliberately NOT matched: their own workflow gates the
-                # full suite at the PR head tree already.
+                # release PRs. bugfix-release/* carve-out branches and the
+                # standing `bugfix` lane are deliberately NOT matched: their
+                # own workflows gate the full suite at the ship tree already
+                # (release-manual dispatches full CI on the lane ref).
                 [ "${PR_AUTHOR:-}" = "github-actions" ] \
                 || [ "${PR_AUTHOR:-}" = "app/github-actions" ] \
                 || case "${PR_HEAD_REF:-}" in *_release-v*) true ;; *) false ;; esac \
@@ -381,13 +397,22 @@ jobs:
         run: |
           set -euo pipefail
           BRANCH="${GITHUB_HEAD_REF}"
+          # PRs into the standing bugfix lane diff against the lane itself,
+          # not master: the lane legitimately carries version state master
+          # has not merged yet (ship bumps); fix PRs into it must still be
+          # version-clean against the LANE.
+          BASE_REF="origin/master"
+          if [ "${{ github.event.pull_request.base.ref }}" = "bugfix" ]; then
+            BASE_REF="origin/bugfix"
+          fi
           # Release + bugfix carve-out branches (#2851/#2853) may bump version — one isolated 'release v{VERSION}' commit each.
-          if [[ "$BRANCH" == *_release-v* || "$BRANCH" == bugfix-release/* ]]; then
+          # The `bugfix` lane itself appears here as the SHIP PR head (base=master): its bump commit is the release.
+          if [[ "$BRANCH" == *_release-v* || "$BRANCH" == bugfix-release/* || "$BRANCH" == "bugfix" ]]; then
             echo "✓ release branch ($BRANCH) — version changes allowed"
             exit 0
           fi
           # Non-release branches must NOT touch the "version" field.
-          if git diff origin/master...HEAD -- package.json | grep -Eq '^[+-][[:space:]]*"version"[[:space:]]*:'; then
+          if git diff "${BASE_REF}...HEAD" -- package.json | grep -Eq '^[+-][[:space:]]*"version"[[:space:]]*:'; then
             echo "::error::\"version\" in package.json was changed on a non-release branch ($BRANCH)."
             echo "Version bumps must go on a dedicated *_release-v* branch with an isolated 'release v{VERSION}' commit. See AGENTS.md §4 'Version Bumps'."
             exit 1

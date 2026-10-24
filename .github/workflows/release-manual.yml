@@ -7,8 +7,8 @@ on:
         description: "Version to publish. Blank = auto next patch over npm latest."
         required: false
         default: ""
-      train:
-        description: "Ship the open patch train (derived from refs): bump its branch, open its ship PR, gate CI green. You merge the PR to publish (release-bugfix publishes the PR-head tree)."
+      bugfix:
+        description: "Ship the standing bugfix lane: bump it, open its ship PR, gate CI green. You merge the PR to publish (release-bugfix publishes the PR-head tree)."
         type: boolean
         required: false
         default: false
@@ -34,36 +34,25 @@ jobs:
           node-version: 22
           registry-url: https://registry.npmjs.org
 
-      - name: Resolve the patch train (train mode)
-        # Dual-lane model: `train=true` ships the OPEN patch train instead of
-        # master. The train is DERIVED, never stored (GITHUB_TOKEN cannot
-        # touch the actions-variables API — the variable-based pointer 403'd
-        # on its maiden run): the newest bugfix-release/* branch whose BASE
-        # version is strictly above the latest v* tag. This release commit
-        # lands on the TRAIN branch and publishes via the carve-out channel
-        # on PR merge — never via the direct master push below.
-        id: train
-        if: inputs.train == true
+      - name: Resolve the bugfix lane (bugfix mode)
+        # Dual-lane model, fixed-branch form (2026-10-24): `bugfix=true` ships
+        # the standing `bugfix` branch instead of master. The lane is a
+        # long-lived branch (cut from a release tag; fix PRs merge into it,
+        # with fix-dual-pr.yml forwarding twins to master). This release
+        # commit lands ON THE LANE and publishes via the carve-out channel on
+        # ship-PR merge — never via the direct master push below.
+        id: bugfix
+        if: inputs.bugfix == true
         run: |
           set -euo pipefail
-          git fetch -q origin '+refs/heads/bugfix-release/*:refs/remotes/origin/bugfix-release/*' --tags
-          LAST="$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)"
-          if [ -z "$LAST" ]; then echo "::error::train mode: no v* tags found"; exit 1; fi
-          NEWEST="$(git for-each-ref --sort=-v:refname --format='%(refname:short)' 'refs/remotes/origin/bugfix-release/*' | sed 's|^origin/||' | head -1 || true)"
-          TRAIN=""
-          if [ -n "$NEWEST" ]; then
-            NB="${NEWEST#bugfix-release/v}"; TB="${LAST#v}"
-            NBB="${NB%%-*}"; TBB="${TB%%-*}"
-            TOP="$(printf '%s\n%s\n' "$NBB" "$TBB" | sort -V | tail -1)"
-            if [ "$NBB" != "$TBB" ] && [ "$TOP" = "$NBB" ]; then TRAIN="$NEWEST"; fi
-          fi
-          if [ -z "$TRAIN" ]; then
-            echo "::error::train mode: no patch train is open (latest tag $LAST, newest branch ${NEWEST:-none}). Cut one by merging a PR with the backport label — the bot cuts it automatically — then re-run."
+          git fetch -q origin '+refs/heads/bugfix:refs/remotes/origin/bugfix' --tags
+          if ! git show-ref --verify --quiet refs/remotes/origin/bugfix; then
+            echo "::error::bugfix mode: the 'bugfix' branch does not exist. Cut it from the latest v* tag (reference/release.md, Dual-lane releases), then re-run."
             exit 1
           fi
-          git checkout --quiet -B train "origin/$TRAIN"
-          echo "name=$TRAIN" >> "$GITHUB_OUTPUT"
-          echo "train mode: shipping $TRAIN (base tag tree + its fixes)"
+          git checkout --quiet -B bugfix origin/bugfix
+          echo "branch=bugfix" >> "$GITHUB_OUTPUT"
+          echo "bugfix mode: shipping the standing bugfix lane (last released base + its merged fixes)"
 
       - name: Resolve version
         id: version
@@ -88,7 +77,7 @@ jobs:
 
       - name: Drift guard
         env:
-          TRAIN_NAME: ${{ steps.train.outputs.name }}
+          LANE_BRANCH: ${{ steps.bugfix.outputs.branch }}
         run: |
           TREE_V="$(node -p "require('./package.json').version")"
           NPM_V="$(npm view billion-context version)"
@@ -97,7 +86,7 @@ jobs:
             exit 1
           fi
           WHAT="master"
-          [ -n "$TRAIN_NAME" ] && WHAT="patch train $TRAIN_NAME"
+          [ -n "$LANE_BRANCH" ] && WHAT="bugfix lane"
           if [ "$TREE_V" != "$NPM_V" ]; then
             echo "::error::$WHAT package.json ($TREE_V) != npm latest ($NPM_V). A release must be cut from the live release: sync the base before releasing."
             exit 1
@@ -181,23 +170,23 @@ jobs:
         id: push
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TRAIN_NAME: ${{ steps.train.outputs.name }}
+          LANE_BRANCH: ${{ steps.bugfix.outputs.branch }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           VER="${{ steps.version.outputs.version }}"
           git commit -q -m "release v$VER"
-          if [ -n "$TRAIN_NAME" ]; then
-            # Train mode: the release commit lands ON THE TRAIN; publishing is
+          if [ -n "$LANE_BRANCH" ]; then
+            # Bugfix mode: the release commit lands ON THE LANE; publishing is
             # the carve-out channel (release-bugfix on ship-PR merge), never a
             # direct master push.
-            if ! git push -q origin "HEAD:$TRAIN_NAME"; then
-              echo "::error::push to train $TRAIN_NAME failed — nothing published, aborting."
+            if ! git push -q origin "HEAD:$LANE_BRANCH"; then
+              echo "::error::push to the bugfix lane failed — nothing published, aborting."
               exit 1
             fi
-            echo "train ship commit pushed to $TRAIN_NAME"
+            echo "bugfix ship commit pushed to $LANE_BRANCH"
             echo "needs_pr=true" >> "$GITHUB_OUTPUT"
-            echo "pr_branch=$TRAIN_NAME" >> "$GITHUB_OUTPUT"
+            echo "pr_branch=$LANE_BRANCH" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           if git push -q origin HEAD:master; then
@@ -288,70 +277,36 @@ jobs:
           export GITHUB_SHA GITHUB_REF_NAME
           node scripts/release-ci-gate.mjs --dispatch
 
-      - name: Reconcile backport-labeled PRs vs the train (ship-time audit)
-        # The dual-lane contract: a merged PR carrying `backport` expressed
-        # intent to ride the next patch release. Cherry-pick conflicts are
-        # flagged only in a PR comment at backport time — easy to miss — and
-        # CI green on the train head says nothing about ABSENT fixes (#4474).
-        # This audit cross-checks, at the last human decision point (the ship
-        # PR), every backport-labeled merge since the train's base tag against
-        # the cherry-pick -x trailers on the train, and renders any no-show
-        # loudly in the ship PR body. It never fails the run: the owner may
-        # legitimately ship without the straggler — but they must SEE it.
+      - name: Audit lane fixes not yet on master (ship-time forward watch)
+        # The dual-lane contract, fixed-branch form: every fix that lands on
+        # the lane must ALSO land on master (its twin PR). A still-open twin
+        # at ship time is legitimate — master catches up on its own schedule —
+        # but the owner must SEE the backlog in the ship PR body, because the
+        # next lane re-cut (after a master release overtakes the lane) drops
+        # anything the lane carries that master never got. Patch-id based
+        # (git cherry): re-picked twins match their originals.
         id: reconcile
-        if: steps.train.outputs.name != ''
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TRAIN_NAME: ${{ steps.train.outputs.name }}
+        if: steps.bugfix.outputs.branch != ''
         run: |
           set -euo pipefail
           git fetch -q origin master --tags
-          # HEAD = train + ship commit; HEAD~1 = last pick. The nearest tag
-          # reachable from there is the tag this train was cut from.
+          # HEAD = lane + ship commit; HEAD~1 = last lane commit. The nearest
+          # tag reachable from there is the tag this lane content grew from.
           BASE_TAG="$(git describe --match 'v[0-9]*' --tags --abbrev=0 HEAD~1)"
           MISSING=""
-          LABELED=0
-          on_train() {  # every own-commit of the PR must have a pick trailer
-            for C in $1; do
-              if [ -z "$(git log HEAD --grep="cherry picked from commit ${C}" --format=%H)" ]; then
-                return 1
-              fi
-            done
-            return 0
-          }
-          audit_pr() {  # $1 = PR number, $2 = commit range / single sha
-            local LABELS
-            LABELS="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/$1" --jq '[.labels[].name] | join(",")' 2>/dev/null || true)"
-          case ",$LABELS," in *,backport,*) ;; *) return 0 ;; esac
-            LABELED=$((LABELED+1))
-            if ! on_train "$2"; then
-              local TITLE
-              TITLE="$(gh api "repos/${GITHUB_REPOSITORY}/pulls/$1" --jq '.title' 2>/dev/null || echo '?')"
-              MISSING="${MISSING}- #$1 ${TITLE}"$'\n'
-            fi
-          }
-          # 1) merge-commit merges: "Merge pull request #N from …" — range M^1..M^2
-          for M in $(git log --merges --ancestry-path "${BASE_TAG}..origin/master" --format='%H'); do
-            N="$(git log -1 --format='%s' "$M" | sed -n 's/^Merge pull request #\([0-9]*\) from .*/\1/p')"
-            [ -z "$N" ] && continue
-            audit_pr "$N" "$(git rev-list --no-merges "${M}^1..${M}^2")"
-          done
-          # 2) squash-shape merges: subject ends in "(#N)" — single sha
-          while read -r C SUBJECT; do
-            N="${SUBJECT##*(#}"
-            N="${N%)}"
-            case "$N" in ''|*[!0-9]*) continue ;; esac
-            audit_pr "$N" "$C"
-          done < <(git log --no-merges "${BASE_TAG}..origin/master" --format='%H %s' | grep -E '\(#[0-9]+\)$' || true)
-          echo "labeled=$LABELED" >> "$GITHUB_OUTPUT"
-          echo "audited ${LABELED} backport-labeled merge(s) since ${BASE_TAG} against $TRAIN_NAME"
+          while read -r STATUS SHA SUBJECT; do
+            [ "$STATUS" = "-" ] && continue   # patch-equivalent already in master
+            case "$SUBJECT" in "release v"*) continue ;; esac  # the ship bump merges back via the ship PR
+            MISSING="${MISSING}- ${SHA:0:12} ${SUBJECT}"$'\n'
+          done < <(git cherry -v origin/master HEAD "$BASE_TAG" || true)
+          echo "audited lane commits since ${BASE_TAG} against origin/master"
           if [ -n "$MISSING" ]; then
             {
               echo "missing_md<<RECONCILE_EOF"
-              printf '## \u26a0\ufe0f Backport-labeled but NOT on this train\n\nThese merged PRs carry the `backport` label but their commits are absent from `%s` — the cherry-pick conflicted (or was shape-rejected) at backport time, so they ship only with the next REGULAR release. Merge only if that is acceptable (or pick them manually and re-run):\n\n%s' "$TRAIN_NAME" "$MISSING"
+              printf '## \u26a0\ufe0f On the bugfix lane, not yet on master\n\nThese fixes ship with this patch release, but their master twin PRs are still open — master does not have them yet. Merge the twins after this ship; the next lane re-cut (when a master release overtakes the lane) drops whatever master never got:\n\n%s' "$MISSING"
               echo "RECONCILE_EOF"
             } >> "$GITHUB_OUTPUT"
-            echo "::warning::backport-labeled PR(s) missing from $TRAIN_NAME — see the ship PR body"
+            echo "::warning::lane fix(es) not yet on master — see the ship PR body"
           fi
 
       - name: Open fallback PR (best effort)
@@ -360,7 +315,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PR_BRANCH: ${{ steps.push.outputs.pr_branch }}
-          TRAIN_NAME: ${{ steps.train.outputs.name }}
+          LANE_BRANCH: ${{ steps.bugfix.outputs.branch }}
           RECONCILE: ${{ steps.reconcile.outputs.missing_md }}
         run: |
           VER="${{ steps.version.outputs.version }}"
@@ -373,10 +328,10 @@ jobs:
           fi
           PAYLOAD_FILE="$(mktemp)"
           BODY_FILE="$(mktemp)"
-          VER="$VER" PR_BRANCH="$PR_BRANCH" LAST_TAG="$LAST_TAG" NOTES="$NOTES" TRAIN_NAME="$TRAIN_NAME" node -e '
+          VER="$VER" PR_BRANCH="$PR_BRANCH" LAST_TAG="$LAST_TAG" NOTES="$NOTES" LANE_BRANCH="$LANE_BRANCH" node -e '
             const fs = require("fs");
-            const intro = process.env.TRAIN_NAME
-              ? "Ship PR for the patch train (dual-lane release): merging publishes the PRE-MERGE head tree — the base tag plus exactly this train\u2019s fixes, none of master\u2019s unreleased work — via release-bugfix.yml."
+            const intro = process.env.LANE_BRANCH
+              ? "Ship PR for the standing bugfix lane (dual-lane release): merging publishes the PRE-MERGE head tree — the released base plus exactly the lane\u2019s merged fix PRs, none of master\u2019s unreleased work — via release-bugfix.yml."
               : "Auto-fallback from the one-click release workflow: direct push to master was blocked by branch protection. Merging this PR publishes via the standard release.yml flow.";
             const warn = process.env.RECONCILE ? process.env.RECONCILE + "\n" : "";
             const body = [

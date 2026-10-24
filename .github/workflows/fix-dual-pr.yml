@@ -1,0 +1,220 @@
+name: Fix dual-PR (bugfix twin)
+
+# Dual-lane release model, fixed-branch form (2026-10-24): the standing
+# `bugfix` branch is the fast ship lane (cut from the latest release tag;
+# only small fixes land on it via PRs). Every PR INTO `bugfix` gets its
+# master twin opened automatically: the fix commits are cherry-picked onto
+# origin/master, pushed as `twin/<fix-branch>`, and a PR base=master is
+# opened (or its branch force-updated on synchronize). The owner merges BOTH:
+# the bugfix PR ships it fast; the twin PR keeps master from regressing.
+# This replaces backport.yml (label-bot cherry-picking onto per-cycle
+# bugfix-release/* trains) — the "did it make the train?" blind spot dies
+# with it: a fix is on the lane the moment its bugfix PR merges, and the
+# twin PR is a first-class reviewable object instead of a comment trail.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+    branches: [bugfix]
+
+concurrency:
+  group: fix-dual-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  twin:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve PR context
+        id: ctx
+        run: |
+          set -euo pipefail
+          J="$GITHUB_EVENT_PATH"
+          PR_ACTION="$(jq -r '.action' "$J")"
+          PR_NUM="$(jq -r '.pull_request.number' "$J")"
+          PR_HEAD_REF="$(jq -r '.pull_request.head.ref' "$J")"
+          PR_HEAD_SHA="$(jq -r '.pull_request.head.sha' "$J")"
+          PR_TITLE="$(jq -r '.pull_request.title' "$J")"
+          PR_MERGED="$(jq -r '.pull_request.merged' "$J")"
+          {
+            echo "action=$PR_ACTION"
+            echo "number=$PR_NUM"
+            echo "head_ref=$PR_HEAD_REF"
+            echo "head_sha=$PR_HEAD_SHA"
+            echo "title=$PR_TITLE"
+            echo "merged=$PR_MERGED"
+            echo "twin_branch=twin/$PR_HEAD_REF"
+          } >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Close the twin when the bugfix PR is dropped
+        # The twin's reason to exist is its bugfix PR. If that PR closes
+        # unmerged, the twin is stale by construction — close it and delete
+        # its branch. A MERGED bugfix PR keeps its twin open: master still
+        # needs the fix; the twin gets a nudge comment instead.
+        if: steps.ctx.outputs.action == 'closed'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TWIN_BRANCH: ${{ steps.ctx.outputs.twin_branch }}
+          PR_NUM: ${{ steps.ctx.outputs.number }}
+          PR_MERGED: ${{ steps.ctx.outputs.merged }}
+        run: |
+          set -euo pipefail
+          TWIN_PRS="$(curl -sS -f \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&head=${{ github.repository }}:${TWIN_BRANCH}&base=master")"
+          TWIN_URL="$(jq -r '.[0].html_url // empty' <<<"$TWIN_PRS")"
+          TWIN_NUM="$(jq -r '.[0].number // empty' <<<"$TWIN_PRS")"
+          if [ "$PR_MERGED" = "true" ]; then
+            if [ -n "$TWIN_NUM" ]; then
+              curl -sS -f -X POST \
+                -H "Authorization: Bearer $GH_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "https://api.github.com/repos/${{ github.repository }}/issues/${TWIN_NUM}/comments" \
+                -d "$(jq -n --arg b "The bugfix-lane PR #${PR_NUM} was merged — this twin is now the only thing keeping master from regressing the fix. Merge it at your convenience (rebase-free; conflicts here mean master moved under the fix and the pick must be redone manually)." '{body:$b}')"
+            fi
+            echo "bugfix PR merged — twin (if any) nudged, nothing else to do"
+            exit 0
+          fi
+          if [ -n "$TWIN_NUM" ]; then
+            curl -sS -f -X PATCH \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/pulls/${TWIN_NUM}" \
+              -d '{"state":"closed"}'
+            echo "::notice::closed twin PR #${TWIN_NUM}"
+          fi
+          git push origin --delete "$TWIN_BRANCH" 2>/dev/null || echo "::notice::twin branch ${TWIN_BRANCH} already gone"
+
+      - name: Cherry-pick the fix onto master (twin branch)
+        # Rebuilt from scratch on every event: the twin is always
+        # origin/master + exactly this PR's commits, so a synchronize push
+        # (new commits, force-push, rebase) just re-picks the current range.
+        # Range = origin/bugfix..PR head — the PR's OWN commits only, which
+        # requires the fix branch to be cut from the bugfix lane (repo
+        # convention). A master-based branch would replay master's whole
+        # unreleased delta — rejected by the commit-count guard below.
+        if: steps.ctx.outputs.action != 'closed'
+        id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_HEAD_SHA: ${{ steps.ctx.outputs.head_sha }}
+          PR_HEAD_REF: ${{ steps.ctx.outputs.head_ref }}
+          PR_NUM: ${{ steps.ctx.outputs.number }}
+          TWIN_BRANCH: ${{ steps.ctx.outputs.twin_branch }}
+        run: |
+          set -euo pipefail
+          git fetch -q origin master bugfix --tags
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          case "$PR_HEAD_REF" in
+            twin/*) echo "::notice::twin PRs never re-enter the bugfix lane (head ${PR_HEAD_REF}) — nothing to do"; exit 0 ;;
+          esac
+          echo "forwarded=false" >> "$GITHUB_OUTPUT"
+          git rev-parse --verify --quiet "${PR_HEAD_SHA}^{commit}" >/dev/null || git fetch -q origin "$PR_HEAD_SHA"
+          RANGE_COUNT="$(git rev-list --count --no-merges origin/bugfix.."$PR_HEAD_SHA" || echo 0)"
+          if [ "$RANGE_COUNT" -eq 0 ]; then
+            echo "::notice::no own commits vs origin/bugfix — nothing to forward (already merged?)"
+            exit 0
+          fi
+          if [ "$RANGE_COUNT" -gt 20 ]; then
+            BODY="The PR carries ${RANGE_COUNT} commits vs the bugfix lane — it looks cut from **master**, not from \`bugfix\`. The twin bot refuses to replay master's unreleased delta. Re-cut the fix branch from the latest \`bugfix\` tip and re-push."
+            curl -sS -f -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
+              -d "$(jq -n --arg b "$BODY" '{body:$b}')"
+            echo "::error::fix PR looks master-based (${RANGE_COUNT} commits) — no twin (comment posted)"
+            exit 1
+          fi
+          git checkout --quiet -B "$TWIN_BRANCH" origin/master
+          for C in $(git rev-list --reverse --no-merges origin/bugfix.."$PR_HEAD_SHA"); do
+            git cherry-pick -x "$C"
+          done
+          git push -q --force origin "HEAD:${TWIN_BRANCH}"
+          PICKED="$(git log --no-merges --format='- %s' origin/master..HEAD | head -10)"
+          {
+            echo "picked<<EOF_${{ github.run_id }}"
+            echo "$PICKED"
+            echo "EOF_${{ github.run_id }}"
+            echo "forwarded=true"
+          } >> "$GITHUB_OUTPUT"
+          echo "twin branch ${TWIN_BRANCH} rebuilt (${RANGE_COUNT} commit(s))"
+
+      - name: Open or keep the twin PR (base=master)
+        if: steps.ctx.outputs.action != 'closed' && steps.pick.outputs.forwarded == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TWIN_BRANCH: ${{ steps.ctx.outputs.twin_branch }}
+          PR_NUM: ${{ steps.ctx.outputs.number }}
+          PR_TITLE: ${{ steps.ctx.outputs.title }}
+          PICKED: ${{ steps.pick.outputs.picked }}
+        run: |
+          set -euo pipefail
+          EXISTING="$(curl -sS -f \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&head=${{ github.repository }}:${TWIN_BRANCH}&base=master")"
+          if jq -e '.[0].number' >/dev/null 2>&1 <<<"$EXISTING"; then
+            echo "::notice::twin PR already open (#$(jq -r '.[0].number' <<<"$EXISTING")) — branch force-update carries the new commits"
+            exit 0
+          fi
+          BODY="$(printf 'Auto-opened master twin of the bugfix-lane PR #%s (fix-dual-pr bot). Merge the bugfix PR to ship it fast; merge THIS PR to keep master from regressing it — both sides must merge eventually.\n\nPicked commits:\n%s' "$PR_NUM" "$PICKED")"
+          PAYLOAD="$(jq -n --arg t "${PR_TITLE} (master twin)" --arg h "$TWIN_BRANCH" --arg b "$BODY" '{title:$t, head:$h, base:"master", body:$b}')"
+          HTTP_CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls" \
+            -d "$PAYLOAD")"
+          echo "twin PR open: HTTP $HTTP_CODE"
+          [ "$HTTP_CODE" = "201" ] || { echo "::error::twin PR open failed ($HTTP_CODE)"; exit 1; }
+
+      - name: Dispatch CI on the twin ref
+        # The twin PR is bot-authored, so its own pull_request runs sit in
+        # action_required (#772) — dispatch the CORE matrix on the ref so the
+        # required status checks land green at the head sha (same pattern as
+        # the release fallback branches, #1744).
+        if: steps.ctx.outputs.action != 'closed' && steps.pick.outputs.forwarded == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TWIN_BRANCH: ${{ steps.ctx.outputs.twin_branch }}
+        run: |
+          set -euo pipefail
+          CODE="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/workflows/ci.yml/dispatches" \
+            -d "{\"ref\":\"${TWIN_BRANCH}\"}")"
+          echo "CI dispatch on ${TWIN_BRANCH}: HTTP $CODE"
+          [ "$CODE" = "204" ] || echo "::warning::CI dispatch returned $CODE (a PR event may have already covered the ref)"
+
+      - name: Comment the twin link on the bugfix PR (best effort)
+        if: steps.ctx.outputs.action != 'closed' && steps.pick.outputs.forwarded == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TWIN_BRANCH: ${{ steps.ctx.outputs.twin_branch }}
+          PR_NUM: ${{ steps.ctx.outputs.number }}
+        run: |
+          set -euo pipefail
+          PRS="$(curl -sS -f \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/pulls?state=open&head=${{ github.repository }}:${TWIN_BRANCH}&base=master")"
+          URL="$(jq -r '.[0].html_url // empty' <<<"$PRS")"
+          [ -z "$URL" ] && exit 0
+          curl -sS -f -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/issues/${PR_NUM}/comments" \
+            -d "$(jq -n --arg b "🔁 Master twin: ${URL} — merge it after (or before) this PR so master keeps the fix." '{body:$b}')"
