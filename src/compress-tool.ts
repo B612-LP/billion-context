@@ -96,7 +96,6 @@ export {
     ACP_TOOLS_GOOGLE,
     ACP_READONLY_TOOLS_RESPONSES,
     buildCompressTextSystemPrompt,
-    buildCompressHybridSystemPrompt,
     ABSORB_TOOL_NAME,
     ABSORB_TOOL,
     ABSORB_TOOL_OPENAI,
