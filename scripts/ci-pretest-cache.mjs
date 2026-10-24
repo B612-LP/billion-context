@@ -21,6 +21,15 @@
 // on a real failure: a build command that failed, or an input tree so broken
 // the hash itself cannot be computed (which means the build would fail too).
 //
+// #4541: a HIT also refreshes every dist file's mtime to NOW. An
+// actions/cache restore lands the saved dist with ARCHIVE-TIME mtimes while
+// the freshly checked-out sources are newer, so any mtime-based freshness
+// consumer — first victim: the golden drive's #3330 kernel-dist guard, which
+// then refused every cache-hit CI leg as "stale" — misreads a provably-
+// correct restore. The marker already proved dist == f(current inputs); the
+// touch makes the mtime say the same thing. On a warm local tree it is a
+// no-op in meaning (the dist is genuinely fresh).
+//
 // The workflow side (actions/cache keyed on hashFiles over the SAME inputs,
 // per runner.os) only accelerates the MISS path across legs; the marker
 // check stands on its own, so local `npm test` warm runs benefit too.
@@ -32,7 +41,7 @@
 
 import { createHash } from "node:crypto";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -129,6 +138,24 @@ export function markerIsFresh(distDir, hash) {
 }
 
 /**
+ * #4541: stamp every file under the dist (and the dir itself) with NOW so
+ * mtime-based consumers see materialization time, not archive time — see the
+ * header rule. Files only; symlinks and other node types are inert here.
+ */
+export function refreshDistMtimes(distDir) {
+    const now = new Date();
+    const walk = (dir) => {
+        for (const e of readdirSync(dir, { withFileTypes: true })) {
+            const p = join(dir, e.name);
+            if (e.isDirectory()) walk(p);
+            else if (e.isFile()) utimesSync(p, now, now);
+        }
+    };
+    walk(distDir);
+    utimesSync(distDir, now, now);
+}
+
+/**
  * The pretest loop. For each component: hash → fresh marker? HIT, skip :
  * MISS → run the real build → stamp the marker. `build`/`log` are test seams
  * (the CLI passes defaults); build failures propagate so the CLI exits 1 —
@@ -144,7 +171,8 @@ export function runPretestCache(opts = {}) {
         const hash = hashComponent(root, comp);
         const distDir = join(root, comp.dir, "dist");
         if (markerIsFresh(distDir, hash)) {
-            log(`pretest-cache: HIT (${comp.name}) — dist fresh for hash ${hash.slice(0, 12)}`);
+            refreshDistMtimes(distDir); // #4541: materialization time, not archive time
+            log(`pretest-cache: HIT (${comp.name}) — dist fresh for hash ${hash.slice(0, 12)}, mtimes refreshed`);
             results.push({ name: comp.name, hit: true, ms: 0 });
             continue;
         }

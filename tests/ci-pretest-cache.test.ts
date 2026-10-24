@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, readFileSync, statSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import * as cache from "../scripts/ci-pretest-cache.mjs";
@@ -171,4 +171,39 @@ test("build failure propagates (CLI exit path) and stamps no marker", () => {
     assert.throws(() => cache.runPretestCache({ root, build: boom }), /tsc exploded/);
     // no marker for a failed component → next run is an honest MISS
     assert.equal(cache.markerIsFresh(join(root, "kernel/dist"), "anything"), false);
+});
+
+// #4541: an actions/cache restore lands the saved dist+marker with
+// ARCHIVE-TIME mtimes while the freshly checked-out sources are newer — the
+// golden drive's #3330 mtime guard then misreads a provably-correct restore
+// as "stale" and every cache-hit CI leg goes red. A HIT must therefore leave
+// the dist with MATERIALIZATION-time mtimes (the marker already proved dist
+// == f(current inputs); the mtime must say the same thing).
+test("#4541: restored dist (fresh marker, archive-time mtimes) is a HIT and gets materialization-time mtimes", () => {
+    const { root } = makeMiniRepo();
+    const kernel = cache.COMPONENTS[0];
+    const hash = cache.hashComponent(root, kernel);
+    const dist = join(root, kernel.dir, "dist");
+
+    mkdirSync(join(dist, "sub"), { recursive: true });
+    writeFileSync(join(dist, "index.js"), "built-bytes");
+    writeFileSync(join(dist, "sub", "chunk.js"), "built-bytes");
+    writeFileSync(join(dist, cache.MARKER_NAME), `${hash}\n`);
+    const archiveTime = new Date(Date.now() - 60 * 60_000);
+    for (const f of [join(dist, "index.js"), join(dist, "sub", "chunk.js"), join(dist, cache.MARKER_NAME)]) utimesSync(f, archiveTime, archiveTime);
+
+    const floor = Date.now();
+    const seen: string[] = [];
+    const r = cache.runPretestCache({ root, build: fakeBuild(seen), log: () => {} });
+    assert.deepEqual(
+        r.map((x) => [x.name, x.hit]),
+        [
+            ["kernel", true],
+            ["pi-subagents", false],
+        ],
+    );
+    assert.deepEqual(seen, ["pi-subagents"]); // only the unrestored component rebuilds
+    for (const f of [join(dist, "index.js"), join(dist, "sub", "chunk.js")]) {
+        assert.ok(statSync(f).mtimeMs >= floor, `${f} must carry the materialization time, not the archive time`);
+    }
 });
