@@ -57,6 +57,11 @@ export const LIVE_FILES = [
     // #4434 (split-brain surface): spawns bili CLI children against a throwaway
     // origin; own probe server is listen(0) so only the zone band matters
     "tests/issue-split-brain-surface.test.ts",
+    // #4449 (af8e5dc80): both landed without registration and tripped the
+    // run-ci-tests guard on every PR branch; neither binds a port (shell
+    // child coordinated via ENTRY_REPORT_FILE; version-sync is execFileSync)
+    "tests/codex-mcp-shell.test.ts",
+    "tests/codex-plugin-version-sync.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
