@@ -84,3 +84,34 @@ export function consumeHostIdChannel(
     }
     return { stripped: true, list: raw as string[] };
 }
+
+/** Persistent join-table cap (derived raw id → host id). Bounded by a
+ *  session's tool-unit history; overflow clears the whole map — the claim pass
+ *  degrades to legacy heuristics until entries re-accumulate (the plugin
+ *  re-stamps every request, so recovery is at most one request away). */
+export const HOSTID_BINDINGS_CAP = 50_000;
+
+/** Zip a validated channel list onto a PREPARED transcript's tool units:
+ *  returns newRawId → hostId for every message carrying a non-empty
+ *  toolCallId, in array order. Undefined when the walk count differs from the
+ *  list length — a representation misalignment between the two walks must
+ *  degrade honestly, never guess (misattribution is the most expensive
+ *  failure, MESSAGE-IDENTITY.md). Pure; persistence is the caller's job. */
+export function zipHostUnits(
+    messages: readonly { id?: string; toolCallId?: string }[],
+    hostIds: string[],
+): Map<string, string> | undefined {
+    const unitIds: string[] = [];
+    for (const m of messages) {
+        if (m.id !== undefined && m.toolCallId !== undefined && m.toolCallId !== "") unitIds.push(m.id);
+    }
+    if (unitIds.length !== hostIds.length) return undefined;
+    const seen = new Set<string>();
+    for (const h of hostIds) {
+        if (seen.has(h)) return undefined; // a host that repeats an id breaks k-th alignment — degrade
+        seen.add(h);
+    }
+    const out = new Map<string, string>();
+    for (let i = 0; i < unitIds.length; i++) out.set(unitIds[i]!, hostIds[i]!);
+    return out;
+}
