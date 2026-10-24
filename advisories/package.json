@@ -9,7 +9,15 @@
     },
     "billionContextAdvisories": {
         "schema": 1,
-        "updated": "2026-09-27",
-        "advisories": []
+        "updated": "2026-10-25",
+        "advisories": [
+            {
+                "id": "bc-2026-001",
+                "affected": ">=0.1.203 <0.1.205",
+                "target": "0.1.207",
+                "reason": "中:v0.1.203–0.1.204 重启后可能丢失压缩状态,长会话上下文超限、以 502 终止且无法自愈——请立即升级到 0.1.207。EN: v0.1.203–0.1.204 may lose compression state after a restart; long sessions overflow the context window, die with 502, and cannot recover — upgrade to 0.1.207 now.",
+                "publishedAt": "2026-10-25T00:00:00Z"
+            }
+        ]
     }
 }
