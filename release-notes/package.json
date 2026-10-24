@@ -9,8 +9,14 @@
   },
   "billionContextReleaseNotes": {
     "schema": 1,
-    "updated": "2026-10-21",
+    "updated": "2026-10-24",
     "releases": [
+      {
+        "version": "0.1.207",
+        "date": "2026-10-24",
+        "tier": "recommended",
+        "summary": "存储可靠性修复(0.1.203–0.1.204 用户请直接升到本版):折叠上下文不再因模型/窗口切换悄悄膨胀直至会话超窗;修复图片会话媒体引用泄漏与存储校验误报(#4390/#4506/#4444)。EN: storage reliability fixes — folded context no longer silently regrows after model/window switches; media-ref leak and false digest drift fixed. v0.1.203–204 users upgrade immediately."
+      },
       {
         "version": "0.1.203",
         "date": "2026-10-21",
