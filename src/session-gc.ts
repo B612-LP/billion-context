@@ -4,9 +4,8 @@ import path from "node:path";
 import { log as loggerLog } from "./logger.js";
 import { defaultCountTokens } from "acp-kernel";
 import { getStore, type SessionStore } from "./persist.js";
-import { retrieveSessionDirName, retrievalExportDir, sessionsDir } from "./paths.js";
+import { retrieveSessionDirName, retrievalExportDir, sessionsDir, stateDir } from "./paths.js";
 import { dropSessionForGc, listSessions, peekSession } from "./session.js";
-import { stateDir } from "./paths.js";
 import { restoreExportDir, restoreExportDirName } from "./image-restore.js";
 import { gcSettings as knobGcSettings } from "./knobs.js";
 
