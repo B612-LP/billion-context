@@ -101,9 +101,9 @@ jobs:
       actions: write
       pull-requests: write  # annotate the ship PR + auto-open the alignment PR + announce auto-cuts
     steps:
-      - name: Ensure jq (2026-10 runner images ship without it — release lanes 127 otherwise)
+      - name: Ensure jq (2026-10 runner images are unreliable about it — always install our own)
         run: |
-          command -v jq >/dev/null 2>&1 && { jq --version; exit 0; }
+          type -a jq || true
           mkdir -p "$HOME/.local/bin"
           curl -fsSL "https://github.com/jqlang/jq/releases/download/jq-1.8.1/jq-linux-amd64" -o "$HOME/.local/bin/jq"
           chmod +x "$HOME/.local/bin/jq"
