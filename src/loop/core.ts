@@ -8,7 +8,7 @@ import { estimateCoreMessages } from "../preflight.js";
 import { estimateWireOverhead } from "../server/budget.js";
 import { handleAcpStatus } from "../acp-status.js";
 import { STATUS_REPORT_CLOSE, STATUS_REPORT_OPEN } from "../acp-panel.js";
-import { credentialFingerprint, generationParamFp, handleAcpCache, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
+import { credentialFingerprint, generationParamFp, handleAcpCache, lastForwardedBody, noteForwardedBody, noteForwardedImageFacts, settleUsageReport } from "../cache-ledger.js";
 import { maybeJudgeContinuity } from "../invariant-judge.js";
 import { countImagesInRawBody } from "../image-tokens.js";
 import { diagnoseSuccessWithoutUsage, lastCompressSuffix, withSessionLock, type Session } from "../session.js";
@@ -36,6 +36,7 @@ import { formatUpstreamError, proxyDispatcher } from "../upstream-proxy.js";
 import { warnCacheCollapse } from "../cache-warn.js";
 import { dumpRejectedBody } from "../error-dump.js";
 import { shedEgressIfOverBudget } from "../egress-shed.js";
+import { DUMP_PLAINTEXT_BANNER } from "../dump-banner.js";
 import { bodyDumpEnabled as knobBodyDumpEnabled, imageRescaleMaxDim } from "../knobs.js";
 import { dumpsDir } from "../paths.js";
 import { isStrictReasoningEcho, modelIdOf, normalizeStrictEchoBody } from "../strict-echo.js";
@@ -168,27 +169,6 @@ function activeAbsorbToolName(session: Session, config: Config): string | undefi
     return a?.enabled === true ? a.toolName ?? ABSORB_TOOL_NAME : undefined;
 }
 
-// Canonical args for repeat-detection: key-order/whitespace differences must not
-// defeat an identical-call match, so parse + re-stringify with sorted keys.
-function canonicalArgs(args: string): string {
-    try {
-        return JSON.stringify(sortKeys(JSON.parse(args)));
-    } catch {
-        return args;
-    }
-}
-
-function sortKeys(v: unknown): unknown {
-    if (Array.isArray(v)) return v.map(sortKeys);
-    if (v !== null && typeof v === "object") {
-        const src = v as Record<string, unknown>;
-        const out: Record<string, unknown> = {};
-        for (const k of Object.keys(src).sort()) out[k] = sortKeys(src[k]);
-        return out;
-    }
-    return v;
-}
-
 // #3661: the re-request below replays proxy-tool arguments into assistant.tool_calls;
 // strict chat-template gateways crash server-side rendering of non-JSON arguments and
 // 400 the whole continuation request, so the round dies before the model ever sees the
@@ -301,7 +281,12 @@ export type ParsedStreamEvent =
     // dropped there, the rebuilt history loses the signature association.
     | { kind: "standalone_signature"; signature: string }
     | { kind: "tool_call"; name: string; callId: string; arguments: string; passthrough?: boolean; signature?: string }
-    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number }
+    // #4072: cacheCreation carries the upstream's cache_creation breakdown
+    // object (e.g. { ephemeral_5m_input_tokens }) verbatim — Anthropic puts it
+    // in message_start, which the anthropic adapter forwards usage-neutral
+    // (#1315), so only the synthetic terminal can deliver it to hosts that
+    // derive their prompt-cache TTL from the breakdown.
+    | { kind: "usage"; inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown> }
     // #1766: keys on the upstream terminal frame that bili does not model
     // (e.g. Anthropic's safeguard_results) — the loop replaces that frame with
     // a synthetic completion, so anything not carried here vanishes from the
@@ -322,7 +307,7 @@ export type ParsedStreamEvent =
 
 export interface EmitCompletionOpts {
     finishReason?: string;
-    usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number };
+    usage?: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown> };
     terminalExtra?: Record<string, unknown>;
 }
 
@@ -431,7 +416,7 @@ export function executeProxyTool(
 
 function recordUsage(
     ctx: LoopCtx,
-    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number },
+    usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean },
     round: number,
 ): void {
     const prompt = usage.inputTokens;
@@ -441,7 +426,9 @@ function recordUsage(
     // the ledger quarantines the sample instead of booking its whole billed
     // prefix as an unexplained ttlRepay residual (which reads as a 0% hit rate).
     const reportedCached: number | null = typeof cached === "number" ? cached : null;
-    const total = promptInputTotal(ctx.protocol, prompt, cached, usage.creationTokens);
+    // #4128: thread the upstream's billing_usage declaration so the anthropic
+    // lane does not double-count an inclusive relay's input_tokens.
+    const total = promptInputTotal(ctx.protocol, prompt, cached, usage.creationTokens, usage.declaredInclusive);
     if (typeof out === "number") ctx.session.stats.outputTokens += out;
     const hitPct =
         reportedCached !== null && total > 0 ? Math.round((reportedCached / total) * 100) : 0;
@@ -521,7 +508,7 @@ export async function* runCompressLoop(
         // overwrites the slot; clipped/oversized bodies retain no full copy and
         // the continuity check silently skips (no false positives from partial
         // forensics). Advisory; never blocks.
-        const prevSentFull = ctx.session.transient?.sentBody?.full ?? null;
+        const prevSentFull = lastForwardedBody(ctx.session)?.full ?? null;
         // #3803: generation-parameter fingerprint from the full wire object (never the capped head) —
         // a host reasoning-effort / thinking-config flip re-partitions the provider cache namespace.
         noteForwardedBody(ctx.session, wireBodyStr, wireArr !== undefined ? wireArr.length : null, credentialFingerprint(requestOptions.headers), generationParamFp(wireObj));
@@ -586,16 +573,11 @@ export async function* runCompressLoop(
         return body;
     };
 
-    // #156: compress/decompress calls already failed this loop. Validation is
-    // deterministic (identical args → identical failure), so a byte-identical
-    // re-submission can never succeed — break early instead of at MAX_LOOP_ROUNDS.
-    const failedSignatures = new Set<string>();
-
     // #3302 (Ask 6): probe-family observability — a model failing compress with
     // one endpoint fixed and the other varying is enumerating a sparse ref
-    // space; the identical-args breaker above never fires on that pattern.
-    // Log it once as an operator signal; the failure receipts carry the live
-    // range table, so the loop keeps running for the model to find it.
+    // space; every attempt carries different args, so the failed-only breaker
+    // below ends such turns without ever flagging them. Log it once as an
+    // operator signal; the failure receipts carry the live range table.
     const probeFailures = new Map<string, Set<string>>();
     let probeWarned = false;
 
@@ -714,7 +696,7 @@ export async function* runCompressLoop(
             const roundParts: RoundPart[] = [];
             let reasoningSealed = true;
             const calls: ToolCallEmit[] = [];
-            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number } = {};
+            let usage: { inputTokens?: number; outputTokens?: number; cachedTokens?: number; creationTokens?: number; declaredInclusive?: boolean; cacheCreation?: Record<string, unknown> } = {};
             let finishReason: string | undefined;
             let streamError: string | undefined;
             let sawDone = false;
@@ -853,6 +835,8 @@ export async function* runCompressLoop(
                             outputTokens: ev.outputTokens,
                             cachedTokens: ev.cachedTokens,
                             creationTokens: ev.creationTokens,
+                            declaredInclusive: ev.declaredInclusive,
+                            cacheCreation: ev.cacheCreation,
                         };
                     } else if (ev.kind === "done") {
                         sawDone = true;
@@ -1485,30 +1469,32 @@ export async function* runCompressLoop(
                 return;
             }
 
-            // #156: if this round is only failed compress/decompress and one of
-            // them re-submits args that already failed, the model is stuck in a
-            // deterministic failure loop — break early instead of burning rounds.
+            // #156/#4186: if this round is only failed compress/decompress, stop
+            // here instead of re-requesting. The failed frames spliced into the
+            // retry body above are ephemeral (#1548): never persisted, never seen
+            // by the client. Letting them reach upstream and then vanish from the
+            // next request rewrites the provider's frozen prefix mid-history —
+            // an unsanctioned cache seam. Breaking keeps them off the wire; the
+            // receipt already streamed to the client carries why it failed, and a
+            // later turn can retry with a different range.
             const failedMutating = proxyResults.filter(
                 (pr) => (pr.name === "compress" || pr.name === "decompress") && pr.result.includes("FAILED"),
             );
-            if (reRequest && failedMutating.length > 0 && failedMutating.length === proxyResults.length) {
-                const repeated = failedMutating.some((pr) => failedSignatures.has(`${pr.name}\u0000${canonicalArgs(pr.arguments)}`));
-                if (repeated) {
-                    ctx.log(`[acp-loop] round ${round}: model re-submitted an already-failed compress with identical arguments; stopping after ${round} round(s) instead of ${MAX_LOOP_ROUNDS}`);
-                    loggerLog("warn", `[acp-loop] repeated identical compress failure at round ${round}; breaking early (#156)`);
-                    yield adapter.emitCompletion({ finishReason: "length", usage, terminalExtra });
-                    return;
-                }
-            }
-            for (const pr of failedMutating) failedSignatures.add(`${pr.name}\u0000${canonicalArgs(pr.arguments)}`);
 
             if (!probeWarned) {
                 const probing = recordProbeFailures(probeFailures, failedMutating);
                 if (probing) {
                     probeWarned = true;
-                    ctx.log(`[acp-loop] round ${round}: model probed ${probing.values.length} distinct ${probing.label} values (${probing.values.join(", ")}) in failed compress calls — sparse ref-space enumeration (#3302); not breaking early, the receipts carry the live range table`);
+                    ctx.log(`[acp-loop] round ${round}: model probed ${probing.values.length} distinct ${probing.label} values (${probing.values.join(", ")}) in failed compress calls — sparse ref-space enumeration (#3302); the receipts carry the live range table`);
                     loggerLog("warn", `[acp-loop] compress probe family at round ${round}: ${probing.values.length} distinct ${probing.label} values failed (${probing.values.join(", ")}) (#3302)`);
                 }
+            }
+
+            if (reRequest && failedMutating.length > 0 && failedMutating.length === proxyResults.length) {
+                ctx.log(`[acp-loop] round ${round}: failed-only mutating round; completing after ${round} round(s) instead of re-requesting (#156/#4186)`);
+                loggerLog("warn", `[acp-loop] failed compress/decompress round at round ${round}; breaking early (#156/#4186)`);
+                yield adapter.emitCompletion({ finishReason: "length", usage, terminalExtra });
+                return;
             }
 
             ctx.log(`[acp-loop] round ${round}: proxy tool executed; re-requesting so the model sees the result`);
@@ -1525,7 +1511,7 @@ export async function* runCompressLoop(
                     const dumpDir = dumpsDir();
                     fs.mkdirSync(dumpDir, { recursive: true });
                     const sid = (ctx.session.id ?? "unknown").replace(/[^a-zA-Z0-9_-]/g, "_");
-                    fs.writeFileSync(path.join(dumpDir, `req-${Date.now()}-${sid}-REREQUEST.json`), JSON.stringify(newBody, null, 2));
+                    fs.writeFileSync(path.join(dumpDir, `req-${Date.now()}-${sid}-REREQUEST.json`), `${DUMP_PLAINTEXT_BANNER}\n${JSON.stringify(newBody, null, 2)}`);
                 } catch { /* best-effort */ }
             }
             let respResult: { response: Response; clearTimer: () => void };
