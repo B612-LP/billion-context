@@ -17,6 +17,7 @@ import {
     defaultZcodeRoutePolicy,
     detectCurrentZcodeOrigin,
     detectZcodeStore,
+    isLoopbackHttpUrl,
     resolveZcodeDataDir,
     stampZcodePluginHeader,
     unrouteZcodeText,
@@ -469,9 +470,9 @@ export function detectZcodeBuiltinAccount(env: NodeJS.ProcessEnv = process.env):
     }
     if (url.protocol !== "https:" && url.protocol !== "http:") return undefined;
     if (url.pathname.startsWith("/bili/")) return undefined;
-    const host = url.hostname.toLowerCase();
-    if (host === "localhost" || host === "::1" || host === "[::1]" || /^127\./.test(host)) return undefined;
-    return { baseUrl: raw, host };
+    // Shared #809 loopback predicate — keeps this detector drift-free from the routing side.
+    if (isLoopbackHttpUrl(raw)) return undefined;
+    return { baseUrl: raw, host: url.hostname.toLowerCase() };
 }
 
 export function reportZcodeBuiltinAccount(account: ZcodeBuiltinAccount, log: (msg: string) => void): void {
