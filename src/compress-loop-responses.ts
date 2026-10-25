@@ -233,8 +233,9 @@ export async function compressLoopResponsesJson(
             noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, result.response.status);
         } catch (e) {
             if (e instanceof UpstreamHttpError) {
-                // #4743: a terminal 429 exhausted the retry budget — arm the governor for the next client turn.
+                // #4743: a terminal 429 exhausted the retry budget — arm the governor for the next client turn; any other settled status proves the endpoint is processing again — clear it (relay parity, #4204).
                 if (e.status === 429) noteUpstreamThrottle429(requestOptions.url, requestOptions.headers, null);
+                else noteUpstreamThrottleResolved(requestOptions.url, requestOptions.headers, e.status);
                 const suffix = e.attempts > 1 ? ` after ${e.attempts} attempt(s)` : "";
                 ctx.log(`[acp-proxy: responses compress loop upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);
                 loggerLog("error", `[acp-compress-responses] upstream error ${e.status}${suffix}: ${e.body.slice(0, 200)}]`);

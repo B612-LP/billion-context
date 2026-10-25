@@ -69,6 +69,18 @@ test("responses-wire compress loop feeds the 429 governor (#4743)", async () => 
         globalThis.fetch = (async () => new Response(JSON.stringify({ id: "ok", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "done" }] }] }), { status: 200, headers: { "content-type": "application/json" } })) as typeof fetch;
         await compressLoopResponsesJson(initial, ctx, body, { url, headers });
         assert.equal(upstreamThrottleLocalReject(url, headers), undefined, "a resolved verdict lifts the hold");
+
+        // Review fix (#4772): a fail-fast NON-429 verdict also settles the endpoint —
+        // the #4204 contract clears on ANY resolved non-429 (relay parity), so the
+        // loop's boundary report must cover thrown UpstreamHttpError(≠429) too.
+        globalThis.fetch = (async () => new Response(JSON.stringify({ error: "rate_limited" }), { status: 429 })) as typeof fetch;
+        try { await compressLoopResponsesJson(initial, ctx, body, { url, headers }); } catch { /* expected */ }
+        assert.ok(upstreamThrottleLocalReject(url, headers), "re-armed by a second terminal 429");
+        globalThis.fetch = (async () => new Response(JSON.stringify({ error: "invalid model" }), { status: 400, headers: { "content-type": "application/json" } })) as typeof fetch;
+        let threw400 = false;
+        try { await compressLoopResponsesJson(initial, ctx, body, { url, headers }); } catch { threw400 = true; }
+        assert.ok(threw400, "a fail-fast 400 propagates out of the loop");
+        assert.equal(upstreamThrottleLocalReject(url, headers), undefined, "a settled non-429 verdict lifts the hold");
     } finally {
         globalThis.fetch = prevFetch;
     }
