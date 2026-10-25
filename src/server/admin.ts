@@ -6,7 +6,7 @@ import { APIG_RESIGN_SCHEME, KNOWN_SIGNATURE_SCHEMES, readPendingRefusals, unres
 import { handleAcpCache, readKeySwitchStats, readModelSwitchStats, readProjSwitchStats, readPromptSwitchStats } from "../cache-ledger.js";
 import type { ProxyOptions } from "../config.js";
 import { loadNamedProviders, loadOptions, loadRoutes, resolveResignSettings } from "../config.js";
-import { applyCompressSettings } from "../compress-settings.js";
+import { applyCompressSettings, resolveCompressSurfaceDetailed } from "../compress-settings.js";
 import { clearConflictEvents, summarizeConflicts } from "../conflict-watch.js";
 import { cannotResolveTarget, getAdvisoryState } from "../advisory.js";
 import { detectCostAdvisories } from "../plugin-advisory.js";
@@ -33,6 +33,7 @@ import { getPlannedUpgrade, getUpdatePolicyState } from "../update-policy.js";
 import { PACKAGE_NAME, VERSION, BUILD_COMMIT } from "../version.js";
 import { buildBlockContent, buildMessageContent, buildOverview, buildSessionDetail, buildSessionList, buildSessionPage, buildSessionTree, handleConfigGet, handleConfigPut, hiddenEmptyCount, renderUI, type BlockContentView } from "../web/index.js";
 import { handleChangelogGet } from "../web/changelog.js";
+import { handleBlogAssetGet, handleBlogGet } from "../web/blogfeed.js";
 import { buildSessionReportMd, buildSessionReportSvg } from "../web/report.js";
 import { queryLogLines } from "../web/logs-query.js";
 import { buildDiagnostics } from "../web/diagnostics.js";
@@ -257,6 +258,19 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         res.end(JSON.stringify({ ok: true, upstream: opts.upstream }));
         return;
     }
+    // #3536: browsers probing the proxy origin for a favicon (the dsh desktop
+    // settings panel frames /__bili/ and the frame fires GET /favicon.ico at
+    // the ORIGIN ROOT) must be answered locally with 204 — falling through to
+    // the relay would rewrite the host onto the configured upstream, burning a
+    // request there and logging a 403 for a static asset no model client ever
+    // asks for. The panel page itself also declares an empty icon (page.ts) so
+    // well-behaved browsers never send the probe at all; this is the backstop
+    // for browsers/timings that still do (probe before redirect, direct visits).
+    if (req.method === "GET" && req.url?.split("?", 2)[0] === "/favicon.ico") {
+        res.writeHead(204);
+        res.end();
+        return;
+    }
     if (req.method === "GET" && req.url === "/__bili/health") {
         // #2941: 503 while registration is still pending — every consumer
         // (launcher spawn-wait, attach discovery, host-native respawn) keys on
@@ -319,6 +333,17 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
     // read-only admin gating as every other /__bili/ GET above (the gates run
     // before dispatch). Always answers 200; offline degrades to empty+error.
     if (req.method === "GET" && req.url === "/__bili/changelog") return handleChangelogGet(res);
+    // #4587: panel-embedded blog/articles — bundled markdown rendered server-side
+    // into a JSON feed, plus its images under a guarded asset route. Read-only,
+    // fail-soft, no config surface; same gating as every other /__bili/ GET above.
+    if (req.method === "GET" && req.url === "/__bili/blog") {
+        handleBlogGet(res);
+        return;
+    }
+    if (req.method === "GET" && req.url !== undefined && req.url.startsWith("/__bili/blog-assets/")) {
+        handleBlogAssetGet(res, req.url);
+        return;
+    }
     // #3719: dedicated 更新/Updates tab — self-update state plus manual
     // check/install actions. Same gating as every /__bili/ route above (the
     // gates run before dispatch); an unwired process (autoUpdate off) answers
@@ -429,7 +454,12 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // (DEFAULT_CCR_CONFIG et al. inside applyCompressSettings); per-request/route overrides
         // are still enforced at execution time, so the manifest stays conservative as #1192
         // requires. Do not "simplify" this back to `config`.
-        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} }));
+        // #3243: pass the pack surface's tool descriptions too — resolved from the SAME
+        // global settings (no route/model context exists at manifest time), so registered
+        // tool descriptions follow the top-level promptPack while per-request system prompts
+        // may still honor deeper provider/model levels.
+        const packSurface = resolveCompressSurfaceDetailed(opts.compress ?? {});
+        return handlePluginManifest(res, applyCompressSettings(config, opts.modelContextLimit, opts.compress, { ...agentProviderRecipes(), ...opts.namedProviders ?? {} }), packSurface.surface.toolPrompts);
     }
     if (req.method === "GET" && req.url?.split("?")[0] === "/__bili/plugin/snapshot") {
         return await handlePluginSnapshot(new URL(req.url, "http://localhost").searchParams.get("conversationId") ?? "", res);
@@ -459,7 +489,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         // back for cross-origin browser readers (the dsh client Context tab);
         // only origins the gate above admitted ever reach this line.
         const reqOrigin = req.headers.origin;
-        return handlePluginStatus(conversationId, res, { core, config, log, webOrigin }, params.get("fallback") === "latest", typeof reqOrigin === "string" && reqOrigin.length > 0 ? reqOrigin : undefined);
+        return handlePluginStatus(conversationId, res, { core, config, log, webOrigin, inlineLane: opts.inlineLane === true }, params.get("fallback") === "latest", typeof reqOrigin === "string" && reqOrigin.length > 0 ? reqOrigin : undefined);
     }
     if (req.method === "POST" && req.url === "/__bili/watcher") {
         // #7: an ATTACHING claude session registers its host pid so the shared
@@ -697,7 +727,7 @@ export async function handleAdminRoute(req: http.IncomingMessage, res: http.Serv
         try {
             const body = await readBody(req);
             const webOrigin = `http://${opts.host === "0.0.0.0" ? "localhost" : opts.host}:${req.socket?.localPort ?? opts.port}`;
-            return await handlePluginTool(body.toString("utf8"), res, { core, config, log, webOrigin });
+            return await handlePluginTool(body.toString("utf8"), res, { core, config, log, webOrigin, inlineLane: opts.inlineLane === true });
         } catch (err) {
             res.writeHead(err instanceof BodyTooLargeError ? 413 : 400, { "content-type": "application/json" });
             res.end(JSON.stringify({ ok: false, error: String(err) }));

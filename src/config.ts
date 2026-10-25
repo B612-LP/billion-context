@@ -301,6 +301,15 @@ export type CompressSettings = {
      *  wins; across levels the deeper level wins regardless of which name it
      *  uses. */
     minCompressRange?: number;
+    /** Hard character cap on ONE generated summary; longer replies are
+     *  rejected whole by the kernel and the external-summary executor. Maps to
+     *  kernel `compress.maxSummaryLength` (default 20000; 0 = unbounded).
+     *  #3635: external summarizers are told this exact cap up front. */
+    maxSummaryLength?: number;
+    /** Character floor for generated summaries; shorter replies are rejected
+     *  whole. Maps to kernel `compress.minSummaryLength` (default 50;
+     *  0 = disabled). #3635. */
+    minSummaryLength?: number;
     /** Enable multi-tier (T2/T3) distillation (kernel `tiers.enabled`). */
     tiers?: boolean;
     /** Tool-name patterns whose LATEST tool-call + paired result are never
@@ -773,6 +782,11 @@ export type ProxyOptions = {
     port: number;
     host: string;
     upstream: string;
+    /** #4571: set by the inline lane at boot (startInlineEngine) — true when
+     *  these options belong to the in-process engine instead of a spawned
+     *  proxy server. Display-only downstream (the status panel appends
+     *  " · inline"), never read for control flow. */
+    inlineLane?: boolean;
     routes: ProviderRoutes;
     /** Named dialing recipes from the providers table (pi/opencode idiom) —
      *  referenced by `compress.externalSummary.targets` ("glm/glm-4.9-flash").
@@ -1064,6 +1078,26 @@ function warnInertMitmLaneKeys(routes: ProviderRoutes, env: NodeJS.ProcessEnv): 
     }
 }
 
+/** #3675: compress-block keys written on the ROUTE ROOT (URL lane or named
+ *  entry) are silently dropped by parseRouteEntry — the same silent-inert
+ *  class as the #1469 routing fields, one level down. Recognition is
+ *  COMPRESS_SETTING_FIELDS (defined below; kept in sync with
+ *  parseCompressSettings): every member is inert at a route root, and none of
+ *  them may be added to parseRouteEntry's whitelist while this warning exists.
+ *  Dialing recipes are skipped — their own parser rejects unknown root fields
+ *  loudly (parseNamedProviderRecipe throws → chain disabled with a warning),
+ *  so a second signal here would only add noise. */
+function warnCompressOnlyFieldsAtRouteRoot(key: string, obj: Record<string, unknown> | null): void {
+    if (!obj) return;
+    if (obj.baseUrl !== undefined || obj.api !== undefined) return;
+    const misplaced = Object.keys(obj).filter((f) => obj[f] !== undefined && COMPRESS_SETTING_FIELDS.has(f));
+    if (misplaced.length === 0) return;
+    warnNamedProviderOnce(
+        `route-root-compress:${key}:${misplaced.join(",")}`,
+        `providers."${key}" carries compress-block keys [${misplaced.join(", ")}] at the route root — they are inert there (move them under providers."${key}".compress to apply)`,
+    );
+}
+
 /** True when the providers-map key is itself a URL lane (http/https/mitm
  *  scheme — mitm:// is the README-documented lookup key for MITM traffic).
  *  Anything else is a NAMED key (provider id): routing-inert on its own,
@@ -1248,6 +1282,10 @@ export function loadRoutes(env: NodeJS.ProcessEnv = process.env): ProviderRoutes
         if (!route) return;
         const obj = value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null;
         const urlLike = isUrlLikeKey(key);
+        // Before the bind branch on purpose: these keys are inert even on a
+        // validly bound alias — parseRouteEntry never parses them, so the
+        // fold onto the target lane cannot carry them.
+        warnCompressOnlyFieldsAtRouteRoot(key, obj);
         if (obj && "bind" in obj) {
             const bind = obj.bind;
             if (typeof bind !== "string") {
@@ -1865,10 +1903,12 @@ type FileConfig = {
      *  `"pi": {"subagents": false}` disables the whole surface. The four
      *  acp.json keys (delegate/delegatePrompt/displayUsage/debug) are a
      *  deprecated fallback, read only while this section is absent.
-     *  `inline` (#3278): run the pi lane's compression IN-PROCESS (no spawned
-     *  proxy) — the config-file home of the BILI_PI_INLINE knob, resolved
-     *  env > file > default(off); BILI_PI_INLINE=0/false explicitly disables
-     *  it over the file. */
+     *  `inline` (#3278, default ON since #4571): run the pi lane's compression
+     *  IN-PROCESS — the pi host no longer spawns a proxy server by default.
+     *  Set `false` (or BILI_PI_INLINE=0/false/no/off) to get the spawned
+     *  server back. Resolved env > file; an announced attach target
+     *  (launcher-set BILLION_CONTEXT_PROXY/ATTACH) still beats the DEFAULT
+     *  but never an explicit inline choice. */
      pi?: { subagents?: PiSubagentsFileConfig | boolean; inline?: boolean };
     /** Feature rollout (canary) block (#3062, resolved by src/rollout.ts):
      *  per-feature overrides of the version's baked-in rollout plan
@@ -2198,7 +2238,9 @@ const COMPRESS_SETTING_FIELDS = new Set([
     "visibilityMarkers", "rules", "injectTool", "injectNudge",
     "acknowledgePromptsRisk", "absorb", "ccr", "search",
     "prompts", "promptPack", "reasoningGuard", "outputSteering", "priceProfile",
-    "reconcile", "streamSummary",
+    "reconcile", "streamSummary", "externalSummary",
+    // #3635: summary-length caps — previously accepted nowhere, silently dropped.
+    "maxSummaryLength", "minSummaryLength",
 ]);
 
 // Deduped per unique key set per process (same pattern as
@@ -2861,6 +2903,15 @@ export function parseCompressSettings(v: unknown): (CompressSettings & { injectT
     }
     for (const key of ["nudgeGrowthTokens", "preserveRecentMessages", "preserveRecentTokens", "minCompressRange", "minCompressRangeChars"] as const) {
         takeNumber(key);
+    }
+    // #3635: summary-length caps map onto kernel compress.{max,min}SummaryLength.
+    // 0 is meaningful (unbounded cap / disabled floor), negative is not — so
+    // validate stricter than takeNumber instead of reusing it.
+    for (const key of ["maxSummaryLength", "minSummaryLength"] as const) {
+        if (!(key in obj)) continue;
+        const v = obj[key];
+        if (typeof v !== "number" || !Number.isFinite(v) || v < 0) ok = false;
+        else (out as Record<string, unknown>)[key] = v;
     }
     // #2228: the decision side-call budget must be positive — 0/negative would
     // starve the call, so validate stricter than takeNumber.
