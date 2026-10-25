@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { existsSync, mkdtempSync, readFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, statSync, utimesSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { createCore, createInitialState, type CoreMessage } from "acp-kernel";
@@ -104,6 +104,15 @@ test("#4699: re-retrieve of the same ref is idempotent within its session (same 
         const second = executeRetrieve({ ref }, s);
         assert.ok(second.text!.includes(p), "second retrieve points at the same file");
         assert.equal(readFileSync(p, "utf8"), ALPHA, "rewrite lands identical bytes");
+        // #4699 review: overwriting an existing file does not touch its parent
+        // dir's mtime, and the GC age gate reads exactly that mtime — so the
+        // write path must refresh it, or a live session that only re-retrieves
+        // the same refs would get its export dir swept after maxAgeDays.
+        const dir = path.dirname(p);
+        const backdated = new Date(Date.now() - 10 * 86_400_000);
+        utimesSync(dir, backdated, backdated);
+        executeRetrieve({ ref }, s);
+        assert.ok(statSync(dir).mtimeMs > backdated.getTime(), "re-retrieve refreshes the export dir mtime (GC age gate input)");
     } finally {
         _resetSessionsForTest();
     }

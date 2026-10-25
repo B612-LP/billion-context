@@ -5,7 +5,7 @@ import { log as loggerLog } from "./logger.js";
 import { defaultCountTokens } from "acp-kernel";
 import { getStore, type SessionStore } from "./persist.js";
 import { retrieveSessionDirName, retrievalExportDir, sessionsDir } from "./paths.js";
-import { dropSessionForGc, peekSession } from "./session.js";
+import { dropSessionForGc, listSessions, peekSession } from "./session.js";
 import { stateDir } from "./paths.js";
 import { restoreExportDir, restoreExportDirName } from "./image-restore.js";
 import { gcSettings as knobGcSettings } from "./knobs.js";
@@ -184,6 +184,26 @@ interface GcResult {
     retrievalExportsRemoved: number;
 }
 
+/** Total bytes of all files under a dir tree — a directory's own stat.size is
+ *  meaningless, so freed-byte accounting for dir deletions sums the contents
+ *  (#4699 review: the summary/doctor numbers must not systematically undercount). */
+async function dirTreeBytes(root: string): Promise<number> {
+    let entries;
+    try {
+        entries = await readdir(root, { withFileTypes: true });
+    } catch {
+        return 0;
+    }
+    let total = 0;
+    for (const e of entries) {
+        const full = path.join(root, e.name);
+        try {
+            total += e.isDirectory() ? await dirTreeBytes(full) : (await stat(full)).size;
+        } catch { /* vanished mid-sweep */ }
+    }
+    return total;
+}
+
 export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore; now?: number; imgRoot?: string; exportRoot?: string }): Promise<GcResult> {
     const result: GcResult = { removed: 0, kept: 0, unreadable: 0, bytesFreed: 0, companionsRemoved: 0, imgDirsRemoved: 0, retrievalExportsRemoved: 0 };
     const cfg = gcConfigFromEnv();
@@ -288,6 +308,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                 const imgDir = opts?.imgRoot !== undefined
                     ? path.join(opts.imgRoot, restoreExportDirName(view.id))
                     : restoreExportDir(view.id);
+                result.bytesFreed += await dirTreeBytes(imgDir);
                 await rm(imgDir, { recursive: true, force: true });
                 loggerLog("info", `[gc] removed image spills for session ${view.id}: ${path.relative(stateDir(), imgDir)}`);
                 result.imgDirsRemoved++;
@@ -299,6 +320,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                 const exportDir = opts?.exportRoot !== undefined
                     ? path.join(opts.exportRoot, retrieveSessionDirName(view.id))
                     : retrievalExportDir(view.id);
+                result.bytesFreed += await dirTreeBytes(exportDir);
                 await rm(exportDir, { recursive: true, force: true });
                 loggerLog("info", `[gc] removed retrieval exports for session ${view.id}: ${path.relative(stateDir(), exportDir)}`);
                 result.retrievalExportsRemoved++;
@@ -416,6 +438,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                 continue;
             }
             if (!ist.isDirectory() || now - ist.mtimeMs < cfg.maxAgeMs) continue;
+            result.bytesFreed += await dirTreeBytes(full);
             try {
                 await rm(full, { recursive: true, force: true });
             } catch {
@@ -430,9 +453,19 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
     // retrieve rewrites them), so an age-eligible dir is safe to drop even if
     // its session survives. The "img" container is the spill tree's own root,
     // swept by its dedicated pass above. Legacy pre-#4699 flat <ref>.txt files
-    // sit directly here and age out as unreferenced payload garbage (a
-    // re-retrieve would rewrite them); anything else in this dir is not ours
-    // and stays put.
+    // sit directly here: they cannot be attributed to any session (flat naming
+    // is exactly what lost that), so a ref number still held by a LIVE
+    // session's content store keeps its file — pointers generated before the
+    // upgrade may name it and the model context may still hold them (#4699
+    // review); everything else ages out (a re-retrieve would rewrite it).
+    // Anything that is neither a session dir nor our txt shape is not ours and
+    // stays put.
+    const liveRefs = new Set<string>();
+    for (const s of listSessions()) {
+        const byRef = s.contentStore?.byRef;
+        if (!byRef) continue;
+        for (const r of Object.keys(byRef)) liveRefs.add(r);
+    }
     const exportRoot = opts?.exportRoot ?? path.join(stateDir(), "retrieve");
     try {
         for (const e of await readdir(exportRoot, { withFileTypes: true })) {
@@ -446,6 +479,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                     continue;
                 }
                 if (!est.isDirectory() || now - est.mtimeMs < cfg.maxAgeMs) continue;
+                result.bytesFreed += await dirTreeBytes(full);
                 try {
                     await rm(full, { recursive: true, force: true });
                 } catch {
@@ -454,6 +488,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                 loggerLog("info", `[gc] removed stale retrieval export dir ${path.relative(stateDir(), full)}`);
                 result.retrievalExportsRemoved++;
             } else if (e.isFile() && e.name.endsWith(".txt") && !e.name.startsWith(".")) {
+                if (liveRefs.has(e.name.slice(0, -".txt".length))) continue;
                 const full = path.join(exportRoot, e.name);
                 let fst;
                 try {

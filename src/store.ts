@@ -12,7 +12,7 @@ import {
     type RetrievalExport,
 } from "acp-kernel";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { mkdirSync, utimesSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import { log as loggerLog } from "./logger.js";
 import { retrievalExportDir } from "./paths.js";
@@ -220,9 +220,15 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
  *  rewrites identical bytes (idempotent; the kernel already deduped by
  *  content). */
 function writeRetrievalExport(exported: RetrievalExport): boolean {
+    const dir = dirname(exported.path);
     try {
-        mkdirSync(dirname(exported.path), { recursive: true });
+        mkdirSync(dir, { recursive: true });
         writeFileSync(exported.path, exported.text, { encoding: "utf8", mode: 0o600 });
+        // Overwriting an existing file does NOT touch its parent dir's mtime —
+        // and the GC age gate (#4699) reads exactly that mtime. Without this,
+        // a live session that only re-retrieves the same refs would age out and
+        // get its export dir swept while still active. Refresh it explicitly.
+        utimesSync(dir, new Date(), new Date());
         return true;
     } catch (e) {
         loggerLog("warn", `[ccr] retrieve export write failed (${exported.path}): ${String(e)}`);
