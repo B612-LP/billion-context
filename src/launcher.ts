@@ -4984,6 +4984,18 @@ export async function ensureProxyRunning(
                 fs.closeSync(logFd);
             } catch {}
         }
+        // #4125: the port log is SHARED across spawns (append fd, size-based
+        // rotation only) — a zero-output failed child used to leave the
+        // PREVIOUS spawn's content behind, and every quoted sample misattributed
+        // it (observed: a week-old EADDRINUSE line quoted as the current
+        // failure's evidence). Mark where THIS spawn's segment starts; the
+        // samples below read from here on, and "N bytes" means N bytes since
+        // this spawn.
+        try {
+            fs.appendFileSync(logPath, `\n=== bili spawn ${new Date(now()).toISOString()} launcherPid=${process.pid} childPid=${child.pid ?? "?"} port=${port} ===\n`);
+        } catch { /* diagnostics only */ }
+        let spawnLogStartBytes = 0;
+        try { spawnLogStartBytes = fs.statSync(logPath).size; } catch { /* unreadable — treat as fresh */ }
         try {
             child.unref?.();
         } catch {}
@@ -5028,7 +5040,9 @@ export async function ensureProxyRunning(
                 const fd = fs.openSync(logPath, "r");
                 try {
                     const buf = Buffer.alloc(256);
-                    const n = fs.readSync(fd, buf, 0, buf.length, 0);
+                    // #4125: from THIS spawn's segment start — the shared file
+                    // may hold previous spawns' output before that offset.
+                    const n = fs.readSync(fd, buf, 0, buf.length, spawnLogStartBytes);
                     if (n === 0) return "";
                     let s = buf.subarray(0, n).toString("utf8").replace(/\s+/g, " ").trim();
                     if (s.length > 200) s = `${s.slice(0, 200)}…`;
@@ -5043,11 +5057,17 @@ export async function ensureProxyRunning(
         const logTail = (): string => {
             try {
                 const size = fs.statSync(logPath).size;
-                // "0 bytes" alone cannot tell "child wrote nothing" from "output
-                // rotated away" (rotatePortLogIfNeeded renames to .old before
-                // the fd is opened) — say which when the rotated half exists.
+                // #4125: report bytes SINCE THIS SPAWN, not the whole shared
+                // file — a zero-output failed child must not be described by
+                // (or quoted from) a previous spawn's content. "0" still cannot
+                // tell "child wrote nothing" from "output rotated away"
+                // (rotatePortLogIfNeeded renames to .old before the fd is
+                // opened) — say which when the rotated half exists.
+                const own = Math.max(0, size - spawnLogStartBytes);
                 const rotated = fs.existsSync(`${logPath}.old`) ? `; earlier output rotated to ${logPath}.old` : "";
-                return size === 0 ? `, ${size} bytes — EMPTY, the child produced no output of its own${rotated}` : `, ${size} bytes${rotated}${logHeadSample()}`;
+                return own <= 0
+                    ? `, ${own} bytes since this spawn — EMPTY, the child produced no output of its own (any earlier content in this shared file belongs to previous spawns)${rotated}`
+                    : `, ${own} bytes since this spawn${rotated}${logHeadSample()}`;
             } catch {
                 return "";
             }
@@ -5090,6 +5110,30 @@ export async function ensureProxyRunning(
             return `last health probe failed with ${d}`;
         };
 
+        // #4125: capture WHAT the planned port was doing at SPAWN time. The
+        // failure-time diagnosis (diagnosePort) only sees the END state; the
+        // start state separates "predecessor still draining/exiting on the
+        // port" from "child wedged on something unrelated" (e.g. a storage lock
+        // left by a forced exit) — the two read identically at the end, and in
+        // the field case the end state was plain ECONNREFUSED while the real
+        // story was the start state.
+        const initialPortNote = await (async (): Promise<string> => {
+            const origin = proxyOrigin(opts.host, port);
+            let info: HealthInfo | undefined;
+            let det: ProbeOutcome = { ok: false, detail: "probe error" };
+            try {
+                const [i, d] = await Promise.all([fetchHealthInfo(origin), fetchDetail(healthUrl(origin))]);
+                info = i;
+                det = d;
+            } catch { /* observability only — keep the generic clause */ }
+            if (info?.ok) return `healthy bili instance${info.pid !== undefined ? ` (pid ${info.pid})` : ""}`;
+            if (det.ok) return "foreign HTTP answer";
+            const d = det.detail ?? "unknown error";
+            if (/^(ECONNREFUSED|ECONNRESET|EHOSTUNREACH|ENETUNREACH|EPIPE)$/i.test(d)) return "nothing listening";
+            if (/^HTTP \d{3}$/.test(d)) return `${d} answer`;
+            if (/^timeout after \d+ms$/i.test(d) && (await (deps.isConnectable ?? tcpConnectable)(origin))) return "busy (TCP up, no health answer)";
+            return `probe failed (${d})`;
+        })();
         const deadline = now() + SPAWN_BUDGET_MS;
         // #2187: announce the phase boundary once — a live child past the
         // initial window is still being waited for, and the log is the only
@@ -5100,7 +5144,7 @@ export async function ensureProxyRunning(
             if (!slowStartNoticed && now() >= deadline - SLOW_START_GRACE_MS) {
                 slowStartNoticed = true;
                 console.error(
-                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (${await diagnosePort(true)}) (log: ${logPath}${logTail()})`,
+                    `bili: spawned proxy not healthy after ${SPAWN_WAIT_MS}ms — child pid ${child.pid ?? "?"} is still starting up; extending wait to ${SPAWN_BUDGET_MS}ms total (${await diagnosePort(true)}; at spawn: ${initialPortNote}) (log: ${logPath}${logTail()})`,
                 );
             }
             await sleepImpl(HEALTH_POLL_INTERVAL_MS);
@@ -5258,7 +5302,7 @@ export async function ensureProxyRunning(
             const detail = childExit.code !== null
                 ? `code ${childExit.code}${childExit.code === TWIN_ADOPT_EXIT_CODE ? " (twin-collision signal)" : ""}`
                 : childExit.signal ? `signal ${childExit.signal}` : "unknown reason";
-            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${await diagnosePort(false)} (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
+            throw new Error(`bili: proxy child exited before becoming healthy (${detail}) — ${await diagnosePort(false)} (at spawn: ${initialPortNote}) (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
         }
         // #2260(A)/#2187: the timeout is the ONE terminal path where the
         // spawned child is STILL ALIVE. Abandoning it leaked a detached proxy
@@ -5271,9 +5315,9 @@ export async function ensureProxyRunning(
         const diagnosis = await diagnosePort(true);
         killAbandonedChild(child);
         console.error(
-            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis} (log: ${logPath}${logTail()})`,
+            `bili: killed spawned proxy (pid ${child.pid ?? "?"}) after ${SPAWN_BUDGET_MS}ms without health — ${diagnosis} (at spawn: ${initialPortNote}) (log: ${logPath}${logTail()})`,
         );
-        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis} (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
+        throw new Error(`bili: proxy did not become healthy within ${SPAWN_BUDGET_MS}ms — ${diagnosis} (at spawn: ${initialPortNote}) (runtime: ${runtime}) (log: ${logPath}${logTail()})`);
     } finally {
         if (claimed) clearStartingMarker(launchToken);
     }
