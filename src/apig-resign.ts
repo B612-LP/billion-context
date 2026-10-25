@@ -41,7 +41,9 @@ import { configFile, stateDir } from "./paths.js";
  * passthrough settings are INERT and the request always refuses. Refusals
  * are remembered (recordSignedRefusal → stateDir()/resign-pending.json) so
  * every bili startup lists still-unresolved schemes next to the listen
- * banner until bili ships their re-signer. resign["<scheme>"].enabled=false
+ * banner until bili ships their re-signer — except schemes whose registry
+ * entry carries a status note, which are permanent-policy refusals that no
+ * re-signer will resolve (#4632). resign["<scheme>"].enabled=false
  * / BILI_RESIGN=0 un-deploy the branch entirely (pre-#1884 rewrite behavior
  * — upstream may reject the rewritten bodies; that choice also clears the
  * reminder).
