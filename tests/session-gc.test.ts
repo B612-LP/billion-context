@@ -17,6 +17,7 @@ import { _resetSessionsForTest, getSession, markDirty, peekSession } from "../sr
 import type { Session } from "../src/session.js";
 import { contentStoreTokens, gcConfigFromEnv, gcSessionFiles, isGcEligible, viewFromParsed } from "../src/session-gc.js";
 import { restoreExportDirName } from "../src/image-restore.js";
+import { retrieveSessionDirName } from "../src/paths.js";
 
 const DAY = 86_400_000;
 
@@ -640,5 +641,51 @@ test("gcSessionFiles: session deletion co-deletes its image spill dir; stale spi
         assert.ok(!existsSync(spill), "spill dir co-deleted with its session despite fresh mtime");
         assert.ok(!existsSync(orphan), "stale orphan swept");
         assert.ok(existsSync(fresh), "fresh spill dir kept");
+    });
+});
+
+test("gcSessionFiles: session deletion co-deletes its retrieval export dir; stale export dirs and legacy flat txt swept (#4699)", async () => {
+    const dir = tmpDir("bili-gc-exp-");
+    const exportRoot = tmpDir("bili-gc-exportroot-");
+    await withEnv({ BILI_SESSION_GC: "1" }, async () => {
+        const store = new SessionStore({ dir, debounceMs: 500 });
+        const oldSavedAt = Date.now() - 10 * DAY;
+        const fDel = writeFile(dir, "anthropic/host_del.json", JSON.stringify(envelope("gc-exp-1", oldSavedAt, { metadata: { rawInputTokens: 5000 } })), 10);
+        // Export dir for the deleted session, FRESH mtime — the deterministic
+        // co-delete (session id → dir name) must take it despite the age gate.
+        const exp = path.join(exportRoot, retrieveSessionDirName("gc-exp-1"));
+        mkdirSync(exp, { recursive: true });
+        writeFileSync(path.join(exp, "m00001.txt"), "x");
+        // Orphaned stale dir (no session at all), backdated past the age gate.
+        const orphan = path.join(exportRoot, "old-lane");
+        mkdirSync(orphan, { recursive: true });
+        writeFileSync(path.join(orphan, "m00001.txt"), "x");
+        const old = new Date(Date.now() - 30 * DAY);
+        utimesSync(orphan, old, old);
+        // Fresh orphan — kept; live sessions keep their exports.
+        const fresh = path.join(exportRoot, "fresh-lane");
+        mkdirSync(fresh, { recursive: true });
+        writeFileSync(path.join(fresh, "m00001.txt"), "x");
+        // Legacy pre-#4699 flat exports sit directly under the root: stale one
+        // swept, fresh one kept, non-txt stray never ours so never touched.
+        const staleFlat = path.join(exportRoot, "m00042.txt");
+        writeFileSync(staleFlat, "legacy");
+        utimesSync(staleFlat, old, old);
+        const freshFlat = path.join(exportRoot, "m00043.txt");
+        writeFileSync(freshFlat, "live");
+        const stray = path.join(exportRoot, "stray.bin");
+        writeFileSync(stray, "?");
+        utimesSync(stray, old, old);
+
+        const res = await gcSessionFiles({ dir, store, now: Date.now(), exportRoot });
+        assert.equal(res.removed, 1);
+        assert.equal(res.retrievalExportsRemoved, 3, `co-delete + stale orphan + stale flat, got ${JSON.stringify(res)}`);
+        assert.ok(!existsSync(fDel));
+        assert.ok(!existsSync(exp), "export dir co-deleted with its session despite fresh mtime");
+        assert.ok(!existsSync(orphan), "stale orphan swept");
+        assert.ok(existsSync(fresh), "fresh export dir kept");
+        assert.ok(!existsSync(staleFlat), "stale legacy flat txt swept");
+        assert.ok(existsSync(freshFlat), "fresh flat txt kept");
+        assert.ok(existsSync(stray), "non-txt stray untouched");
     });
 });

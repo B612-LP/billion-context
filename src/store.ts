@@ -13,9 +13,9 @@ import {
 } from "acp-kernel";
 import { randomUUID } from "node:crypto";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { log as loggerLog } from "./logger.js";
-import { stateDir } from "./paths.js";
+import { retrievalExportDir } from "./paths.js";
 import { getStore } from "./persist.js";
 import type { CompressSettings } from "./config.js";
 import { ccrRetrievalTtlMs as knobCcrRetrievalTtlMs } from "./knobs.js";
@@ -178,8 +178,10 @@ export function cloneStoreForRefs(store: MessageContentStore, refs: Iterable<str
  *  count hit/miss, and return the framed original IN THE TOOL RESULT ITSELF
  *  (GHSA jc6g v2: untrusted data rides back at the trust tier it came from,
  *  never as a host-synthesized system message). Originals at or above the
- *  inline threshold are exported to <stateDir>/retrieve/<ref>.txt and the
- *  tool result carries a file pointer the model reads with its file tool.
+ *  inline threshold are exported to <stateDir>/retrieve/<session>/<ref>.txt
+ *  (per-session partition — refs are per-session numbers, a flat layout
+ *  collides across sessions, #4699) and the tool result carries a file
+ *  pointer the model reads with its file tool.
  *  A hallucinated ref costs one tool call by design. */
 export function executeRetrieve(args: Record<string, unknown>, session: Session): ProxyToolResult {
     session.stats.retrieveCalls = (session.stats.retrieveCalls ?? 0) + 1;
@@ -189,7 +191,7 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
         return toolFail(`[${retrieveToolName(session)} FAILED: ref (an mNNNNN id) is required]`);
     }
-    const result = applyRetrieve({ store: contentStoreOf(session), ref, exportDir: retrievalExportDir() });
+    const result = applyRetrieve({ store: contentStoreOf(session), ref, exportDir: retrievalExportDir(session.id) });
     if (!result.ok) {
         session.stats.retrieveMisses = (session.stats.retrieveMisses ?? 0) + 1;
         loggerLog("info", `[ccr] retrieve ${ref}: miss (${result.reason})`);
@@ -211,15 +213,12 @@ export function executeRetrieve(args: Record<string, unknown>, session: Session)
     return toolOk(result.toolResultText);
 }
 
-/** Host side of the kernel RetrievalExport effect: exports land under
- *  <stateDir>/retrieve/<ref>.txt with 0600 (folded conversation content is
- *  not world-readable on multi-user hosts), parents created on demand.
- *  Content-addressed by ref, so a repeated retrieve rewrites identical
- *  bytes (idempotent; the kernel already deduped by content). */
-function retrievalExportDir(): string {
-    return join(stateDir(), "retrieve");
-}
-
+/** Host side of the kernel RetrievalExport effect: writes the export file
+ *  (path comes from retrievalExportDir(session.id), #4699) with 0600 (folded
+ *  conversation content is not world-readable on multi-user hosts), parents
+ *  created on demand. Addressed by session + ref, so a repeated retrieve
+ *  rewrites identical bytes (idempotent; the kernel already deduped by
+ *  content). */
 function writeRetrievalExport(exported: RetrievalExport): boolean {
     try {
         mkdirSync(dirname(exported.path), { recursive: true });

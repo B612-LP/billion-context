@@ -4,7 +4,7 @@ import path from "node:path";
 import { log as loggerLog } from "./logger.js";
 import { defaultCountTokens } from "acp-kernel";
 import { getStore, type SessionStore } from "./persist.js";
-import { sessionsDir } from "./paths.js";
+import { retrieveSessionDirName, retrievalExportDir, sessionsDir } from "./paths.js";
 import { dropSessionForGc, peekSession } from "./session.js";
 import { stateDir } from "./paths.js";
 import { restoreExportDir, restoreExportDirName } from "./image-restore.js";
@@ -180,10 +180,12 @@ interface GcResult {
     companionsRemoved: number;
     /** #1995: image-spill directories removed (co-deletions + stale-mtime sweep) */
     imgDirsRemoved: number;
+    /** #4699: CCR text-export dirs/files removed (co-deletions + stale-mtime sweep) */
+    retrievalExportsRemoved: number;
 }
 
-export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore; now?: number; imgRoot?: string }): Promise<GcResult> {
-    const result: GcResult = { removed: 0, kept: 0, unreadable: 0, bytesFreed: 0, companionsRemoved: 0, imgDirsRemoved: 0 };
+export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore; now?: number; imgRoot?: string; exportRoot?: string }): Promise<GcResult> {
+    const result: GcResult = { removed: 0, kept: 0, unreadable: 0, bytesFreed: 0, companionsRemoved: 0, imgDirsRemoved: 0, retrievalExportsRemoved: 0 };
     const cfg = gcConfigFromEnv();
     if (!cfg.enabled) return result;
     const store = opts?.store ?? getStore();
@@ -289,6 +291,17 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                 await rm(imgDir, { recursive: true, force: true });
                 loggerLog("info", `[gc] removed image spills for session ${view.id}: ${path.relative(stateDir(), imgDir)}`);
                 result.imgDirsRemoved++;
+            } catch { /* mtime pass retries next sweep */ }
+            // #4699: CCR text exports share this session's lifecycle — pure
+            // cache (a re-retrieve rewrites them), and refs are per-session so
+            // the dir is addressable by id exactly like the spill tree.
+            try {
+                const exportDir = opts?.exportRoot !== undefined
+                    ? path.join(opts.exportRoot, retrieveSessionDirName(view.id))
+                    : retrievalExportDir(view.id);
+                await rm(exportDir, { recursive: true, force: true });
+                loggerLog("info", `[gc] removed retrieval exports for session ${view.id}: ${path.relative(stateDir(), exportDir)}`);
+                result.retrievalExportsRemoved++;
             } catch { /* mtime pass retries next sweep */ }
         }
         if (compSt) {
@@ -412,9 +425,57 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
             result.imgDirsRemoved++;
         }
     } catch { /* no spill tree yet — nothing to sweep */ }
-    if (result.removed > 0 || result.unreadable > 0 || result.companionsRemoved > 0 || result.imgDirsRemoved > 0) {
+    // #4699: per-session CCR text-export dirs under <state>/retrieve/ — same
+    // self-heal rationale as spills: exports are a pure cache (the next
+    // retrieve rewrites them), so an age-eligible dir is safe to drop even if
+    // its session survives. The "img" container is the spill tree's own root,
+    // swept by its dedicated pass above. Legacy pre-#4699 flat <ref>.txt files
+    // sit directly here and age out as unreferenced payload garbage (a
+    // re-retrieve would rewrite them); anything else in this dir is not ours
+    // and stays put.
+    const exportRoot = opts?.exportRoot ?? path.join(stateDir(), "retrieve");
+    try {
+        for (const e of await readdir(exportRoot, { withFileTypes: true })) {
+            if (e.isDirectory()) {
+                if (e.name === "img") continue;
+                const full = path.join(exportRoot, e.name);
+                let est;
+                try {
+                    est = await stat(full);
+                } catch {
+                    continue;
+                }
+                if (!est.isDirectory() || now - est.mtimeMs < cfg.maxAgeMs) continue;
+                try {
+                    await rm(full, { recursive: true, force: true });
+                } catch {
+                    continue;
+                }
+                loggerLog("info", `[gc] removed stale retrieval export dir ${path.relative(stateDir(), full)}`);
+                result.retrievalExportsRemoved++;
+            } else if (e.isFile() && e.name.endsWith(".txt") && !e.name.startsWith(".")) {
+                const full = path.join(exportRoot, e.name);
+                let fst;
+                try {
+                    fst = await stat(full);
+                } catch {
+                    continue;
+                }
+                if (now - fst.mtimeMs < cfg.maxAgeMs) continue;
+                try {
+                    await rm(full, { force: true });
+                } catch {
+                    continue;
+                }
+                loggerLog("info", `[gc] removed stale flat retrieval export ${e.name} (${fst.size} B)`);
+                result.retrievalExportsRemoved++;
+                result.bytesFreed += fst.size;
+            }
+        }
+    } catch { /* no export tree yet — nothing to sweep */ }
+    if (result.removed > 0 || result.unreadable > 0 || result.companionsRemoved > 0 || result.imgDirsRemoved > 0 || result.retrievalExportsRemoved > 0) {
         loggerLog(result.unreadable > 0 ? "warn" : "info",
-            `[gc] removed ${result.removed} stale session file(s)${result.companionsRemoved > 0 ? ` + ${result.companionsRemoved} content store file(s)` : ""}${result.imgDirsRemoved > 0 ? ` + ${result.imgDirsRemoved} image spill dir(s)` : ""} (age>${Math.round(cfg.maxAgeMs / DAY_MS)}d, ≤${cfg.maxTokens}tok), freed ${(result.bytesFreed / 1024).toFixed(1)} KB${result.unreadable > 0 ? `; left ${result.unreadable} unreadable file(s) in place` : ""}`);
+            `[gc] removed ${result.removed} stale session file(s)${result.companionsRemoved > 0 ? ` + ${result.companionsRemoved} content store file(s)` : ""}${result.imgDirsRemoved > 0 ? ` + ${result.imgDirsRemoved} image spill dir(s)` : ""}${result.retrievalExportsRemoved > 0 ? ` + ${result.retrievalExportsRemoved} retrieval export(s)` : ""} (age>${Math.round(cfg.maxAgeMs / DAY_MS)}d, ≤${cfg.maxTokens}tok), freed ${(result.bytesFreed / 1024).toFixed(1)} KB${result.unreadable > 0 ? `; left ${result.unreadable} unreadable file(s) in place` : ""}`);
     }
     return result;
 }
