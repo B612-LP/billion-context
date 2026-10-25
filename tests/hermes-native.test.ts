@@ -694,6 +694,12 @@ elif SCENARIO == "registry-find":
     out["rf_foreign"] = mod._find_spawned_in_registry(4242)
     seed({"stale": {"origin": ORIGIN, "pid": 12345, "instanceId": "stale"}})
     out["rf_dead"] = mod._find_spawned_in_registry(4242)
+    # Two markers share OUR child's pid: a stale one from a previous run whose dead pid the OS
+    # reused (it sorts FIRST by filename) plus our child's own newer registration. The newest
+    # started_at must win — never the alphabetically-first stale marker (#4658 review).
+    seed({"aaa-stale": {"origin": ORIGIN, "pid": 4242, "instanceId": "aaa-stale", "startedAt": 1},
+          "zzz-own": {"origin": ORIGIN, "pid": 4242, "instanceId": "zzz-own", "startedAt": 999}})
+    out["rf_dup_pid"] = (mod._find_spawned_in_registry(4242) or {}).get("instance_id")
     out["rf_none"] = mod._find_spawned_in_registry(None)
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
@@ -767,6 +773,7 @@ interface DriverOut {
     rf_own?: string | null;
     rf_foreign?: unknown;
     rf_dead?: unknown;
+    rf_dup_pid?: string | null;
     rf_none?: unknown;
 }
 
@@ -1138,6 +1145,7 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.rf_own, "own", "our child's own pid resolves to its marker");
         assert.equal(out!.rf_foreign, null, "a live foreign instance (its own launchToken) is never mistaken for ours");
         assert.equal(out!.rf_dead, null, "a stale marker from a dead pid is not adopted");
+        assert.equal(out!.rf_dup_pid, "zzz-own", "two markers sharing our child's pid (reused-pid corner): the newest registration wins, never the alphabetically-first stale one");
         assert.equal(out!.rf_none, null, "no child pid -> never match");
     });
 });
