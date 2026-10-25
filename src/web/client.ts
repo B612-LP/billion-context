@@ -1311,6 +1311,22 @@ function changelogCatOf(rawLine) {
                 kb.innerHTML = "";
             }
         }
+        // #4634: default-on auto-review block notice — only shows once at least
+        // one review request was locally answered (count + saved estimate + how
+        // to turn auto-review itself off; the block only stops bili's egress).
+        const arb = $("autoreview-banner");
+        if (arb) {
+            const ar = d.autoReviewBlock;
+            if (ar && typeof ar.blockedCount === "number" && ar.blockedCount > 0) {
+                arb.hidden = false;
+                arb.classList.add("show");
+                arb.innerHTML = "<strong>" + t("autoreview.on") + '</strong> <span class="mono">' + t("autoreview.count", { n: ar.blockedCount, tok: ar.savedEstTokens }) + "</span> " + t("autoreview.desc") + " " + t("autoreview.hint");
+            } else {
+                arb.hidden = true;
+                arb.classList.remove("show");
+                arb.innerHTML = "";
+            }
+        }
         // #2861: host-side metering plugin notice — dismissal is server-side
         // (POST /__bili/host-plugins/dismiss) so one close silences every browser.
         const hb = $("host-plugin-banner");
