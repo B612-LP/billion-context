@@ -863,18 +863,38 @@ export class UnifiedStore {
             // bounds from the append-only transcript. Final absolute seqs exist
             // only here (delta placeholders are renumbered in-transaction), so
             // the pure planner cannot know them. Coverage whose ids have no
-            // transcript row (imported pre-fold) keeps the 0 placeholder.
-            const seqSpanById = new Map<string, [number, number]>();
+            // transcript row (imported pre-fold) is UNKNOWN — stored as NULL
+            // (no claim), never a degenerate [0,0]: kernel's interval
+            // consumers treat [0,0] as a live claim over seq 0 and would
+            // mis-cover an unrelated message (#4741).
+            // #4742: point-query only the covered ids (the full-table scan ran
+            // on EVERY save of every folded session; span resolution needs at
+            // most the ids one block's payload names).
+            const coveredIds = new Set<string>();
             if (input.blocks.length > 0) {
-                const rows = this.db
-                    .prepare("SELECT msg_id, seq FROM messages WHERE session_id = ?")
-                    .all(s.sessionId) as Array<{ msg_id: string; seq: number }>;
-                for (const r of rows) {
-                    const cur = seqSpanById.get(r.msg_id);
-                    if (!cur) seqSpanById.set(r.msg_id, [r.seq, r.seq]);
-                    else {
-                        if (r.seq < cur[0]) cur[0] = r.seq;
-                        if (r.seq > cur[1]) cur[1] = r.seq;
+                for (const b of input.blocks) {
+                    try {
+                        const cov = JSON.parse(b.payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                        for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) coveredIds.add(id);
+                    } catch { /* malformed payload: bounds stay unknown */ }
+                }
+            }
+            const seqSpanById = new Map<string, [number, number]>();
+            {
+                const ids = [...coveredIds];
+                for (let i = 0; i < ids.length; i += 500) {
+                    const chunk = ids.slice(i, i + 500);
+                    const ph = chunk.map(() => "?").join(",");
+                    const rows = this.db
+                        .prepare(`SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${ph})`)
+                        .all(s.sessionId, ...chunk) as Array<{ msg_id: string; seq: number }>;
+                    for (const r of rows) {
+                        const cur = seqSpanById.get(r.msg_id);
+                        if (!cur) seqSpanById.set(r.msg_id, [r.seq, r.seq]);
+                        else {
+                            if (r.seq < cur[0]) cur[0] = r.seq;
+                            if (r.seq > cur[1]) cur[1] = r.seq;
+                        }
                     }
                 }
             }
@@ -889,8 +909,11 @@ export class UnifiedStore {
                         if (sp[0] < lo) lo = sp[0];
                         if (sp[1] > hi) hi = sp[1];
                     }
-                } catch { /* malformed payload: keep the 0 placeholder */ }
-                return hi < 0 ? [0, 0] : [lo, hi];
+                } catch { /* malformed payload: bounds stay unknown */ }
+                // Unknown → the -1/-1 no-claim sentinel (planner convention,
+                // ingest.ts:372): never a degenerate [0,0] that reads like a
+                // real interval claim over seq 0 (#4741).
+                return hi < 0 ? [-1, -1] : [lo, hi];
             };
             for (const b of input.blocks) {
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
@@ -935,8 +958,8 @@ export class UnifiedStore {
                             b.blockId,
                             s.sessionId,
                             b.ord,
-                            b.startSeq,
-                            b.endSeq,
+                            bStartSeq,
+                            bEndSeq,
                             b.startRef,
                             b.endRef,
                             b.tier,

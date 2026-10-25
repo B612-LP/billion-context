@@ -520,20 +520,35 @@ export class MysqlBackend implements StorageBackend {
             }
             // #4316 layer 3 (mirror of store.ts): resolve coverage to canonical
             // seq bounds from the append-only transcript; unresolvable keeps 0.
+            // #4741/#4742 (mysql twin): point-query only the covered ids; an
+            // unresolvable span is UNKNOWN — stored as NULL, never a
+            // degenerate [0,0] that reads like a real interval claim.
+            const coveredIds = new Set<string>();
+            for (const b of input.blocks) {
+                try {
+                    const cov = JSON.parse(b.payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                    for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) coveredIds.add(id);
+                } catch { /* malformed payload: bounds stay unknown */ }
+            }
             const seqSpanById = new Map<string, [number, number]>();
-            if (input.blocks.length > 0) {
-                const spanRows = (await c.query(
-                    "SELECT msg_id, seq FROM messages WHERE session_id = ?",
-                    [s.sessionId],
-                )) as unknown as Row[][];
-                for (const r of spanRows[0]) {
-                    const msgId = str(r.msg_id);
-                    const seq = Number(r.seq);
-                    const cur = seqSpanById.get(msgId);
-                    if (!cur) seqSpanById.set(msgId, [seq, seq]);
-                    else {
-                        if (seq < cur[0]) cur[0] = seq;
-                        if (seq > cur[1]) cur[1] = seq;
+            {
+                const ids = [...coveredIds];
+                for (let i = 0; i < ids.length; i += 500) {
+                    const chunk = ids.slice(i, i + 500);
+                    const ph = chunk.map(() => "?").join(",");
+                    const spanRows = (await c.query(
+                        `SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${ph})`,
+                        [s.sessionId, ...chunk],
+                    )) as unknown as Row[][];
+                    for (const r of spanRows[0]) {
+                        const msgId = str(r.msg_id);
+                        const seq = Number(r.seq);
+                        const cur = seqSpanById.get(msgId);
+                        if (!cur) seqSpanById.set(msgId, [seq, seq]);
+                        else {
+                            if (seq < cur[0]) cur[0] = seq;
+                            if (seq > cur[1]) cur[1] = seq;
+                        }
                     }
                 }
             }
@@ -548,8 +563,9 @@ export class MysqlBackend implements StorageBackend {
                         if (sp[0] < lo) lo = sp[0];
                         if (sp[1] > hi) hi = sp[1];
                     }
-                } catch { /* malformed payload: keep the 0 placeholder */ }
-                return hi < 0 ? [0, 0] : [lo, hi];
+                } catch { /* malformed payload: bounds stay unknown */ }
+                // Unknown → -1/-1 no-claim sentinel, never degenerate [0,0] (#4741).
+                return hi < 0 ? [-1, -1] : [lo, hi];
             };
             for (const b of input.blocks) {
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
