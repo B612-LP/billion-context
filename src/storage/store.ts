@@ -2333,6 +2333,7 @@ export class UnifiedStore {
                 .all(sessionId, ...chunk) as Record<string, unknown>[];
             out.push(...rows.map((r) => this.mapMessageRow(r)));
         }
+        out.sort((a, b) => a.seq - b.seq);
         return out;
     }
 

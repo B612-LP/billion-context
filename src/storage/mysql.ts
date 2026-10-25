@@ -1057,6 +1057,7 @@ export class MysqlBackend implements StorageBackend {
                 });
             }
         }
+        out.sort((a, b) => a.seq - b.seq);
         return out;
     }
 
