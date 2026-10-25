@@ -79,9 +79,11 @@ import { markNativeHost, nativeAttachOrigin, nativeBootstrapGate, nativeProxyScr
 import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, noteRoutedOrigin, observeRoutedOrigin, readyOrigin, replaceRequestPayload, replaceRequestTarget, routedBiliModelUrl, type LiveOriginResolverDeps, type NativeInterceptState, type UnavailableReason } from "./native-intercept.js";
 import { clearIncrementalProbe, createPrepareDirectSend, INCREMENTAL_TURN_MARKER_HEADER, INCREMENTAL_TURN_ID_HEADER, newIncrementalTurnId, noteIncrementalAck, noteIncrementalRejection, planIncrementalTurn, probeIncrementalTurns, rememberOriginalBody, sweepStale, wireMessagesLookAnthropic, type IncrementalWireMessage } from "./incremental-client.js";
 import { createOpencodeV2Setup, type V2HttpRequestEvent, type V2State } from "./opencode-v2.js";
+import { alignedMsgIdsForWire, harvestOpencodeMsgIds } from "./opencode-msgids.js";
 import { asciiHeaderValue, fetchProxyVersion, postIdentityRegister, reportRuntimeInfoOnChange, waitForProxyVersion, type ForwardedToolResult } from "./shared.js";
 import { callLegacyAcpConfig, isLegacyAcpSession, loadLegacyAcp, type LegacyAcpModule } from "./opencode-legacy.js";
 import { logHostEvent } from "./host-log.js";
+import { mediaBytesOfWireBody } from "./media-bytes.js";
 
 /** Decides whether the native bootstrap should run in this process. */
 export function shouldBootstrapNativeOpencode(env: NodeJS.ProcessEnv): boolean {
@@ -111,8 +113,8 @@ export type OpencodeNativeRouteDeps = LiveOriginResolverDeps;
 /** #3308: client-side mirror of #2924's refuse-oversized arm for this lane
  *  (the V2 route has no takeover gate to carry it). Returns a host-visible
  *  refusal when the proxy is unavailable AND the body provably cannot fit the
- *  model's context window — the FLOOR estimate (bytes/4) already exceeds the
- *  window, and #2924's ledger evidence says real bodies run ABOVE the floor
+ *  model's context window — the core-text floor (bytes/4) exceeds the
+ *  window, and #2924's ledger evidence says real text runs ABOVE the floor
  *  (calibratedEstimate ~1.14), so the comparison cannot false-refuse. Unknown
  *  model, unknown window, unreadable or absent body all return undefined and
  *  keep the documented fail-open direct send. The size is measured through a
@@ -124,24 +126,28 @@ async function oversizeDirectRefusal(e: V2HttpRequestEvent, s: V2State, reason?:
     if (window === undefined || !Number.isFinite(window) || window <= 0) return undefined;
     const req = e.request as Request | undefined;
     if (req === null || typeof req !== "object" || typeof req.clone !== "function") return undefined;
-    let bytes: number;
+    let body: ArrayBuffer;
     try {
-        bytes = (await req.clone().arrayBuffer()).byteLength;
+        body = await req.clone().arrayBuffer();
     } catch {
         return undefined;
     }
-    const floorTokens = Math.ceil(bytes / 4);
+    const bytes = body.byteLength;
+    if (Math.ceil(bytes / 4) <= window) return undefined;
+    // #4121: only re-price would-refuse bodies; inline media is not text.
+    const coreBytes = Math.max(bytes - mediaBytesOfWireBody(new TextDecoder().decode(body)), 0);
+    const floorTokens = Math.ceil(coreBytes / 4);
     if (floorTokens <= window) return undefined;
     // #3654: a busy-exhausted refusal must NOT claim "proxy unavailable …
     // guaranteed upstream 400" — the proxy IS up and would serve the request
     // once its event loop drains; the honest fact is that we stopped waiting.
     if (reason === "busy-exhausted") {
         return new Error(
-            `bili: proxy alive but unresponsive — it accepted connections but never answered its health probe within the wait budget (event loop saturated, typically a large compression in flight); this request cannot be sent uncompressed (body ~${floorTokens} tok (floor estimate ${bytes}B/4) exceeds the ${model.providerID}/${model.id} context window (${window})), so it is refused locally instead of queued indefinitely. The proxy is likely to serve it once the fold finishes (#3654); retry shortly.`,
+            `bili: proxy alive but unresponsive — it accepted connections but never answered its health probe within the wait budget (event loop saturated, typically a large compression in flight); this request cannot be sent uncompressed (body ~${floorTokens} tok (floor estimate ${coreBytes}B/4) exceeds the ${model.providerID}/${model.id} context window (${window})), so it is refused locally instead of queued indefinitely. The proxy is likely to serve it once the fold finishes (#3654); retry shortly.`,
         );
     }
     return new Error(
-        `bili: proxy unavailable and this request cannot be sent uncompressed — body ~${floorTokens} tok (floor estimate ${bytes}B/4) exceeds the ${model.providerID}/${model.id} context window (${window}); upstream would reject it. Recovery is automatic (#3308); retry shortly, or start a fresh session if the local history has outgrown the window.`,
+        `bili: proxy unavailable and this request cannot be sent uncompressed — body ~${floorTokens} tok (floor estimate ${coreBytes}B/4) exceeds the ${model.providerID}/${model.id} context window (${window}); upstream would reject it. Recovery is automatic (#3308); retry shortly, or start a fresh session if the local history has outgrown the window.`,
     );
 }
 
@@ -270,8 +276,12 @@ export function _setSpawnForTest(fn?: () => Promise<string | undefined>): void {
  *  attach origin, the fallback origin, or undefined when nothing came up. */
 export async function verifyAttachAndRecover(attachOrigin: string): Promise<string | undefined> {
     // #1365: routed evidence outranks the planned origin — probe where the
-    // model channel actually points, not where the env says it should.
-    const home = state.routedOrigin ?? attachOrigin;
+    // model channel actually points, not where the env says it should. An
+    // EXPLICIT BILLION_CONTEXT_ATTACH outranks both: it names the plugin API
+    // endpoint directly, and a routed model origin may be a plain model-only
+    // path (e.g. an admin-gated port) that never exposes the plugin manifest.
+    const explicitAttachOrigin = nativeAttachOrigin(process.env);
+    const home = explicitAttachOrigin ?? state.routedOrigin ?? attachOrigin;
     const version = await fetchProxyVersion(home).catch(() => undefined);
     if (version !== undefined) {
         // Restore the readyOrigin short-circuit — a runtime recovery clears
@@ -281,7 +291,7 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
         process.env.BILLION_CONTEXT_PROXY = home;
         return home;
     }
-    const pinned = state.routedOrigin ?? (await observeRoutedOrigin(state));
+    const pinned = explicitAttachOrigin ?? state.routedOrigin ?? (await observeRoutedOrigin(state));
     if (pinned !== undefined) {
         const back = await waitForProxyVersion(pinned);
         if (back !== undefined) {
@@ -290,7 +300,13 @@ export async function verifyAttachAndRecover(attachOrigin: string): Promise<stri
             logHostEvent("info", "[native-client]", `bili-native-opencode: attach target ${pinned} is healthy again — attached, no second instance spawned`);
             return back;
         }
-        logHostEvent("error", "[native-client]", `bili-native-opencode: attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`);
+        logHostEvent(
+            "error",
+            "[native-client]",
+            explicitAttachOrigin !== undefined
+                ? `bili-native-opencode: explicit attach target ${pinned} unreachable within the health deadline — refusing to spawn a second instance (your declared endpoint stays authoritative). Start your proxy at ${pinned} or unset BILLION_CONTEXT_ATTACH; bili keeps re-checking and self-heals when it comes back.`
+                : `bili-native-opencode: attach target ${pinned} is down and this process's model channel is pinned to it — refusing to spawn a second instance (bili tools would 404 against the other one). Start your proxy at ${pinned} or unset BILLION_CONTEXT_PROXY; bili keeps re-checking and self-heals when it comes back.`,
+        );
         state.origin = undefined;
         return undefined;
     }
@@ -592,6 +608,14 @@ function lastSessionFromMessages(messages: unknown): string | undefined {
     return undefined;
 }
 
+/** #4491 host wiring: harvest host message ids per LLM request from the V1
+ *  messages.transform hook — the only opencode seam that sees them (V2's
+ *  http.request sees just the wire, so V2-shaped turns degrade to
+ *  content-derived identities). Never mutates the host's messages. */
+const harvestMsgIdsTransform = async (_input: unknown, output: { messages?: unknown }): Promise<void> => {
+    harvestOpencodeMsgIds(lastSessionFromMessages(output?.messages), output?.messages);
+};
+
 // #1135: dynamic origin getter instead of a captured constant — after a
 // runtime death+recovery the live origin changes, and hooks bound to the
 // startup origin would keep forwarding tools to the dead port while traffic
@@ -682,9 +706,14 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
         const msgT = legacy.hooks["experimental.chat.messages.transform"];
         if (typeof msgT === "function") {
             hooks["experimental.chat.messages.transform"] = async (input, output) => {
-                if (!isLegacy(lastSessionFromMessages(output?.messages))) return;
-                await (msgT as (i: unknown, o: unknown) => Promise<void>)(input, output);
+                if (isLegacy(lastSessionFromMessages(output?.messages))) {
+                    await (msgT as (i: unknown, o: unknown) => Promise<void>)(input, output);
+                    return;
+                }
+                await harvestMsgIdsTransform(input, output);
             };
+        } else {
+            hooks["experimental.chat.messages.transform"] = harvestMsgIdsTransform;
         }
         const textC = legacy.hooks["experimental.text.complete"];
         if (typeof textC === "function") {
@@ -699,6 +728,10 @@ export function createV1ServerHooks(getOrigin: () => string | undefined, ctx: V1
         if (typeof evt === "function") {
             hooks.event = evt as V1Hooks["event"];
         }
+    } else {
+        // #4491: with no absorbed acp the transform hook is pure msgid
+        // harvesting — registered for every session, inert-safe.
+        hooks["experimental.chat.messages.transform"] = harvestMsgIdsTransform;
     }
     if (deps.z !== undefined || legacy !== undefined) {
         hooks["chat.headers"] = async (input, output) => {
@@ -892,7 +925,7 @@ export async function maybeIncrementalOpencode(e: V2HttpRequestEvent, s: V2State
         const b = body as { messages?: unknown; model?: unknown; system?: unknown };
         if (typeof b.model !== "string" || !wireMessagesLookAnthropic(b.messages)) return; // anthropic-wire only; OpenAI-tool shapes resend full
         if (!(await probeIncrementalTurns(base))) return;
-        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown> });
+        const plan = planIncrementalTurn({ conversationId: sid, path: "/v1/messages", messages: b.messages as IncrementalWireMessage[], system: b.system as unknown, request: b as { model?: unknown } & Record<string, unknown>, msgIds: alignedMsgIdsForWire(sid, b.messages) });
         if (plan.mode === "skip") return;
         // #3378 single-flight (kept over #3329's removal per the rebase
         // decision): while a marker'd request for this URL is still awaiting
