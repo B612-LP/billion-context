@@ -8,6 +8,7 @@ import {
     reconcileFoldCoverage,
     resolveFoldReconcileMode,
     noteSystemPromptFingerprint,
+    noteBiliToolSurface,
     METADATA_FOLD_COVERAGE,
     resetNormalizedIdentityWork,
     turnContexts,
@@ -291,6 +292,56 @@ describe("reconcileFoldCoverage (#1921)", () => {
         assert.equal(logs.length, 1);
         assert.match(logs[0], /system prompt changed/);
         assert.match(logs[0], /fold state unaffected/);
+    });
+});
+
+describe("noteBiliToolSurface (#4789 tripwire)", () => {
+    const empty = () => ({ state: { blocks: [] }, metadata: {} }) as unknown as Session;
+    const logOpts = (logs: string[]) => ({ sessionId: "s1", log: (_l: string, m: string) => logs.push(m) });
+
+    test("stable surface across requests logs nothing", () => {
+        const session = empty();
+        const logs: string[] = [];
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        assert.equal(logs.length, 0, "first egress seeds silently");
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        assert.equal(logs.length, 0, "unchanged surface stays silent");
+    });
+
+    test("a removal flip warns once naming what left", () => {
+        const session = empty();
+        const logs: string[] = [];
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        noteBiliToolSurface(session, { ccr: false, imageRescale: false }, logOpts(logs));
+        assert.equal(logs.length, 1);
+        assert.match(logs[0], /\[tool-set\]/);
+        assert.match(logs[0], /\+(-) \/ -(imageRescale)/);
+        assert.match(logs[0], /#4789/);
+    });
+
+    test("an addition flip reports the new entry", () => {
+        const session = empty();
+        const logs: string[] = [];
+        noteBiliToolSurface(session, { ccr: false, imageRescale: false }, logOpts(logs));
+        noteBiliToolSurface(session, { ccr: true, imageRescale: false }, logOpts(logs));
+        assert.equal(logs.length, 1);
+        assert.match(logs[0], /\+(ccr) \/ -(-)/);
+    });
+
+    test("back-and-forth flips each warn", () => {
+        const session = empty();
+        const logs: string[] = [];
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        noteBiliToolSurface(session, { ccr: false, imageRescale: false }, logOpts(logs));
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        assert.equal(logs.length, 2, "each direction change is its own warn");
+    });
+
+    test("no metadata → no-op, never throws", () => {
+        const session = { state: { blocks: [] } } as unknown as Session;
+        const logs: string[] = [];
+        noteBiliToolSurface(session, { ccr: true, imageRescale: true }, logOpts(logs));
+        assert.equal(logs.length, 0);
     });
 });
 

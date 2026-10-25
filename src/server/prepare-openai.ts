@@ -10,7 +10,7 @@ import { pluginAgentHeader } from "../plugin.js";
 import { applyReasoningDrop, diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, planReasoningDrop, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, warnDroppedOpenaiParts, warnReasoningPairs, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
-import { reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
+import { reconcileFoldCoverage, noteBiliToolSurface, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
@@ -351,6 +351,7 @@ export async function prepareOpenai(
         if (injectTools) {
             toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
+        if (!isTitleGen) noteBiliToolSurface(session, { ccr: injectTools && ccrEnabled(session), imageRescale: injectTools && imageRescaleToolArmed(session) }, { sessionId, log });
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
         // nudge channel of their own, so this proxy-side nudge is the proactive

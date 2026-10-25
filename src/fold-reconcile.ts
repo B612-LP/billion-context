@@ -162,6 +162,13 @@ export const METADATA_CANONICAL_SYS_FP = "canonicalSysFp";
  *  last prepared request — written by prepare-responses, read by the ledger
  *  settle for projection-switch forensics (the `pm` line field). */
 export const METADATA_LAST_RESPONSES_MODE = "lastResponsesMode";
+/** #4789: last-noted bili-injected-tool surface ({fp, tags}) — which of the two
+ *  metadata-stamped conditional tools (acp_retrieve / CCR, acp_read_original_image /
+ *  image-rescale) the session's LAST prepared request actually declared. Those two
+ *  ride mutable per-request session state, so a flip between consecutive requests
+ *  means the declared tool array changed; tool definitions render BEFORE system +
+ *  messages, so that silently invalidates the whole prefix cache (full re-bill). */
+export const METADATA_TOOLSET_FP = "toolsetFp";
 /** Anchors are only kept for covered ids; 16k covered messages is far beyond
  *  any folded session, the cap only bounds pathological metadata. */
 const MAX_ANCHORS = 16384;
@@ -2235,4 +2242,25 @@ export function noteCanonicalSystemFingerprint(session: Session, canonical: unkn
     const text = canonical === undefined || canonical === null ? "" : JSON.stringify(canonical) ?? "";
     const fp = canonical === undefined || canonical === null ? "-" : createHash("sha256").update(text).digest("hex").slice(0, 16);
     session.metadata[METADATA_CANONICAL_SYS_FP] = { fp, size: text.length };
+}
+
+/** #4789: tripwire for the outbound bili tool SURFACE. The two metadata-stamped
+ *  conditional tools (acp_retrieve / CCR, acp_read_original_image / image-rescale)
+ *  are the only ACP entries whose membership rides mutable per-request session
+ *  state; observed at egress (prepare), not at the handle stamp, so a mid-request
+ *  metadata reset still shows up as a flip here. Pure observation — never alters
+ *  egress; warns once per change with what was added/removed. */
+export function noteBiliToolSurface(session: Session, surface: { ccr: boolean; imageRescale: boolean }, opts: ReconcileOptions = {}): void {
+    if (!session.metadata) return;
+    const tags = [surface.ccr ? "ccr" : null, surface.imageRescale ? "imageRescale" : null].filter((t): t is string => t !== null).sort();
+    const fp = tags.length === 0 ? "-" : tags.join(",");
+    const prev = session.metadata[METADATA_TOOLSET_FP] as { fp: string; tags: string[] } | undefined;
+    if (prev !== undefined && prev.fp !== fp) {
+        if (opts.log !== undefined) {
+            const added = tags.filter((t) => !prev.tags.includes(t));
+            const removed = prev.tags.filter((t) => !tags.includes(t));
+            opts.log("warn", `${opts.sessionId === undefined ? "" : `[${opts.sessionId}] `}[tool-set] outbound bili tool surface changed (+${added.join(",") || "-"} / -${removed.join(",") || "-"}) between consecutive requests — tool definitions precede system+messages, so this invalidates the whole prefix cache (#4789)`);
+        }
+    }
+    session.metadata[METADATA_TOOLSET_FP] = { fp, tags };
 }
