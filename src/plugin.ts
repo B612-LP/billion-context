@@ -310,7 +310,7 @@ const STALE_BINDING_PROCESS_START_MS = Date.now();
 const warnedStaleBindings = new Set<string>();
 const WARNED_STALE_BINDINGS_CAP = 4096;
 
-export type StaleBindingDiagnosis = {
+type StaleBindingDiagnosis = {
     /** The conversation id the caller sent (the suspected stale binding). */
     boundConversationId: string;
     /** The session whose runtime traffic evidence says it is the live one. */
