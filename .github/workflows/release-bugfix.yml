@@ -113,7 +113,7 @@ jobs:
       - name: Validate trigger + resolve the path (publish | cut | noop)
         id: resolve
         run: |
-          PATH=noop
+          PMODE=noop
           BRANCH=""
           SHA=""
           VER=""
@@ -140,7 +140,7 @@ jobs:
               echo "::error::fork PRs cannot use the carve-out channel (repo secrets are unavailable for them)"
               exit 1
             fi
-            PATH=publish
+            PMODE=publish
             BRANCH="$HEADREF"
             SHA="$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")"
             HEADSHA="$SHA"
@@ -167,7 +167,7 @@ jobs:
                 echo "::error::fork PRs cannot use the gate-branch publish channel (repo secrets are unavailable for them)"
                 exit 1
               fi
-              PATH=publish
+              PMODE=publish
               BRANCH="$HEADREF"
               SHA="$(jq -r '.pull_request.merge_commit_sha' "$GITHUB_EVENT_PATH")"
               HEADSHA="$(jq -r '.pull_request.head.sha' "$GITHUB_EVENT_PATH")"
@@ -186,7 +186,7 @@ jobs:
                     echo "::error::alignment title does not follow the contract 'align master with vX.Y.Z (...)' (parsed version '$VER') — auto-cut refused"
                     exit 1
                   fi
-                  PATH=cut
+                  PMODE=cut
                   echo "::notice::alignment PR '$TITLE' merged — auto-cutting lane bugfix-v$VER from tag v$VER"
                   ;;
                 *)
@@ -200,13 +200,13 @@ jobs:
             fi
           else
             # workflow_dispatch: EMERGENCY fast publish of the selected ref
-            PATH=publish
+            PMODE=publish
             BRANCH="$GITHUB_REF_NAME"
             SHA=""
           fi
-          [ "$PATH" = "noop" ] && { echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0; }
+          [ "$PMODE" = "noop" ] && { echo "proceed=false" >> "$GITHUB_OUTPUT"; exit 0; }
           echo "proceed=true" >> "$GITHUB_OUTPUT"
-          echo "path=$PATH" >> "$GITHUB_OUTPUT"
+          echo "path=$PMODE" >> "$GITHUB_OUTPUT"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
           echo "headsha=$HEADSHA" >> "$GITHUB_OUTPUT"
