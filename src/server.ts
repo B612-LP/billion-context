@@ -1589,6 +1589,15 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
                         deadStreak.delete(pid);
                         log("info", `[watchdog] pid ${pid} alive again after failed kill-0 probe(s) — clearing death streak (#3890)`);
                     }
+                } else if (decision.heartbeatVeto) {
+                    // #4125: fresh beat vs failed existence probe — announce the
+                    // disagreement once per episode so the field can attribute
+                    // what the probe actually failed with (same errno clue as
+                    // the #3890 line below).
+                    if ((deadStreak.get(pid) ?? 0) === 0) {
+                        log("info", `[watchdog] kill-0 probe failed for pid ${pid} (code=${probe.errCode ?? "?"}) but its heartbeat beat recently — trusting the identity-anchored heartbeat, failure not counted (#4125/#3890)`);
+                    }
+                    deadStreak.delete(pid);
                 } else {
                     if (decision.streak === 1) {
                         // Field instrumentation (#3890): Windows collapses every
@@ -1933,16 +1942,28 @@ interface WatcherTickDecision {
     staleHeartbeat: boolean;
     /** Failed-probe streak after this tick (0 when alive or removed). */
     streak: number;
+    /** #4125: the probe failed but a FRESH heartbeat vouched for the pid — the failure was neither counted nor removing. */
+    heartbeatVeto?: boolean;
 }
 
 /** #3890: pure per-pid death-streak step. A live probe resets the streak; a
  *  failed probe increments it and only removes the pid once the streak reaches
  *  confirmTicks. Heartbeat expiry stays immediate (it is a time-based liveness
- *  proof, not an existence probe — #3544 semantics). */
+ *  proof, not an existence probe — #3544 semantics). #4125: a FAILED probe on
+ *  a heartbeat-opted owner does NOT count while its last beat is still fresh —
+ *  the beat is identity-anchored (only the true owner posts its own pid over
+ *  loopback), kill-0 is an identity-blind existence check, and disagreement
+ *  resolves in favor of the stronger proof. Field case: three consecutive
+ *  transient OpenProcess failures against a LIVE host burned the whole confirm
+ *  window and force-exited a healthy proxy mid-session; the same host pid then
+ *  re-armed fine on the replacement proxy, proving it never died. */
 export function tickWatchedPid(probe: PidProbe, lastSeen: number | undefined, nowMs: number, prevStreak: number | undefined, opts: { heartbeatGraceMs: number; confirmTicks: number }): WatcherTickDecision {
     if (probe.alive) {
         const staleHeartbeat = watcherIsDead(true, lastSeen, nowMs, opts.heartbeatGraceMs);
         return { removed: staleHeartbeat, staleHeartbeat, streak: 0 };
+    }
+    if (lastSeen !== undefined && nowMs - lastSeen <= opts.heartbeatGraceMs) {
+        return { removed: false, staleHeartbeat: false, streak: 0, heartbeatVeto: true };
     }
     const streak = (prevStreak ?? 0) + 1;
     return streak >= opts.confirmTicks ? { removed: true, staleHeartbeat: false, streak: 0 } : { removed: false, staleHeartbeat: false, streak };
