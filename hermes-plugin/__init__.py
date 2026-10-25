@@ -3,12 +3,18 @@
 Installed by ``bili plugin install hermes`` — a plain ``hermes`` session then becomes a full
 billion-context client with no launcher, no env vars and no fixed port:
 
+* registers the always-on surfaces immediately (llm_request middleware, pre_api_request hook,
+  /acp + /acp-cache, an unload hook) so register() returns fast; the slow attach-or-spawn + tool
+  registration runs on a background thread under one monotonic deadline (#4641 — the host discards
+  the whole plugin if register() exceeds its fixed load budget);
 * spawns its own bili proxy on an ephemeral port (or attaches to a healthy one) and routes
   model traffic through it via ``HTTPS_PROXY`` + ``SSL_CERT_FILE`` (combined CA bundle) —
   the same wire path the ``bili hermes`` launcher uses (CONNECT + certificate MITM);
-* registers the proxy's ACP tools (compress / decompress / acp_status) as native Hermes tools;
-* stamps plugin-mode headers on every LLM request once the tools are ready — round 1 rides
-  wire mode so strict backends see a clean head;
+* registers the proxy's ACP tools (compress / decompress / acp_status) as native Hermes tools once
+  the background boot lands;
+* stamps plugin-mode headers on every LLM request once the tools are ready — the first request
+  blocks a bounded window for the boot, then rides wire mode only if it has not landed, so strict
+  backends still see a clean head;
 * reports runtime info (model + max output tokens) to the proxy via bootstrap POSTs.
 
 Fail-open everywhere: if anything here fails, hermes simply talks to the upstream directly.
@@ -52,7 +58,13 @@ TOOL_TIMEOUT_S = 60.0
 RUNTIME_INFO_TIMEOUT_S = 5.0
 STATUS_TIMEOUT_S = 5.0
 HEALTH_PROBE_TIMEOUT_S = 2.0
-SPAWN_WAIT_S = 10.0
+# #4641 — the host gives each plugin a FIXED load budget (plugins.load_timeout_seconds, default
+# 10s) around import+register; exceed it and the host discards the ENTIRE plugin (every
+# registration disposed, later register_tool a no-op). So register() must return well inside it
+# regardless of how slow the proxy takes to come up: the slow path moves to a background thread.
+REGISTER_WAIT_S = 4.0             # bounded wait inside register(); warm attach-hit finishes in it
+BOOTSTRAP_BUDGET_S = 90.0         # single monotonic deadline spanning the whole background boot
+FIRST_REQUEST_WAIT_S = BOOTSTRAP_BUDGET_S + 15.0  # first llm_request may block this long for readiness
 SPAWN_POLL_S = 0.1
 STARTING_MARKER_TTL_S = 90.0
 MAX_TRACKED_SESSIONS = 256
@@ -72,7 +84,10 @@ _PROXY_ENV_KEYS = ("HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "AL
 # mode values: "attach" | "spawn"; child: Popen of the spawned proxy;
 # max_output: OrderedDict[session_id -> int(max_tokens)]; runtime_info_sent: (model, max_output) pairs;
 # refused: origins refused by the #1338 attach gate (log dedup per process);
-# instance_id: the registry id discover_instance picked (None until an attach is chosen).
+# instance_id: the registry id discover_instance picked (None until an attach is chosen);
+# epoch (#4641): current bootstrap generation {gen, stop: Event, ready: Event, outcome} — stop is
+#   set on unload/re-register so an in-flight boot aborts; ready is set on EVERY terminal outcome
+#   (ok/failed/stopped) so the first request's bounded wait wakes the moment the boot settles.
 _state: Dict[str, Any] = {
     "origin": None,
     "mode": None,
@@ -83,6 +98,7 @@ _state: Dict[str, Any] = {
     "runtime_info_sent": set(),
     "refused": set(),
     "instance_id": None,
+    "epoch": None,
 }
 
 
@@ -96,6 +112,7 @@ def _reset_for_test() -> None:
     _state["runtime_info_sent"].clear()
     _state["refused"].clear()
     _state["instance_id"] = None
+    _state["epoch"] = None
 
 
 # — paths ---------------------------------------------------------------------
@@ -948,15 +965,19 @@ def _attach(origin: str) -> str:
     return origin
 
 
-def ensure_origin(sidecar: Dict[str, str]) -> Optional[str]:
-    """Return a healthy proxy origin. Attach when possible (explicit target, then any recorded
-    instance); otherwise spawn our own behind the starting-marker arbiter."""
+def ensure_origin(sidecar: Dict[str, str], deadline: float, epoch: Dict[str, Any]) -> Optional[str]:
+    """Return a healthy proxy origin before ``deadline`` (#4641: ONE monotonic bound for the whole
+    boot, replacing the old per-stage waits that summed in the worst case). Attach when possible
+    (explicit target, then any recorded instance); otherwise spawn our own behind the
+    starting-marker arbiter. Returns None on stop / timeout / failure."""
     attach = (os.environ.get(ATTACH_ENV) or "").strip().rstrip("/")
     if attach:
         if probe_proxy(attach):
             return _attach(attach)
         logger.warning("billion-context: %s %s is not healthy — falling back to local bootstrap", ATTACH_ENV, attach)
 
+    if epoch["stop"].is_set() or time.monotonic() >= deadline:
+        return None
     found = discover_instance(sidecar["script"])
     if found:
         return _attach(found)
@@ -967,8 +988,7 @@ def ensure_origin(sidecar: Dict[str, str]) -> Optional[str]:
     token = uuid.uuid4().hex
     claimed = claim_starting_marker(token, port)
     if not claimed:
-        deadline = time.monotonic() + SPAWN_WAIT_S
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and not epoch["stop"].is_set():
             found = discover_instance(sidecar["script"])
             if found:
                 return _attach(found)
@@ -979,13 +999,14 @@ def ensure_origin(sidecar: Dict[str, str]) -> Optional[str]:
         if not claim_starting_marker(token, port):
             return None
         claimed = True
+    if epoch["stop"].is_set() or time.monotonic() >= deadline:
+        return None
     try:
         child = _spawn_child(sidecar, port, token)
         if child is None:
             return None
         _state["child"] = child
-        deadline = time.monotonic() + SPAWN_WAIT_S
-        while time.monotonic() < deadline:
+        while time.monotonic() < deadline and not epoch["stop"].is_set():
             inst = read_instance_file()
             if inst and inst.get("launch_token") == token and probe_proxy(inst["origin"]):
                 _state.update(origin=inst["origin"], mode="spawn")
@@ -996,7 +1017,7 @@ def ensure_origin(sidecar: Dict[str, str]) -> Optional[str]:
                                os.path.join(tempfile.gettempdir(), f"bili-proxy-{port}.log"))
                 return None
             time.sleep(SPAWN_POLL_S)
-        logger.warning("billion-context: proxy did not become healthy within %ss", SPAWN_WAIT_S)
+        logger.warning("billion-context: proxy did not become healthy within the bootstrap budget")
         try:
             child.terminate()
         except Exception:
@@ -1070,10 +1091,16 @@ def _stampable_header_value(value: Any) -> Optional[str]:
 
 def on_llm_request(request: Optional[Dict[str, Any]] = None, **context: Any) -> Optional[Dict[str, Any]]:
     """llm_request middleware: stamp plugin-mode headers once the native tools are registered.
-    Round 1 (before tools are ready) deliberately returns None — it rides wire mode."""
+    Before the background boot settles, the request blocks a bounded window for it (#4641) so a fast
+    boot still compresses round 1; if the boot has not landed by then the request rides wire mode
+    deliberately. Once settled the check is free — ready is already set, so the wait is a no-op."""
     try:
-        if not _state.get("tools_ready") or request is None or not isinstance(request, dict):
+        if request is None or not isinstance(request, dict):
             return None
+        if not _state.get("tools_ready"):
+            _wait_for_bootstrap(FIRST_REQUEST_WAIT_S)
+            if not _state.get("tools_ready"):
+                return None
         origin = _state.get("origin")
         session_id = context.get("session_id")
         if not origin or not session_id:
@@ -1252,9 +1279,103 @@ def acp_cache_command(raw_args: str = "", *, session_id: str = "") -> Optional[s
         return f"bili: /acp-cache failed ({type(exc).__name__}: {exc})"
 
 
+# — bootstrap coordination (#4641) -----------------------------------------------
+# The host hands each plugin a FIXED load budget (plugins.load_timeout_seconds, default 10s) around
+# import+register; blow past it and the host discards the WHOLE plugin (every registration disposed,
+# later register_tool a no-op) — which is exactly why a slow cold-start used to drop /acp and every
+# tool. So register() only does the cheap registrations and returns fast; the slow path (attach-or-
+# spawn + manifest + tool registration) runs on a daemon thread under ONE monotonic deadline. Each
+# register()/re-enable mints a fresh epoch: its stop Event aborts an in-flight boot (unload or a
+# newer generation), and its ready Event is set on EVERY terminal outcome so a caller's bounded wait
+# wakes the moment the boot settles.
+
+def _new_epoch() -> Dict[str, Any]:
+    gen = int(_state.get("_epoch_gen", 0)) + 1
+    _state["_epoch_gen"] = gen
+    epoch = {"gen": gen, "stop": threading.Event(), "ready": threading.Event(), "outcome": None}
+    _state["epoch"] = epoch
+    return epoch
+
+
+def _on_unload() -> None:
+    """Host unload hook: abort any in-flight bootstrap and drop this process's routing state so a
+    later re-enable boots fresh. os.environ is deliberately left alone — reverting launcher-set proxy
+    vars here could cut off a still-live shared proxy's routing."""
+    try:
+        epoch = _state.get("epoch")
+        if isinstance(epoch, dict):
+            epoch["stop"].set()
+        _state["tools_ready"] = False
+        _state["origin"] = None
+        _state["env_applied"] = False
+    except Exception:
+        pass
+
+
+def _wait_for_bootstrap(timeout: float) -> None:
+    """Block up to ``timeout`` for the CURRENT epoch's boot to settle. A no-op once settled (ready
+    already set) or when no bootstrap ever started — only a still-running boot actually blocks."""
+    epoch = _state.get("epoch")
+    if isinstance(epoch, dict) and not epoch["ready"].is_set():
+        epoch["ready"].wait(timeout)
+
+
+def _bootstrap(epoch: Dict[str, Any], sidecar: Dict[str, str], ctx: Any) -> None:
+    """Background boot: attach-or-spawn under ONE monotonic deadline, then apply env + fetch the
+    manifest + register the tools. Every side-effecting step re-checks the epoch so an unload (or a
+    newer generation) aborts before a late env write or tool registration lands on a dead plugin."""
+    outcome = "failed"
+    try:
+        deadline = time.monotonic() + BOOTSTRAP_BUDGET_S
+        origin = ensure_origin(sidecar, deadline, epoch)
+        if not origin:
+            logger.warning("billion-context: could not reach or start a bili proxy — staying inert "
+                           "(hermes talks to the upstream directly)")
+            return
+        if epoch["stop"].is_set():
+            outcome = "stopped"
+            return
+        apply_env(origin)
+        manifest = http_get_json(origin.rstrip("/") + "/__bili/plugin/manifest", MANIFEST_TIMEOUT_S)
+        tools = manifest.get("tools", {}).get("anthropic") if isinstance(manifest, dict) else None
+        if not isinstance(tools, list) or not tools:
+            logger.warning("billion-context: proxy manifest had no tool definitions — staying inert")
+            return
+        if epoch["stop"].is_set():
+            outcome = "stopped"
+            return
+        names: List[str] = []
+        for tool in tools:
+            if not isinstance(tool, dict) or not tool.get("name"):
+                continue
+            name = str(tool["name"])
+            ctx.register_tool(
+                name=name,
+                toolset=PLUGIN_ID,
+                schema=tool.get("input_schema") or {},
+                handler=make_tool_handler(name),
+                description=str(tool.get("description") or ""),
+            )
+            names.append(name)
+        _state["tools_ready"] = True
+        outcome = "ok"
+        logger.info("billion-context: hermes native mode active (%s, tools: %s)",
+                    _state.get("mode"), ", ".join(names))
+    except Exception as exc:
+        logger.warning("billion-context: background bootstrap failed (%s) — staying inert", exc)
+    finally:
+        epoch["outcome"] = outcome
+        epoch["ready"].set()
+
+
 # — entry point -----------------------------------------------------------------
 
 def register(ctx: Any) -> None:
+    """Cheap, FAST registration (#4641): wire the always-on surfaces (llm_request middleware,
+    pre_api_request hook, /acp + /acp-cache, unload hook), kick off the slow attach/spawn + tool
+    registration on a daemon thread, and return well inside the host's load budget. A warm attach-hit
+    finishes inside the bounded wait; a slow cold boot hands off to the thread so the host never times
+    us out and discards the whole plugin."""
     try:
         if gated_off(os.environ):
             return
@@ -1265,33 +1386,10 @@ def register(ctx: Any) -> None:
             logger.warning("billion-context: no usable bili.json sidecar next to the hermes plugin "
                            "(run `bili plugin install hermes`) — staying inert")
             return
-        origin = ensure_origin(sidecar)
-        if not origin:
-            logger.warning("billion-context: could not reach or start a bili proxy — staying inert "
-                           "(hermes talks to the upstream directly)")
-            return
-        apply_env(origin)
-        manifest = http_get_json(origin.rstrip("/") + "/__bili/plugin/manifest", MANIFEST_TIMEOUT_S)
-        tools = manifest.get("tools", {}).get("anthropic") if isinstance(manifest, dict) else None
-        if not isinstance(tools, list) or not tools:
-            logger.warning("billion-context: proxy manifest had no tool definitions — staying inert")
-            return
-        names: List[str] = []
-        for tool in tools:
-            if not isinstance(tool, dict) or not tool.get("name"):
-                continue
-            ctx.register_tool(
-                name=str(tool["name"]),
-                toolset=PLUGIN_ID,
-                schema=tool.get("input_schema") or {},
-                handler=make_tool_handler(str(tool["name"])),
-                description=str(tool.get("description") or ""),
-            )
-            names.append(str(tool["name"]))
         ctx.register_middleware("llm_request", on_llm_request)
         ctx.register_hook("pre_api_request", on_pre_api_request)
-        # In-session slash commands; hosts without PluginContext.register_command
-        # (older builds) skip them — tools keep working, only the command entries are absent.
+        # In-session slash commands; hosts without PluginContext.register_command (older builds)
+        # skip them — tools keep working, only the command entries are absent.
         if hasattr(ctx, "register_command"):
             ctx.register_command(
                 "acp", acp_command,
@@ -1301,8 +1399,20 @@ def register(ctx: Any) -> None:
                 "acp-cache", acp_cache_command,
                 description="Prompt-cache reconciliation (same report as the acp_cache tool)",
             )
-        _state["tools_ready"] = True
-        logger.info("billion-context: hermes native mode active (%s, tools: %s)",
-                    _state.get("mode"), ", ".join(names))
+        # Best-effort: a host without an unload hook (or that rejects the name) simply skips it —
+        # re-enable still works regardless, because every register() mints a fresh bootstrap generation.
+        try:
+            ctx.register_hook("unload", _on_unload)
+        except Exception:
+            pass
+        epoch = _state.get("epoch")
+        if epoch is None or epoch["ready"].is_set():
+            epoch = _new_epoch()
+            threading.Thread(target=_bootstrap, args=(epoch, sidecar, ctx),
+                             name="bili-hermes-bootstrap", daemon=True).start()
+        # Bounded wait: the warm attach-hit lands inside it; a slow cold boot simply hands off.
+        epoch["ready"].wait(REGISTER_WAIT_S)
+        logger.info("billion-context: hermes %s",
+                    "native mode active" if _state.get("tools_ready") else "booting in background")
     except Exception as exc:
         logger.warning("billion-context: plugin registration failed (%s) — staying inert", exc)

@@ -257,8 +257,38 @@ def parse(text):
 YAML_STUB_SRC = "def safe_load(text):\n    from _bcminiyaml import parse\n    return parse(text)\n"
 RUAMEL_INIT_SRC = ""
 RUAMEL_YAML_SRC = ("class YAML:\n    def __init__(self, typ=None):\n        pass\n"
-                   "    def load(self, text):\n        from _bcminiyaml import parse\n"
-                   "        return parse(text)\n")
+                    "    def load(self, text):\n        from _bcminiyaml import parse\n"
+                    "        return parse(text)\n")
+# #4641 slow-boot fixture: a proxy that takes BC_SLOW_BOOT_MS to come up (simulating a cold boot,
+# e.g. a huge index.db), then serves the plugin manifest + writes the instance record the spawn
+# poll matches on, and self-exits after a bounded lifetime so the spawned child never leaks.
+SLOW_PROXY_JS = r"""
+const fs = require("fs");
+const path = require("path");
+const http = require("http");
+const args = process.argv.slice(2);
+const port = parseInt(args[args.indexOf("--port") + 1], 10);
+const delayMs = parseInt(process.env.BC_SLOW_BOOT_MS || "0", 10);
+function serve() {
+  const srv = http.createServer((req, res) => {
+    if (req.url === "/__bili/plugin/manifest") {
+      res.writeHead(200, {"Content-Type": "application/json"});
+      res.end(JSON.stringify({ version: "slow-boot-1", tools: { anthropic: [
+        { name: "compress", description: "compress a range", input_schema: { type: "object" } } ] }}));
+    } else { res.writeHead(404, {"Content-Type": "application/json"}); res.end("{}"); }
+  });
+  srv.listen(port, "127.0.0.1", () => {
+    const sd = path.join(process.env.XDG_STATE_HOME, "billion-context");
+    fs.mkdirSync(sd, { recursive: true });
+    fs.writeFileSync(path.join(sd, "proxy-origin"), JSON.stringify({
+      origin: "http://127.0.0.1:" + port, pid: process.pid, instanceId: "slow-1",
+      codeFingerprint: "", host: "127.0.0.1", passthrough: false, mitmDomains: [], modelWindows: {},
+      startedAt: Date.now(), lane: "hermes", launchToken: process.env.BILI_LAUNCH_TOKEN }));
+  });
+  setTimeout(() => process.exit(0), 15000);
+}
+if (delayMs > 0) { setTimeout(serve, delayMs); } else { serve(); }
+"""
 WARNINGS = []
 
 
@@ -651,6 +681,48 @@ elif SCENARIO.startswith("mitm-"):
     out["mitm_kind"] = kind
     out["mitm_domains"] = mod.mitm_domains_from_config()
     out["mitm_warnings"] = list(WARNINGS)
+elif SCENARIO == "slow-boot":
+    # #4641 core regression: a cold boot SLOWER than register()'s bounded wait must not make
+    # register() block past the host's load budget; the plugin survives and tools land once the
+    # background boot settles. REGISTER_WAIT_S is shrunk so the test stays snappy.
+    import time as _t
+    script = os.path.join(BASE, "slow-proxy.cjs")
+    with open(script, "w") as f:
+        f.write(SLOW_PROXY_JS)
+    with open(os.path.join(PLUGIN_DIR, "bili.json"), "w") as f:
+        json.dump({"proxyScript": script, "nodePath": os.environ["BC_NODE"]}, f)
+    mod.REGISTER_WAIT_S = 1.5
+    t0 = _t.monotonic()
+    mod.register(ctx)
+    out["register_elapsed_s"] = round(_t.monotonic() - t0, 3)
+    out["tools_at_register_return"] = sorted(ctx.tools.keys())
+    deadline = _t.monotonic() + 12.0
+    while _t.monotonic() < deadline and not ctx.tools:
+        _t.sleep(0.1)
+    out["tools_after_boot"] = sorted(ctx.tools.keys())
+elif SCENARIO == "re-enable":
+    # #4641: after a host unload, re-enabling must mint a fresh bootstrap generation and bring the
+    # tools back. Negative control: without the generation reset the stale stop signal kills it.
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
+    os.makedirs(ca_dir, exist_ok=True)
+    with open(os.path.join(ca_dir, "root-ca.pem"), "w") as f:
+        f.write("dummy-ca\n")
+    with open(os.path.join(ca_dir, "combined-ca.pem"), "w") as f:
+        f.write("dummy-combined-ca\n")
+    mod.register(ctx)
+    out["first_tools"] = sorted(ctx.tools.keys())
+    out["first_tools_ready"] = bool(mod._state.get("tools_ready"))
+    unload = ctx.hooks.get("unload")
+    out["has_unload_hook"] = unload is not None
+    if unload:
+        unload()
+    out["post_unload_tools_ready"] = bool(mod._state.get("tools_ready"))
+    out["post_unload_origin"] = mod._state.get("origin")
+    mod.register(ctx)
+    out["second_tools"] = sorted(ctx.tools.keys())
+    out["second_tools_ready"] = bool(mod._state.get("tools_ready"))
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -718,6 +790,17 @@ interface DriverOut {
     cmd_acp?: string | null;
     cmd_acp_cache?: string | null;
     command_results?: Array<{ session: string; panel: string; cache: string }>;
+    // #4641 slow-boot / re-enable scenarios
+    register_elapsed_s?: number;
+    tools_at_register_return?: string[];
+    tools_after_boot?: string[];
+    first_tools?: string[];
+    first_tools_ready?: boolean;
+    has_unload_hook?: boolean;
+    post_unload_tools_ready?: boolean;
+    post_unload_origin?: string | null;
+    second_tools?: string[];
+    second_tools_ready?: boolean;
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -749,7 +832,8 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"]);
         assert.deepEqual(out!.toolsets, ["billion-context"]);
         assert.deepEqual(out!.middlewares, ["llm_request"]);
-        assert.deepEqual(out!.hooks, ["pre_api_request"]);
+        // #4641: an unload hook is now registered up front so a host unload aborts the background boot
+        assert.deepEqual(out!.hooks, ["pre_api_request", "unload"]);
         assert.deepEqual(out!.commands, {
             acp: "Show bili context-compression status for this session",
             "acp-cache": "Prompt-cache reconciliation (same report as the acp_cache tool)",
@@ -1054,6 +1138,44 @@ describe("python plugin runtime (subprocess)", () => {
         assert.deepEqual(out!.tools_registered, []);
         assert.equal(out!.env_https_proxy, null);
         assert.equal(out!.marker_left, false);
+    });
+
+    test("slow cold boot: register() returns within the host budget; tools land once the background boot settles (#4641)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        // BC_SLOW_BOOT_MS=4000 makes the proxy come up ~4s after spawn — SLOWER than register()'s
+        // bounded wait (shrunk to 1.5s in the driver). Pre-fix, register() blocked on this and blew
+        // past the host's 10s load budget, so the host discarded the whole plugin. Post-fix it must
+        // return fast and let the background thread finish the job.
+        const { out, err } = runDriver("slow-boot", { BC_SLOW_BOOT_MS: "4000" });
+        assert.ok(out, err);
+        assert.ok(out!.register_elapsed_s! < 8,
+            `register() took ${out!.register_elapsed_s}s — must stay under the host's 10s load budget`);
+        assert.ok(out!.register_elapsed_s! < 4.0,
+            `register() blocked ${out!.register_elapsed_s}s — should have handed off to the background boot`);
+        // the plugin survived the budget: tools arrive once the background boot finishes
+        assert.deepEqual(out!.tools_after_boot, ["compress"]);
+        assert.ok(out!.env_https_proxy, "routing env should be applied once the background boot lands");
+    });
+
+    test("re-enable after unload boots a fresh generation and restores the tools (#4641)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("re-enable");
+        assert.ok(out, err);
+        assert.equal(out!.has_unload_hook, true);
+        assert.deepEqual(out!.first_tools, ["acp_status", "compress", "decompress"]);
+        assert.equal(out!.first_tools_ready, true);
+        // teardown dropped this process's routing state
+        assert.equal(out!.post_unload_tools_ready, false);
+        assert.equal(out!.post_unload_origin, null);
+        // re-enable mints a fresh generation -> boots again -> tools restored
+        assert.deepEqual(out!.second_tools, ["acp_status", "compress", "decompress"]);
+        assert.equal(out!.second_tools_ready, true);
     });
 });
 
