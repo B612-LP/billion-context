@@ -17,7 +17,7 @@ import { applyAbsorbView } from "./absorb.js";
 import { adoptContentStore, ccrLoopConfig, contentStoreOf } from "./store.js";
 import { applyRanges, normalizeRangeOrder, type RewriteCtx } from "./stream.js";
 import { fetchWithTimeout, isTransientUpstreamError, replayMaxAttempts, replayBackoffMs, sleep, UpstreamHttpError } from "./fetch-util.js";
-import { noteUpstreamThrottle429, noteUpstreamThrottleResolved } from "./upstream-throttle.js";
+import { noteUpstreamThrottleResolved } from "./upstream-throttle.js";
 import { dumpSummaryRejection } from "./error-dump.js";
 import { proxyDispatcher } from "./upstream-proxy.js";
 import { isTlsTrustCode, tlsTrustRemediation, TLS_TRUST_CODES } from "./upstream-fail.js";
@@ -1324,9 +1324,8 @@ async function requestSummaryBody(deps: PreflightDeps, body: string, stream: boo
             stage = "response body";
             const text = await result.response.text();
             deps.signal?.throwIfAborted();
-            // #4743: the preflight refold feeds the 429 governor — a rate-limit 429 arms the hold (honouring Retry-After), any other settled response clears it.
-            if (result.response.status === 429) noteUpstreamThrottle429(deps.url, outHeaders, result.response.headers.get("retry-after"));
-            else noteUpstreamThrottleResolved(deps.url, outHeaders, result.response.status);
+            // #4743 review fix (#4772): a settled non-429 summary response proves the endpoint processed again — clear any hold. A 429 must NOT arm here: this request's own forward runs AFTER preflight and passes the relay gate, so arming now would block our own forward of a fitting payload (#301 contract: fits + preflight 429 → still forward). The arm lives at the caller's withhold verdict (server.ts) instead.
+            if (result.response.status !== 429) noteUpstreamThrottleResolved(deps.url, outHeaders, result.response.status);
             if (!result.response.ok) throw new UpstreamHttpError(result.response.status, text, attempt);
             return text;
         } catch (err) {

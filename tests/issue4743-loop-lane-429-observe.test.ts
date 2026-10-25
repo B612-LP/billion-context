@@ -6,6 +6,11 @@
 // reasoning-guard continuation rounds. Each of those sites now reports its verdict
 // so a 429-storming upstream arms the egress hold for the NEXT client turn.
 //
+// #4772 review fix: the preflight site reports RESOLVED per response but arms ONLY
+// at the caller's withhold verdict (server.ts) — arming per-response there would
+// block the same request's own forward of a fitting payload (#301). The e2e pin for
+// the withhold-time arm lives in tests/preflight-fail-fast.test.ts.
+//
 // Unlike PR #4725's governor-contract pin (which passes on master too), these are
 // WIRING pins: they drive the real code path against a 429 upstream and assert the
 // governor armed — so they FAIL on master and pass only once the site observes.
@@ -20,7 +25,7 @@ import { runReasoningGuard, type SseSink } from "../src/reasoning-guard.ts";
 import { preflightCompress, type PreflightDeps } from "../src/preflight.ts";
 import { getSession } from "../src/session.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { upstreamThrottleLocalReject, _resetUpstreamThrottleForTest } from "../src/upstream-throttle.ts";
+import { noteUpstreamThrottle429, upstreamThrottleLocalReject, _resetUpstreamThrottleForTest } from "../src/upstream-throttle.ts";
 
 process.env.NODE_ENV = "test";
 process.env.BILI_REPLAY_RETRY_MAX = "3";
@@ -189,7 +194,7 @@ function preflightFixture(url: string) {
     return { deps, messages };
 }
 
-test("preflight refold feeds the 429 governor (#4743)", async () => {
+test("preflight refold clears the 429 hold without self-arming (#4743/#4772)", async () => {
     let mode: "429" | "200" = "429";
     const server = http.createServer((req, res) => {
         req.resume();
@@ -211,13 +216,20 @@ test("preflight refold feeds the 429 governor (#4743)", async () => {
     const url = `http://127.0.0.1:${addr.port}/responses`;
     const headers: Record<string, string> = {};
     try {
-        // Arm: the preflight summary call 429s (each retry attempt reports the verdict).
+        // Anti-self-block (#4772 review): a 429'd summary probe must NOT arm the hold —
+        // this request's own forward runs AFTER preflight and passes the relay gate, so
+        // arming here would block our own forward of a fitting payload (#301 contract).
+        // The arm lives at the caller's withhold verdict (server.ts; e2e pin in
+        // tests/preflight-fail-fast.test.ts). This phase FAILS on the per-response-arm
+        // tree and passes only with the verdict-time arm.
         mode = "429";
-        const armed = preflightFixture(url);
-        await preflightCompress(armed.deps, armed.messages);
-        assert.ok(upstreamThrottleLocalReject(url, headers), "governor armed after a 429 summary");
+        const probed = preflightFixture(url);
+        await preflightCompress(probed.deps, probed.messages);
+        assert.equal(upstreamThrottleLocalReject(url, headers), undefined, "a 429'd summary probe alone does not arm the hold (no self-block)");
 
-        // Clear: a successful summary lifts the hold (same origin + credential key).
+        // Clear: a settled non-429 summary response lifts an existing hold (same origin key).
+        noteUpstreamThrottle429(url, headers, null);
+        assert.ok(upstreamThrottleLocalReject(url, headers), "setup: hold armed");
         mode = "200";
         const cleared = preflightFixture(url);
         await preflightCompress(cleared.deps, cleared.messages);
