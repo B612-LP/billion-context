@@ -140,6 +140,11 @@ function storageLogTail(lines: string[]): string[] {
 // #4649: the codex lane's equivalent chain — whether a compaction was
 // intercepted (and forged locally) or passed through unrecognized; without
 // these a codex conflict report carries no log evidence at all (#4648).
+// #4688: the client-agnostic tail of the chain — the #2695 zombie reap verdict
+// (the line a pure orphan-reap ledger lives on; without it such reports ship
+// an empty evidence section even with the reap in the log pair) and the
+// OpenAI-lane codex local auto-compaction detection (#2372/#4521) that lands
+// beside it once PR #4542 ships.
 const CONFLICT_LOG_PATTERNS = [
     "takeover gate refused",
     "dsh native compaction call identified",
@@ -149,6 +154,8 @@ const CONFLICT_LOG_PATTERNS = [
     "codex compaction_trigger request not intercepted",
     "codex compact intercepted",
     "codex compact forge failed",
+    "zombie fold reap",
+    "codex local auto-compaction detected",
 ];
 
 function conflictLogTail(lines: string[]): string[] {
