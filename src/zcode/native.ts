@@ -450,7 +450,7 @@ interface BootstrapZcodeOptions {
  *  provider, #1660/#403), so cert-MITM is the only way to cover it. Detected
  *  here so a session going blind on it is loud instead of silent (#1896
  *  extended past the empty-store shape to the non-empty one). */
-export interface ZcodeBuiltinAccount {
+interface ZcodeBuiltinAccount {
     readonly baseUrl: string;
     readonly host: string;
 }
