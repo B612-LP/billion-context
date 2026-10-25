@@ -1094,7 +1094,7 @@ export async function buildSessionTree(id: string): Promise<{ blocks: WebSession
  *  behavior stands). For each id the NEWEST stored version wins (max seq):
  *  split tool-call cores share an id, and the freshest bytes are what the
  *  client last sent before dropping the message. */
-export type StorageLeaf = { role?: string; toolName?: string; preview?: string };
+type StorageLeaf = { role?: string; toolName?: string; preview?: string };
 
 /** #4738: newest stored version of an id (max seq) parsed back to a message —
  *  split tool-call cores share one msg_id across rows, and the freshest bytes
