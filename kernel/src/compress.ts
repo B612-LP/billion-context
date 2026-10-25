@@ -37,7 +37,11 @@ import {
   isMessageProtectedWithPairing,
 } from "./protected.js";
 import { isToolMessage } from "./message-kind.js";
-import { projectUnit, collectCoverage } from "./unit-projection.js";
+import {
+  projectUnit,
+  collectCoverage,
+  type UnitProjection,
+} from "./unit-projection.js";
 import { evaluateRefold, type RefoldDecision } from "./refold.js";
 import {
   computeProtectedRefs,
@@ -241,6 +245,42 @@ function coveringBlockIds(
     }
   }
   return [...found].sort((x, y) => numericBlockId(x) - numericBlockId(y));
+}
+
+// Active block(s) whose coverage intersects ANY message of the resolved span.
+// Unlike coveringBlockIds (boundaries only), this also names blocks that
+// straddle or sit inside the span — the set the apply-time livelock guard's
+// consumedBlockIds used to name, which src/dead-ranges.ts parses back out of
+// the verdict text for its structural-dead memory (#2638).
+function intersectingBlockIds(
+  state: CompressionState,
+  rawIds: readonly string[],
+): string[] {
+  const idSet = new Set(rawIds);
+  const found: string[] = [];
+  for (const candidate of activeBlocks(state)) {
+    if (candidate.effectiveMessageIds.some((id) => idSet.has(id))) {
+      found.push(candidate.blockId);
+    }
+  }
+  return found.sort((x, y) => numericBlockId(x) - numericBlockId(y));
+}
+
+/** #4240: the model-facing sentence for a range that RESOLVES but folds
+ *  NOTHING — every message in its span is already owned by active blocks (or
+ *  was carved out as protected / media / turn-integrity). Shared by the
+ *  whole-batch gate verdict and the per-range skip warning so both lanes say
+ *  exactly what the apply-time livelock guard used to throw. */
+function noNewRangeDetail(covering: string[]): string {
+  const coverText =
+    covering.length > 0
+      ? `every message in it is already covered by active block(s) ${covering.join(", ")}`
+      : `every message in it was excluded (protected zone, media, or turn-integrity carve)`;
+  const mergeHint =
+    covering.length > 0
+      ? ` To rewrite or merge those blocks, reference them by block ID (${covering[0]}..${covering[covering.length - 1]})`
+      : "";
+  return `contains no new compressible messages — ${coverText}.${mergeHint}; otherwise run acp_status and compress a range it reports as compressible.`;
 }
 
 // Block-ID-boundary advice is only actionable when tier distillation is ready;
@@ -479,12 +519,79 @@ export function createCore(ports: Ports = {}): CompressionCore {
       if (entry.end > acceptedMaxIndex) acceptedMaxIndex = entry.end;
     }
 
+    // #4240: ranges that RESOLVE but fold NOTHING — projectUnit's filtered set
+    // is empty because every message in the span is already owned by active
+    // blocks (or was carved out as protected / media / integrity). On full-log
+    // hosts those refs stay visible, so classification calls them "ok" and they
+    // sail through every gate (their text even counts toward minCompressRange);
+    // they only died at apply time, where the atomic batch contract (#3939)
+    // rejected the WHOLE batch — one stale range poisoned sibling ranges that
+    // would have landed ("Batch rejected before folding any range", the loop
+    // reported in #4240). A zero-new projection is an order-independent NO-OP:
+    // skipping it commits nothing, so it cannot break the partial-commit
+    // invariant atomicity protects. Screened with the SAME projection the apply
+    // lane throws by (#3236/#3371: one judgment, two consumers — recommend
+    // already demotes exactly these units); refoldable candidates are excluded,
+    // they land in place (#398).
+    const noNewSpecs = new Map<
+      (typeof input.ranges)[number],
+      { covering: string[]; reasons: string[] }
+    >();
+    for (const [spec, resolution] of classifications) {
+      if (resolution.status !== "ok" || skipSpecs.has(spec)) continue;
+      if (resolution.resolved.boundaryKind === "block") continue;
+      const decision = refoldDecisions.get(spec);
+      if (decision?.kind === "refold") continue;
+      let projection: UnitProjection | undefined;
+      try {
+        projection = projectUnit({
+          messages: input.messages,
+          state,
+          config: input.config,
+          startRef: spec.startRef,
+          endRef: spec.endRef,
+          preExistingCoverage,
+          protectedMessageIds,
+        });
+      } catch {
+        continue; // boundary re-resolution failed — classification owns the error
+      }
+      if (!projection || projection.fatal !== null) continue;
+      if (projection.filteredIds.length > 0) continue;
+      noNewSpecs.set(spec, {
+        covering: intersectingBlockIds(state, resolution.resolved.messageIds),
+        reasons: decision?.kind === "blocked" ? decision.reasons : [],
+      });
+    }
+    // Whole-batch verdict when every requested range resolves but folds
+    // nothing. Used by the size gate below AND by the post-loop safety net
+    // (minCompressRange === 0 disables the gate entirely, where an all-no-op
+    // batch must not return a silent zero-fold success — the fake-progress
+    // receipt the livelock guard exists to prevent, dog/billion-context-pi#199).
+    const noNewBatchError = (): string => {
+      const details = [...noNewSpecs.entries()]
+        .map(([spec, info]) => `Range ${spec.startRef}..${spec.endRef} ${noNewRangeDetail(info.covering)}`)
+        .join(" | ");
+      const reasons = [
+        ...new Set([...noNewSpecs.values()].flatMap((info) => info.reasons)),
+      ];
+      const refoldNote =
+        reasons.length > 0
+          ? ` Refold blocked: ${reasons.join("; ")}. Restore the affected block(s) inline (decompress with inline:true), then recompressing the same range updates them in place.`
+          : "";
+      return `Requested range(s) already compressed — ${details}${refoldNote} ${refGateDiagnostics(state, input.ranges.length, unknownCount)} Continue the task, or run acp_status and target one of the CURRENT compressible ranges it reports.${tierActionHint(input.config, state)}`;
+    };
+
     if (input.config.compress.minCompressRange > 0 && input.ranges.length > 0) {
       let totalRangeChars = 0;
       let hasBlockBoundaryRange = false;
       let countedRanges = 0;
       for (const [spec, resolution] of classifications) {
-        if (resolution.status !== "ok" || skipSpecs.has(spec)) continue;
+        if (
+          resolution.status !== "ok" ||
+          skipSpecs.has(spec) ||
+          noNewSpecs.has(spec)
+        ) continue;
         if (resolution.resolved.boundaryKind === "block") {
           hasBlockBoundaryRange = true;
           continue;
@@ -563,8 +670,10 @@ export function createCore(ports: Ports = {}): CompressionCore {
             : consumedRanges.length > 0
               ? danglingRefs.length > 0
                 ? `Requested range(s) cannot be anchored (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}): refs ${danglingRefs.join(", ")} are known to this session but no longer back any visible or folded message — the client rewrote or dropped those messages (an edit reissues a new ref; host-native compaction or a bulk history rewrite drops them outright), and no active block covers them. These refs are now recorded as DEAD: no range that includes them can compress now or later, whatever the neighbors. Do not retry this range in any form — run acp_status and target only the live refs it reports. ${diagnostics}`
-                : `Requested range(s) already compressed (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}) — ${coverDetail}${refoldDetail}. Nothing new to compress in that window. ${diagnostics} Continue the task, or run acp_status and target one of the CURRENT compressible ranges it reports.${tierActionHint(input.config, state)}`
-              : countedRanges > 0
+                 : `Requested range(s) already compressed (e.g. ${firstConsumed!.startRef}..${firstConsumed!.endRef}) — ${coverDetail}${refoldDetail}. Nothing new to compress in that window. ${diagnostics} Continue the task, or run acp_status and target one of the CURRENT compressible ranges it reports.${tierActionHint(input.config, state)}`
+               : countedRanges === 0 && noNewSpecs.size > 0
+                 ? noNewBatchError()
+                 : countedRanges > 0
                 ? `Total compressible content too small (${totalRangeChars} chars across ${countedRanges} range(s), min ${input.config.compress.minCompressRange}). Combine more messages into your range(s) to meet the threshold.${refoldSuffix(okBlockedReasons)}`
                 : null;
         if (gateMessage === null) {
@@ -614,8 +723,10 @@ export function createCore(ports: Ports = {}): CompressionCore {
     // Screening them here turns the common PARTIAL outcome (one oversized summary
     // rejects while sibling ranges land and open a seam) into a clean 0-commit
     // reject: nothing lands, so the model's single retry pays ONE seam instead of
-    // two. Content-class failures (protected-zone / turn-integrity / no-new-
-    // messages) DO depend on state + cross-range coverage and stay per-range below.
+    // two. Content-class failures (protected-zone / turn-integrity) DO depend on
+    // state + cross-range coverage and stay per-range below; the no-new-messages
+    // class is pre-screened out of this check entirely (#4240) — its summary is
+    // never stored, so an oversized one must not kill a salvageable batch.
     // Scope is EXACTLY the fold-candidate set that mutates state in the loop —
     // never every requested range, else a consumed range whose summary happens to
     // be long would wrongly kill a batch whose real candidates all validate.
@@ -623,6 +734,7 @@ export function createCore(ports: Ports = {}): CompressionCore {
       const lengthFailures: string[] = [];
       for (const spec of input.ranges) {
         if (skipSpecs.has(spec)) continue;
+        if (noNewSpecs.has(spec)) continue;
         const resolution = classifications.get(spec);
         if (resolution === undefined) continue;
         const foldsFresh = resolution.status === "ok";
@@ -662,17 +774,20 @@ export function createCore(ports: Ports = {}): CompressionCore {
 
     // #3939 (PR-B item ④, extends #3670/#3003 to content class): the length
     // pre-check above cannot screen content-class fatals (protected-zone /
-    // turn-integrity / livelock / empty-range) because they depend on state
-    // plus cross-range coverage — range N+1's eligibility may hinge on range N
-    // having landed. So apply the loop and keep a pristine pre-loop snapshot;
-    // any apply-level throw rejects the WHOLE batch with zero commits instead
-    // of leaving earlier siblings landed (the #3003 double-seam shape: a fold
-    // seam PLUS the retry seam on the model's next attempt). Classification-
-    // level outcomes (unknown / invalid / consumed-skip) never mutate state,
-    // so they stay per-range and do NOT poison the batch.
+    // turn-integrity) because they depend on state plus cross-range coverage —
+    // range N+1's eligibility may hinge on range N having landed. So apply the
+    // loop and keep a pristine pre-loop snapshot; any apply-level throw rejects
+    // the WHOLE batch with zero commits instead of leaving earlier siblings
+    // landed (the #3003 double-seam shape: a fold seam PLUS the retry seam on
+    // the model's next attempt). Classification-level outcomes (unknown /
+    // invalid / consumed-skip) never mutate state, so they stay per-range and do
+    // NOT poison the batch. The no-new-messages class (#4240) is pre-screened
+    // above for the same reason it must not poison: it folds nothing under ANY
+    // execution order, so skipping it per-range is safe even mid-batch.
     const preLoopState = cloneState(state);
     const applyErrors: string[] = [];
     const warningsBase = warnings.length;
+    let noNewSkipped = 0;
     // #3769: capture which blocks already exist so, after the loop, we can tell
     // which were created by THIS fold and where it starts (for the orphan sweep).
     const preFoldBlockIds = new Set(state.blocks.map((b) => b.blockId));
@@ -682,6 +797,16 @@ export function createCore(ports: Ports = {}): CompressionCore {
       if (skipSpecs.has(spec)) continue;
       const resolution = classifications.get(spec);
       if (resolution === undefined) continue;
+      if (noNewSpecs.has(spec)) {
+        // #4240: folds nothing under any execution order — warn and move on so
+        // sibling ranges still land (the old atomic reject killed them too).
+        const info = noNewSpecs.get(spec)!;
+        noNewSkipped++;
+        warnings.push(
+          `Skipped range (${spec.startRef}..${spec.endRef}) — ${noNewRangeDetail(info.covering)}${info.reasons.length > 0 ? ` In-place refold unavailable: ${info.reasons.join("; ")}. Restore the affected block(s) inline (decompress with inline:true), then recompressing the same range updates them in place.` : ""}`,
+        );
+        continue;
+      }
       if (resolution.status === "consumed") {
         const decision = refoldDecisions.get(spec);
         if (decision?.kind === "refold") {
@@ -742,6 +867,23 @@ export function createCore(ports: Ports = {}): CompressionCore {
           ),
         );
       }
+    }
+
+    if (applyErrors.length === 0 && blocksCreated === 0 && noNewSkipped > 0) {
+      // #4240: with minCompressRange === 0 the size gate never fires, so an
+      // all-no-op batch would otherwise fall through to a SUCCESS receipt with
+      // zero folds and zero errors — the fake-progress loop the livelock guard
+      // exists to prevent (dog/billion-context-pi#199). Verdict it like the
+      // gate does: hard error naming each covering block, nothing committed.
+      return {
+        state: preLoopState,
+        result: {
+          blocksCreated: 0,
+          tokensCompressed: 0,
+          errors: [noNewBatchError(), ...classificationErrors],
+          warnings: warnings.slice(0, warningsBase),
+        },
+      };
     }
 
     if (applyErrors.length > 0) {

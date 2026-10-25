@@ -550,11 +550,14 @@ test("full anchor view: unmarked block keeps the legacy livelock rejection verba
   assert.equal(result.state.nextBlockId, 2);
 });
 
-test("full anchor view: sub-threshold span over an unmarked block names the blocker in the size-gate error (#402)", () => {
+test("full anchor view: sub-threshold span over an unmarked block names the blocker in the already-compressed verdict (#402/#4240)", () => {
   const core = createCore();
-  // Short messages (~30 chars each → ~300 total < minCompressRange 500), so
-  // the size gate fires BEFORE the per-range loop could reach the livelock
-  // error that names b1 — the diagnostic must carry the blocker itself.
+  // Short messages (~30 chars each → ~300 total < minCompressRange 500).
+  // Pre-#4240 the covered text still counted toward the size gate, so this
+  // shape died "too small"; now the covered range folds nothing under any
+  // order, is excluded from the gate count, and the batch is verdicted
+  // "already compressed" up front — the diagnostic must carry the blocker
+  // itself either way (#402).
   const messages = makeMessages(10);
   const state = makeState(messages, [
     makeBlock({
@@ -574,16 +577,22 @@ test("full anchor view: sub-threshold span over an unmarked block names the bloc
   });
 
   assert.equal(result.result.errors.length, 1);
+  assert.match(result.result.errors[0]!, /Requested range\(s\) already compressed/);
   assert.match(
     result.result.errors[0]!,
-    /Total compressible content too small/,
+    /Range m00001\.\.m00010 contains no new compressible messages — every message in it is already covered by active block\(s\) b1/,
   );
   assert.match(result.result.errors[0]!, /blocked by b1 \(not restored\)/);
   assert.match(result.result.errors[0]!, /decompress with inline:true/);
   assert.ok(
-    result.result.errors[0]!.indexOf("too small") <
+    result.result.errors[0]!.indexOf("already compressed") <
       result.result.errors[0]!.indexOf("Refold blocked"),
-    "blocker detail appended to the too-small branch",
+    "blocker detail appended after the verdict",
+  );
+  assert.doesNotMatch(
+    result.result.errors[0]!,
+    /too small/,
+    "covered text no longer counts toward the size gate (#4240)",
   );
   assert.equal(result.state.blocks.length, 1, "nothing applied");
   assert.equal(result.state.blocks[0]!.summary, OLD_SUMMARY);

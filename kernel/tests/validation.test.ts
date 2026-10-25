@@ -200,7 +200,11 @@ test("validation: range with zero compressible messages (covered by non-nested b
 
   // m00002→m00003 maps to b,c. Block b1 covers a,b,c but its anchor is
   // at index 0 (a), outside range [1,2]. So b1 is NOT nested → consumedBlockCount=0.
-  // But b,c are in preExistingCoverage → directMessageIds=[]. Validation fires.
+  // But b,c are in preExistingCoverage → directMessageIds=[]. #4240: this
+  // zero-new shape is now caught by the classification-time no-new screen
+  // (read-only projectUnit) instead of the apply-time validation throw, so
+  // the reject arrives earlier and names the covering block + refold
+  // blocker. Still a hard reject — nothing lands.
   const second = core.applyCompression({
     ranges: [{ startRef: "m00002", endRef: "m00003", summary: validSummary }],
     messages,
@@ -208,7 +212,14 @@ test("validation: range with zero compressible messages (covered by non-nested b
     config,
   });
   assert.equal(second.result.blocksCreated, 0);
-  assert.match(second.result.errors[0]!, /no compressible/i);
+  assert.match(
+    second.result.errors[0]!,
+    /Requested range\(s\) already compressed/,
+  );
+  assert.match(
+    second.result.errors[0]!,
+    /contains no new compressible messages — every message in it is already covered by active block\(s\) b1/,
+  );
 });
 
 test("validation: block-boundary compress with 0 direct msgs but consumed blocks is allowed", () => {
