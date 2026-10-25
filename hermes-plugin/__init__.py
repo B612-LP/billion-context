@@ -1406,7 +1406,9 @@ def register(ctx: Any) -> None:
         except Exception:
             pass
         epoch = _state.get("epoch")
-        if epoch is None or epoch["ready"].is_set():
+        # stop-set matters here even though ready will follow: an unload can abort a still-running
+        # boot BEFORE its finally sets ready, and waiting on that dead boot leaves no bootstrap left.
+        if epoch is None or epoch["ready"].is_set() or epoch["stop"].is_set():
             epoch = _new_epoch()
             threading.Thread(target=_bootstrap, args=(epoch, sidecar, ctx),
                              name="bili-hermes-bootstrap", daemon=True).start()

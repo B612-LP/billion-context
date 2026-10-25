@@ -723,6 +723,34 @@ elif SCENARIO == "re-enable":
     mod.register(ctx)
     out["second_tools"] = sorted(ctx.tools.keys())
     out["second_tools_ready"] = bool(mod._state.get("tools_ready"))
+elif SCENARIO == "re-enable-inflight":
+    # #4641 review: an unload can abort a bootstrap that has NOT yet settled (stop set, ready still
+    # unset). Re-enabling in that window must mint a FRESH generation and boot, not wait on the dead
+    # one. We seed exactly that state deterministically instead of racing a real slow boot.
+    import time as _t
+    import threading as _th
+    install_sidecar(False)
+    os.environ["BILLION_CONTEXT_ATTACH"] = ORIGIN
+    ca_dir = os.path.join(os.environ["XDG_DATA_HOME"], "billion-context", "ca")
+    os.makedirs(ca_dir, exist_ok=True)
+    with open(os.path.join(ca_dir, "root-ca.pem"), "w") as f:
+        f.write("dummy-ca\n")
+    with open(os.path.join(ca_dir, "combined-ca.pem"), "w") as f:
+        f.write("dummy-combined-ca\n")
+    mod.REGISTER_WAIT_S = 1.0
+    fake_stop = _th.Event(); fake_stop.set()   # an unload already fired on the prior generation
+    fake_ready = _th.Event()                    # ...but its boot has not settled yet (ready unset)
+    mod._state["_epoch_gen"] = 7
+    mod._state["epoch"] = {"gen": 7, "stop": fake_stop, "ready": fake_ready, "outcome": None}
+    mod._state["tools_ready"] = False
+    out["epoch_gen_before"] = int(mod._state.get("_epoch_gen", 0))
+    mod.register(ctx)
+    out["epoch_gen_after"] = int(mod._state.get("_epoch_gen", 0))
+    deadline = _t.monotonic() + 12.0
+    while _t.monotonic() < deadline and not mod._state.get("tools_ready"):
+        _t.sleep(0.1)
+    out["second_tools"] = sorted(ctx.tools.keys())
+    out["second_tools_ready"] = bool(mod._state.get("tools_ready"))
 else:
     raise SystemExit("unknown scenario: " + SCENARIO)
 
@@ -801,6 +829,8 @@ interface DriverOut {
     post_unload_origin?: string | null;
     second_tools?: string[];
     second_tools_ready?: boolean;
+    epoch_gen_before?: number;
+    epoch_gen_after?: number;
 }
 
 function runDriver(scenario: string, extraEnv: Record<string, string> = {}): { out: DriverOut | null; err: string } {
@@ -1174,6 +1204,21 @@ describe("python plugin runtime (subprocess)", () => {
         assert.equal(out!.post_unload_tools_ready, false);
         assert.equal(out!.post_unload_origin, null);
         // re-enable mints a fresh generation -> boots again -> tools restored
+        assert.deepEqual(out!.second_tools, ["acp_status", "compress", "decompress"]);
+        assert.equal(out!.second_tools_ready, true);
+    });
+
+    test("re-enable while a prior boot was aborted-but-unsettled mints a fresh generation (#4641 review)", () => {
+        if (!PY) {
+            console.warn("skip: no python3/python interpreter on this machine (hermes requires Python 3.11+)");
+            return;
+        }
+        const { out, err } = runDriver("re-enable-inflight");
+        assert.ok(out, err);
+        // an unload can abort a boot before its finally sets ready; that window must still mint fresh
+        assert.ok(out!.epoch_gen_after! > out!.epoch_gen_before!,
+            `register() did not mint a fresh generation over an aborted-unsettled epoch (before=${out!.epoch_gen_before} after=${out!.epoch_gen_after})`);
+        // ...and that fresh generation actually boots and restores the tools
         assert.deepEqual(out!.second_tools, ["acp_status", "compress", "decompress"]);
         assert.equal(out!.second_tools_ready, true);
     });
