@@ -2813,6 +2813,10 @@ async function handleRequest(
                     bodyText = undefined;
                     parsed = null;
                     overflowRefold = undefined;
+                    // The chain-fingerprint/resume memo aliases parsed.messages
+                    // (or input/contents) — drop it or the inbound message array
+                    // stays pinned on this frame across the response stream.
+                    affinityMessagesCache = null;
                 };
                 await forward(req, res, opts, pendingForward.body, pendingForward.prepared, core, reqConfig, log, route, instanceId, affinity, overflowRefold, v1Meta, releaseRequestInput);
                 // Remember for ALL modes (not just plugin): wire clients (dsh,
