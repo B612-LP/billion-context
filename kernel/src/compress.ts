@@ -276,11 +276,11 @@ function noNewRangeDetail(covering: string[]): string {
     covering.length > 0
       ? `every message in it is already covered by active block(s) ${covering.join(", ")}`
       : `every message in it was excluded (protected zone, media, or turn-integrity carve)`;
-  const mergeHint =
+  const tail =
     covering.length > 0
-      ? ` To rewrite or merge those blocks, reference them by block ID (${covering[0]}..${covering[covering.length - 1]})`
-      : "";
-  return `contains no new compressible messages — ${coverText}.${mergeHint}; otherwise run acp_status and compress a range it reports as compressible.`;
+      ? ` To rewrite or merge those blocks, reference them by block ID (${covering[0]}..${covering[covering.length - 1]}); otherwise run acp_status and compress a range it reports as compressible.`
+      : " Run acp_status and compress a range it reports as compressible.";
+  return `contains no new compressible messages — ${coverText}.${tail}`;
 }
 
 // Block-ID-boundary advice is only actionable when tier distillation is ready;
