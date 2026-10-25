@@ -752,11 +752,7 @@ test("HTTP fork revision and originals survive a new proxy process", { timeout: 
         parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
         parent.contentStoreDirty = true;
         assert(h.store.flushSync(parent));
-        // #4316 PR3/3: cold load runs the one-time ledger alignment — the loaded
-        // state now carries refLedgerAligned. Mirror it in the expectation.
-        const persistedState = JSON.parse(JSON.stringify(parent.state));
-        persistedState.refLedgerAligned = true;
-        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), persistedState);
+        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), JSON.parse(JSON.stringify(parent.state)));
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
         const req = forkRequest(snapshot);
         const fork = await h.request("/__bili/plugin/fork", req);
