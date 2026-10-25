@@ -307,10 +307,11 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                 const imgDir = opts?.imgRoot !== undefined
                     ? path.join(opts.imgRoot, restoreExportDirName(view.id))
                     : restoreExportDir(view.id);
-                result.bytesFreed += await dirTreeBytes(imgDir);
+                const freed = await dirTreeBytes(imgDir);
                 await rm(imgDir, { recursive: true, force: true });
                 loggerLog("info", `[gc] removed image spills for session ${view.id}: ${path.relative(stateDir(), imgDir)}`);
                 result.imgDirsRemoved++;
+                result.bytesFreed += freed;
             } catch { /* mtime pass retries next sweep */ }
             // #4699: CCR text exports share this session's lifecycle — pure
             // cache (a re-retrieve rewrites them), and refs are per-session so
@@ -319,10 +320,11 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                 const exportDir = opts?.exportRoot !== undefined
                     ? path.join(opts.exportRoot, retrieveSessionDirName(view.id))
                     : retrievalExportDir(view.id);
-                result.bytesFreed += await dirTreeBytes(exportDir);
+                const freed = await dirTreeBytes(exportDir);
                 await rm(exportDir, { recursive: true, force: true });
                 loggerLog("info", `[gc] removed retrieval exports for session ${view.id}: ${path.relative(stateDir(), exportDir)}`);
                 result.retrievalExportsRemoved++;
+                result.bytesFreed += freed;
             } catch { /* mtime pass retries next sweep */ }
         }
         if (compSt) {
@@ -437,7 +439,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                 continue;
             }
             if (!ist.isDirectory() || now - ist.mtimeMs < cfg.maxAgeMs) continue;
-            result.bytesFreed += await dirTreeBytes(full);
+            const freed = await dirTreeBytes(full);
             try {
                 await rm(full, { recursive: true, force: true });
             } catch {
@@ -445,6 +447,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
             }
             loggerLog("info", `[gc] removed stale image spill dir ${path.relative(stateDir(), full)}`);
             result.imgDirsRemoved++;
+            result.bytesFreed += freed;
         }
     } catch { /* no spill tree yet — nothing to sweep */ }
     // #4699: per-session CCR text-export dirs under <state>/retrieve/ — same
@@ -478,7 +481,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                     continue;
                 }
                 if (!est.isDirectory() || now - est.mtimeMs < cfg.maxAgeMs) continue;
-                result.bytesFreed += await dirTreeBytes(full);
+                const freed = await dirTreeBytes(full);
                 try {
                     await rm(full, { recursive: true, force: true });
                 } catch {
@@ -486,6 +489,7 @@ export async function gcSessionFiles(opts?: { dir?: string; store?: SessionStore
                 }
                 loggerLog("info", `[gc] removed stale retrieval export dir ${path.relative(stateDir(), full)}`);
                 result.retrievalExportsRemoved++;
+                result.bytesFreed += freed;
             } else if (e.isFile() && e.name.endsWith(".txt") && !e.name.startsWith(".")) {
                 if (liveRefs.has(e.name.slice(0, -".txt".length))) continue;
                 const full = path.join(exportRoot, e.name);
