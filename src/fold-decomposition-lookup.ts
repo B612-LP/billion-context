@@ -89,10 +89,13 @@ export function resolveStoredDecompositions(
     // Latest seq per id wins (edits append rows); neighbors stay in so rc
     // pairs keep adjacency for turn-key derivation. Unparseable rows are
     // auxiliary-evidence misses, not errors — count them, don't throw.
+    // #4747: no in-loop index maintenance — interleaved rows (A1,B1,A2,B2 —
+    // the append shape for edits, exactly this lookup's target scenario)
+    // desynced a per-id index map on every splice, deleting the wrong
+    // element and silently dropping another id's LATEST row. Collect
+    // per-id latest now; rebuild + sort once at the end.
     let skipped = 0;
-    const latestSeq = new Map<string, number>();
-    const ordered: { seq: number; m: CoreMessage }[] = [];
-    const orderedIdx = new Map<string, number>();
+    const latestById = new Map<string, { seq: number; m: CoreMessage }>();
     for (const row of rows) {
         let parsed: unknown;
         try {
@@ -110,16 +113,12 @@ export function resolveStoredDecompositions(
             skipped++;
             continue;
         }
-        const prev = latestSeq.get(row.msgId);
-        if (prev !== undefined && prev >= row.seq) continue;
-        latestSeq.set(row.msgId, row.seq);
-        const prevIdx = orderedIdx.get(row.msgId);
-        if (prevIdx !== undefined) ordered.splice(prevIdx, 1);
-        ordered.push({ seq: row.seq, m });
-        orderedIdx.set(row.msgId, ordered.length - 1);
+        const prev = latestById.get(row.msgId);
+        if (prev !== undefined && prev.seq >= row.seq) continue;
+        latestById.set(row.msgId, { seq: row.seq, m });
     }
     if (skipped > 0) loggerLog("debug", `[fold-reconcile] stored decomposition: ${skipped} unparseable row(s) skipped`);
-    if (ordered.length === 0) return undefined;
-    ordered.sort((a, b) => a.seq - b.seq);
+    if (latestById.size === 0) return undefined;
+    const ordered = [...latestById.values()].sort((a, b) => a.seq - b.seq);
     return ordered.map((o) => o.m);
 }
