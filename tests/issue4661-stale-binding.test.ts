@@ -71,8 +71,15 @@ describe("#4661 proxy: stale-binding diagnosis in handlePluginTool", () => {
     function makePair() {
         const s = getSession(`t-4661-s-${Math.random().toString(36).slice(2)}`);
         const f = getSession(`t-4661-f-${Math.random().toString(36).slice(2)}`);
-        s.lastModelRequestAt = Date.now() - 20 * 60 * 1000;
-        f.lastModelRequestAt = Date.now() - 60 * 1000;
+        const sQuiet = Date.now() - 20 * 60 * 1000;
+        const fLive = Date.now() - 60 * 1000;
+        s.lastModelRequestAt = sQuiet;
+        f.lastModelRequestAt = fLive;
+        // lastSeen feeds #4168's reported recency facts (witnessLastSeen /
+        // namedSessionLastSeen); stamp it explicitly so the row never rides on
+        // the two creation-time Date.now() calls landing in different ms.
+        s.lastSeen = sQuiet;
+        f.lastSeen = fLive;
         return { s, f };
     }
 
