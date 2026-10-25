@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { resolveStoredDecompositions, type DecompositionSource, type StoredRow } from "../src/fold-decomposition-lookup.ts";
+import { resolveStoredDecompositions } from "../src/fold-decomposition-lookup.ts";
+import type { StoredRow, DecompositionSource } from "../src/fold-decomposition-lookup.ts";
 import type { Session } from "../src/session.ts";
 import type { FoldAnchor } from "../src/fold-reconcile.ts";
 
@@ -20,7 +21,7 @@ test("#4747: interleaved rows (A1,B1,A2,B2) keep every id's LATEST row", () => {
         { seq: 12, msgId: "A", content: JSON.stringify({ id: "A", role: "assistant", contentType: "text", text: "A-new" }) },
         { seq: 13, msgId: "B", content: JSON.stringify({ id: "B", role: "assistant", contentType: "text", text: "B-2" }) },
     ];
-    const src: DecompositionSource = { rows: (_sid, ids) => (ids.includes("A") || ids.includes("B") ? rows : []) };
+    const src: DecompositionSource = { rows: (_sid: string, ids: readonly string[]) => (ids.includes("A") || ids.includes("B") ? rows : []) };
     const out = resolveStoredDecompositions(mkSession(["A", "B"]), "s", new Set(["wire-live"]), src);
     assert.ok(out !== undefined, "rows returned");
     const texts = out!.map((m) => (m as { text?: string }).text);

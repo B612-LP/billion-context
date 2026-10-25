@@ -23,7 +23,7 @@ export interface StoredRow {
     content: string;
 }
 
-interface DecompositionSource {
+export interface DecompositionSource {
     /** null = no index available (legacy/shadow/degraded); [] = index has none of them. */
     rows(sessionId: string, msgIds: readonly string[]): StoredRow[] | null;
 }

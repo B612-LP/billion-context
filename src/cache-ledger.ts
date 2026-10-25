@@ -1291,10 +1291,16 @@ export function recordCacheSample(
     if (pending.length > 0 && known && s.input > 0) {
         const rawMissed = s.input - effCached;
         if (rawMissed > 8192 && rawMissed > 0.3 * s.input) {
-            const curB = session.transient?.sentBody;
+            // #4748: read the CURRENT send through pendingCapture — the relay
+            // lane keeps pending evidence in the AsyncLocalStorage capture
+            // (#4430), so transient.sentBody is undefined there and this
+            // measurement (whose target scenario IS the relay lane) never
+            // fired. prev reads stay on transient: settled evidence is moved
+            // OUT of the capture at settle time.
+            const curB = pendingCapture(session).sentBody ?? session.transient?.sentBody;
             const prevB = session.transient?.settledBody;
             if (curB !== undefined && prevB !== undefined && curB.bytes <= SEAM_BODY_CAP && prevB.bytes <= SEAM_BODY_CAP) {
-                const curIn = session.transient?.inBody;
+                const curIn = pendingCapture(session).inBody ?? session.transient?.inBody;
                 const prevIn = session.transient?.settledInBody;
                 const clientBreak = curIn !== undefined && prevIn !== undefined && curIn.msgs <= INBOUND_MSG_CAP && prevIn.msgs <= INBOUND_MSG_CAP && (() => {
                     const k = firstDivergentInboundMsg(prevIn, curIn);
