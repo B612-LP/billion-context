@@ -521,7 +521,7 @@ function containsRun(haystack: string[], needle: string[]): boolean {
 }
 
 /** #4264: one judged candidate inside a ResumeMissReport. */
-export interface ResumeMissCandidate {
+interface ResumeMissCandidate {
     sessionId: string;
     /** Stored chain depth (neutral turns for hv2, raw messages for hv1). */
     chainDepth: number;
@@ -555,7 +555,7 @@ export interface ResumeMissCandidate {
 }
 
 /** #4264: diagnostics-only report for a resume-inheritance miss. */
-export interface ResumeMissReport {
+interface ResumeMissReport {
     /** Tracked chains that passed the pre-screen (depth ≥
      *  MIN_RESUME_PREFIX, id ≠ self, in-domain floor) and were actually
      *  judged. 0 with no declaredParentState = nothing eligible to begin
