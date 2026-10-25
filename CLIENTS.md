@@ -389,8 +389,8 @@ two small node scripts that do the work around the client:
   pointing `baseURL` at a dead port.
 - **Plugin-mode stamping:** once the MCP child verifies the ACP tool list
   against the live proxy manifest, the routed entries gain
-   `headers["x-bili-plugin"] = "zcode"` — until then traffic rides wire mode.
-   Tool calls bind via the per-call `conversation_id` argument (#760).
+  `headers["x-bili-plugin"] = "zcode"` — until then traffic rides wire mode.
+  Tool calls bind via the per-call `conversation_id` argument (#760).
 - **Session binding & stale pins (#4661):** ZCode injects no session id into
   the MCP child, so the shim binds to the `BILI_CONVERSATION_ID` you pinned in
   `~/.zcode/cli/config.json`; that pin goes stale whenever ZCode mints a new
