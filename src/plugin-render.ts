@@ -105,9 +105,15 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
         if (blockSeqs.length === 0) continue;
         for (const s of blockSeqs) coveredSeqs.add(s);
         const maxCover = Math.max(...blockSeqs);
+        // #4746: the anchor's slot is the first view row PAST the block's
+        // coverage — when the coverage ends at (or beyond) the window's last
+        // row there IS no later row, and the anchor belongs at the very end
+        // (mirror of snapshot-render.ts's `let at = d` default + its tail
+        // flush). Skipping it (the old `continue`) suppressed the covered
+        // rows AND emitted no acp_summary anchor: the model silently lost
+        // the fold's context while the log still counted folded=N.
         const pos = viewRows.findIndex((r) => r.seq > maxCover);
-        if (pos === -1) continue; // the fold extends past the requested window
-        anchors.push({ pos, msg: { id: `acp_summary_${block.blockId}`, role: "system", contentType: "text", text: "" } as BiliMessage });
+        anchors.push({ pos: pos === -1 ? viewRows.length : pos, msg: { id: `acp_summary_${block.blockId}`, role: "system", contentType: "text", text: "" } as BiliMessage });
     }
     anchors.sort((a, b) => a.pos - b.pos);
     const merged: BiliMessage[] = [];
@@ -118,6 +124,13 @@ export async function handlePluginRender(req: http.IncomingMessage, res: http.Se
             ai++;
         }
         if (!coveredSeqs.has(viewRows[i].seq)) merged.push(prefix[i]);
+    }
+    // #4746: anchors slotted past the last view row (coverage reached the
+    // window's end) must still be flushed — the loop above never reaches
+    // their index (mirror of snapshot-render.ts's tail flush).
+    while (ai < anchors.length) {
+        merged.push(anchors[ai].msg);
+        ai++;
     }
 
     const system = loadSystem(sessionId);
