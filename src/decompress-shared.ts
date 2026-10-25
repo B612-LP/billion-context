@@ -418,7 +418,13 @@ function resolveDecompressRange(args: Record<string, unknown>, ctx: ProxyToolCtx
     }
     for (const { raw, num } of cov.raws) {
         if (!pickedSet.has(raw)) continue;
-        const r = retrieveByRef(store, `m${String(num).padStart(5, "0")}`);
+        // #4733: the coverage pair certifies "num belongs to raw". A store hit
+        // whose frozen alias names a DIFFERENT raw means the number was
+        // re-homed or reused (ledger restamp drift, pruned-ref reissue) —
+        // serving it would return another message's original, so treat it as
+        // not-found and fall through to the view lookup keyed by raw id.
+        let r = retrieveByRef(store, `m${String(num).padStart(5, "0")}`);
+        if (r.ok && r.entry.rawId !== raw) r = { ok: false, reason: "not-found" };
         if (r.ok) {
             parts.push(r.entry.toolName ? `[${r.entry.toolName} • stored]\n${r.text}` : `[${r.entry.kind} • stored]\n${r.text}`);
             restoredFromStore++;

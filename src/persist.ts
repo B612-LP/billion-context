@@ -27,7 +27,7 @@ import { recordRequestedMode } from "./storage/runtime-status.js";
 import { VERSION } from "./version.js";
 import { createStorageCodec, parseEncryptionKey } from "./encrypt.js";
 import { PersistEpermAlert } from "./persist-eperm.js";
-import { createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore } from "acp-kernel";
+import { BLOCKED_REF, createInitialState, defaultCountTokens, prune, type CompressionState, type CoreMessage, type MessageContentStore, type StoredEntry } from "acp-kernel";
 import { markDirty } from "./session.js";
 import { mergeState } from "./state-hydration.js";
 import { restampRefsToLedger } from "acp-kernel";
@@ -299,6 +299,34 @@ export function fileNameMatchesId(base: string, id: string, protocol?: string, u
         return canonicalBase === relBase || canonicalBase === flatBase;
     }
     return false;
+}
+
+/** #4733: move the CCR store's frozen ref→rawId aliases along with a ledger
+ *  restamp. The stamp re-keys messageRefs (ref := seq+1) but the content
+ *  store keys its entries by the ref frozen at arrival — without this pass
+ *  every entry keeps pointing at a superseded number: forkSnapshot's alias
+ *  invariant then fails forever ("CCR original alias inconsistent", 409) and
+ *  retrieveByRef can serve another message's original under a re-homed
+ *  number. Each entry follows its rawId into the stamped map (byRaw is
+ *  authoritative post-stamp); a collision means the ref map itself is
+ *  corrupt, so throw and let the caller roll the whole alignment back. */
+function rekeyContentStoreForRaw(store: MessageContentStore, byRaw: Record<string, string>): MessageContentStore {
+    const byRef: Record<string, StoredEntry> = {};
+    let changed = false;
+    for (const [ref, entry] of Object.entries(store.byRef)) {
+        const next = byRaw[entry.rawId];
+        if (next === undefined || next === BLOCKED_REF || next === ref) {
+            byRef[ref] = entry;
+            continue;
+        }
+        const occupant = byRef[next];
+        if (occupant !== undefined && occupant !== entry) {
+            throw new Error(`CCR re-key collision at ${next}: rawIds ${occupant.rawId} and ${entry.rawId} both claim the number`);
+        }
+        byRef[next] = entry;
+        changed = true;
+    }
+    return changed ? { ...store, byRef } : store;
 }
 
 /** Session persistence policy over the kernel StateStore mechanism. The
@@ -1606,7 +1634,32 @@ export class SessionStore {
         try {
             const seqByRawId = this.unifiedSeqByRaw(session.id);
             if (seqByRawId === null || seqByRawId.size === 0) return;
+            // #4733: capture the pre-stamp map so a failed CCR re-key can roll
+            // the whole alignment back — shipping a renumbered map beside an
+            // un-rekeyed store is exactly the broken pair this prevents.
+            const prevRefs = state.messageRefs;
             const outcome = restampRefsToLedger(state, seqByRawId);
+            if (outcome.superseded.size > 0) {
+                // #4733: numbers moved, so the CCR store's frozen aliases must
+                // move in the SAME operation. Only materialize the store when
+                // something actually drifted (zero-drift sessions never touch
+                // it). Re-key failure rolls the stamp back entirely.
+                try {
+                    const liveStore = session.contentStore ?? this.unifiedCcrFor(session.id) ?? this.loadContentStore(session);
+                    if (liveStore && Object.keys(liveStore.byRef).length > 0) {
+                        const next = rekeyContentStoreForRaw(liveStore, state.messageRefs.byRaw);
+                        if (next !== liveStore) {
+                            session.contentStore = next;
+                            session.contentStoreDirty = true;
+                        }
+                    }
+                } catch (err) {
+                    state.messageRefs = prevRefs;
+                    state.refLedgerAligned = false;
+                    this.log("warn", `[persist] ledger alignment rolled back for ${session.id} (CCR store re-key failed): ${err instanceof Error ? err.message : String(err)}`);
+                    return;
+                }
+            }
             if (outcome.superseded.size > 0) {
                 session.restampSuperseded = outcome.superseded;
             }
