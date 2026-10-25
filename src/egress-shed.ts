@@ -18,7 +18,7 @@ import { currentFetchTransport, isWsLaneTransport } from "./fetch-transport.js";
 import { limitsWsOutboundBytes } from "./knobs.js";
 import { decodeImageDims } from "./image-tokens.js";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "./compress-tool.js";
-import { refForItemBytes, shedDownscaleImage } from "./image-rescale.js";
+import { matchesOriginalImageReceipt, refForItemBytes, shedDownscaleImage } from "./image-rescale.js";
 import { ResponsesWsUpstreamError } from "./responses-ws.js";
 
 type Part = Record<string, unknown>;
@@ -132,6 +132,24 @@ function isExemptOutput(protocol: WireProtocol, item: Part, names: Map<string, s
 
 function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
     const occ: Occurrence[] = [];
+    const addAnthropicImages = (parts: unknown[], entryIndex: number, toolOutput: boolean): void => {
+        parts.forEach((part, pos) => {
+            if (!isObj(part) || part.type !== "image") return;
+            const src = part.source;
+            if (!isObj(src) || src.type !== "base64" || typeof src.data !== "string" || src.data.length === 0) return;
+            if (toolOutput && matchesOriginalImageReceipt(src.data, parts)) return;
+            const mediaType = typeof src.media_type === "string" ? src.media_type : "image/png";
+            occ.push({
+                entryIndex,
+                b64: src.data,
+                mediaType,
+                protectedTail: false,
+                archived: false,
+                applyArchive: (note) => { parts[pos] = { type: "text", text: note }; },
+                applyShrink: (b64) => { src.data = b64; },
+            });
+        });
+    };
     if (protocol === "google") {
         const contents = body.contents;
         if (!Array.isArray(contents)) return occ;
@@ -142,6 +160,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                 if (!isObj(part)) return;
                 const inline = part.inlineData;
                 if (!isObj(inline) || typeof inline.data !== "string" || inline.data.length === 0) return;
+                if (matchesOriginalImageReceipt(inline.data, parts)) return;
                 const mediaType = typeof inline.mimeType === "string" ? inline.mimeType : "image/png";
                 occ.push({
                     entryIndex,
@@ -169,7 +188,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
             parts.forEach((part, pos) => {
                 if (!isObj(part) || part.type !== "input_image" || typeof part.image_url !== "string") return;
                 const d = parseDataUrl(part.image_url);
-                if (!d) return;
+                if (!d || (partsKey === "output" && matchesOriginalImageReceipt(d.base64, parts))) return;
                 occ.push({
                     entryIndex,
                     b64: d.base64,
@@ -193,6 +212,7 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
         if (protocol === "anthropic" && Array.isArray(m.content) && m.content.some((b) => isObj(b) && b.type === "tool_result" && isExemptOutput(protocol, b, names))) return;
         if (!Array.isArray(m.content)) return;
         const content = m.content as unknown[];
+        if (protocol === "anthropic") addAnthropicImages(content, entryIndex, false);
         content.forEach((part, pos) => {
             const p = isObj(part) ? part : undefined;
             if (!p) return;
@@ -212,20 +232,8 @@ function collectOccurrences(protocol: WireProtocol, body: Part): Occurrence[] {
                     applyArchive: (note) => { content[pos] = { type: "text", text: note }; },
                     applyShrink: (b64) => { p.image_url = typeof iu === "string" ? dataUrl(d.mediaType, b64) : { ...(iu ?? {}), url: dataUrl(d.mediaType, b64) }; },
                 });
-            } else {
-                if (p.type !== "image") return;
-                const src = p.source;
-                if (!isObj(src) || src.type !== "base64" || typeof src.data !== "string" || src.data.length === 0) return;
-                const mediaType = typeof src.media_type === "string" ? src.media_type : "image/png";
-                occ.push({
-                    entryIndex,
-                    b64: src.data,
-                    mediaType,
-                    protectedTail: false,
-                    archived: false,
-                    applyArchive: (note) => { content[pos] = { type: "text", text: note }; },
-                    applyShrink: (b64) => { src.data = b64; },
-                });
+            } else if (p.type === "tool_result" && Array.isArray(p.content)) {
+                addAnthropicImages(p.content, entryIndex, true);
             }
         });
     });
@@ -305,6 +313,66 @@ export async function shedWireImages(
         body: next,
         stats: { originalBytes, finalBytes: byteLen(next), archived, downscaled, changed: true },
     };
+}
+
+/** #4124: shed images from a serialized request until at most maxImages remain.
+ *  Count-space twin of shedWireImages — RUNG A ONLY, because archiving is the only
+ *  action that reduces COUNT (rung B downscaling leaves the image count untouched).
+ *  Same placeholder/archive machinery, so every original stays reachable via
+ *  decompress({imageRef}). Two deliberate differences from shedWireImages:
+ *   - the work list is NOT sliced at MAX_SHED_IMAGES — that bound caps jimp CPU,
+ *     while archiving is a cheap string swap and a 165→29 convergence needs ~136;
+ *   - the protected tail YIELDS to the cap: an upstream count wall is HARD (sending
+ *     over it fails the whole request), unlike the WS byte budget which is soft —
+ *     once non-tail images are exhausted, tail images are archived too (oldest-first).
+ *  Exempt read_original_image occurrences never enter the walk (collectOccurrences
+ *  skips them); if exempt images alone exceed the cap the body cannot be brought
+ *  under it and the rejection stays visible. Pure on the string; byte-identical
+ *  passthrough when the count is already within maxImages or nothing was sheddable. */
+export async function shedWireImagesToCount(
+    body: string,
+    protocol: WireProtocol,
+    maxImages: number,
+    opts: ShedOptions = {},
+): Promise<{ body: string; stats: ShedStats }> {
+    const originalBytes = byteLen(body);
+    const noop: ShedStats = { originalBytes, finalBytes: originalBytes, archived: 0, downscaled: 0, changed: false };
+    if (!Number.isInteger(maxImages) || maxImages < 0) return { body, stats: noop };
+    let parsed: unknown;
+    try {
+        parsed = JSON.parse(body);
+    } catch {
+        return { body, stats: noop };
+    }
+    if (!isObj(parsed)) return { body, stats: noop };
+    const occurrences = collectOccurrences(protocol, parsed);
+    if (occurrences.length <= maxImages) return { body, stats: noop };
+
+    const totalEntries = protocol === "google" ? (Array.isArray(parsed.contents) ? parsed.contents.length : 0)
+        : protocol === "responses" ? (Array.isArray(parsed.input) ? parsed.input.length : 0)
+            : Array.isArray(parsed.messages) ? parsed.messages.length : 0;
+    const protectFrom = Math.max(0, totalEntries - PROTECTED_TAIL_ENTRIES);
+    for (const o of occurrences) o.protectedTail = o.entryIndex >= protectFrom;
+
+    let remaining = occurrences.length;
+    let archived = 0;
+    for (const allowTail of [false, true]) {
+        if (remaining <= maxImages) break;
+        for (const o of occurrences) {
+            if (remaining <= maxImages) break;
+            if (o.archived) continue;
+            if (!allowTail && o.protectedTail) continue;
+            const note = await shedNote(o.mediaType, o.b64, opts.resolveRef);
+            o.applyArchive(note);
+            o.archived = true;
+            remaining--;
+            archived++;
+        }
+    }
+
+    if (archived === 0) return { body, stats: noop };
+    const next = JSON.stringify(parsed);
+    return { body: next, stats: { originalBytes, finalBytes: byteLen(next), archived, downscaled: 0, changed: true } };
 }
 
 interface ShedContext {

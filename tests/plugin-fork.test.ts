@@ -18,6 +18,7 @@ import { _resetSessionsForTest, getSession, markDirty } from "../src/session.ts"
 import { _setForTest } from "../src/registry.ts";
 import { recordToolWitness, resetToolRingForTest } from "../src/tool-ring.ts";
 import { contentStoreOf } from "../src/store.ts";
+import { closeServers } from "./server-close-guard.ts";
 
 process.env.NODE_ENV = "test";
 const testRoot = mkdtempSync(join(tmpdir(), "bili-fork-"));
@@ -113,7 +114,7 @@ async function harness(persist = false, seedParent = true, compressExtra: Record
         assert.equal(r.status, 200);
         await r.text();
     }
-    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); proxy.close(); upstream.close(); proxy.closeIdleConnections?.(); proxy.closeAllConnections?.(); upstream.closeIdleConnections?.(); upstream.closeAllConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+    return { request, messages, forwarded, dir, store, upstreamUrl, origin, close: async () => { store.cancelAll(); await closeServers([proxy, upstream], "plugin-fork harness"); } };
 }
 
 test("plain proxy panel snapshots do not change raw-history persistence", { timeout: 60_000 }, async () => {
@@ -751,7 +752,11 @@ test("HTTP fork revision and originals survive a new proxy process", { timeout: 
         parent.contentStore = storeOriginal(createContentStore(), { ref: "m00001", rawId: parent.pluginSnapshot![0].id, text: "CCR original retained independently after restart", kind: "original", tokens: 10, head: "CCR original" });
         parent.contentStoreDirty = true;
         assert(h.store.flushSync(parent));
-        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), JSON.parse(JSON.stringify(parent.state)));
+        // #4316 PR3/3: cold load runs the one-time ledger alignment — the loaded
+        // state now carries refLedgerAligned. Mirror it in the expectation.
+        const persistedState = JSON.parse(JSON.stringify(parent.state));
+        persistedState.refLedgerAligned = true;
+        assert.deepEqual(JSON.parse(JSON.stringify(h.store.loadSync("parent")!.state)), persistedState);
         const snapshot = (await h.request("/__bili/plugin/snapshot?conversationId=parent")).body;
         const req = forkRequest(snapshot);
         const fork = await h.request("/__bili/plugin/fork", req);
