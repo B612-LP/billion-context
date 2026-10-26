@@ -218,7 +218,7 @@ describe("escalation semantics (#2915) — the #2821 death spiral stays closed",
             assert.equal(r.unmatched, 1, `${gen}: only the changed preamble id is honest loss`);
             assert.equal(r.reaped, 0, `${gen}: no zombie reap`);
         }
-        assert.ok(!logs.some((l) => l.msg.includes("compression substrate appears destroyed")),
+        assert.ok(!logs.some((l) => l.msg.includes("fold epoch confirmation required")),
             "the #2821 verdict must never fire for re-mint churn");
         assert.ok(session.metadata.foldDriftEscalated === undefined, "escalation latch never sets");
         assert.ok(session.metadata.foldDriftStreak === undefined || session.metadata.foldDriftStreak === 0,
@@ -266,7 +266,7 @@ describe("escalation semantics (#2915) — the #2821 death spiral stays closed",
             assert.equal(r.byPos, 11, `${gen}: positional copy regenerated — order carries the re-mint`);
             assert.equal(r.unmatched, 1, `${gen}: only the changed preamble`);
         }
-        assert.ok(!logs.some((l) => l.msg.includes("compression substrate appears destroyed")));
+        assert.ok(!logs.some((l) => l.msg.includes("fold epoch confirmation required")));
     });
 });
 
@@ -357,24 +357,26 @@ describe("escalation latch recovery (review gap ②) — upgrade-in-place heals"
         }
         assert.equal(session.metadata.foldDriftEscalated, true, "latched after 3 consecutive total-drift passes");
         assert.equal(session.metadata.foldDriftStreak, 3);
-        assert.equal(logs.filter((l) => l.msg.includes("compression substrate appears destroyed")).length, 1,
+        assert.equal(logs.filter((l) => l.msg.includes("fold epoch confirmation required")).length, 1,
             "#2297: exactly ONE error line per episode");
 
-        // healthy resend of the ORIGINAL bytes: missing=0 → noop, and the
-        // streak reset clears the latch — the upgrade-in-place recovery path.
+        // healthy resend of the ORIGINAL bytes: everything present → fully
+        // clean pass ("resend"), and the streak reset clears the latch — the
+        // upgrade-in-place recovery path.
         const healthy = reconcileFoldCoverage(session, originals, opts(log));
-        assert.equal(healthy.kind, "noop");
+        assert.equal(healthy.kind, "resend");
         assert.ok(session.metadata.foldDriftEscalated === undefined, "latch cleared on recovery");
         assert.ok(session.metadata.foldDriftStreak === undefined, "streak cleared on recovery");
 
-        // Escalation reaped the destroyed block (#2695 zombie-carrier reap) —
-        // so after the latch clears the ledger is a CLEAN SLATE, not a repair
-        // target: nothing is covered, nothing missing, and the next fold
-        // cycle starts fresh. That is the upgrade-in-place contract: a
-        // v0.1.192→v0.1.196 upgrade with a latched ledger heals instead of
-        // dead-looping the doomed preflight.
-        assert.equal((session.state.blocks as unknown[]).length, 0, "destroyed substrate reaped at escalation");
+        // #4260 superseded the #2695 clean-slate contract: escalation no
+        // longer reaps — the fold snapshot is RETAINED while the ledger heals
+        // (nothing is deleted, nothing is silently reset), so after the latch
+        // clears the session keeps its block and the next id churn re-anchors
+        // against it instead of starting from scratch. That is the
+        // upgrade-in-place contract: a v0.1.192→v0.1.196 upgrade with a
+        // latched ledger heals instead of dead-looping the doomed preflight.
+        assert.equal((session.state.blocks as unknown[]).length, 1, "#4260: destroyed substrate retained while epoch confirmation pending");
         const r = reconcileFoldCoverage(session, remint(originals, "g9"), opts(log));
-        assert.equal(r.kind, "noop", "clean slate — the lane lives, folds rebuild on the next compress cycle");
+        assert.equal(r.kind, "reanchored", "retained snapshot re-anchors the id re-mint positionally");
     });
 });

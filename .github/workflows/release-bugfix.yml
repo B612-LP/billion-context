@@ -21,8 +21,10 @@ name: Bugfix Release (carve-out)
 # deliberately does not match it, so merging the PR cannot double-publish the
 # post-merge master through the normal channel.
 #
-# Emergency fallback: manual workflow_dispatch against an explicitly chosen ref
-# (a human picks the exact ref in the Actions UI; every guard below still runs).
+# NOTE 2026-10-25: the workflow_dispatch trigger was REMOVED after a concurrent
+# agent session abused manual dispatch to publish v0.1.208 outside the intended
+# flow (see #4718). The ONLY ignition shape left is a HUMAN merging the
+# carve-out PR below.
 #
 # Guarded so it can never:
 #   - move `latest` backwards (target must be strictly newer than npm latest);
@@ -39,9 +41,6 @@ on:
   pull_request:
     types: [closed]
     branches: [master]
-  workflow_dispatch:
-    inputs: {}
-
 concurrency:
   group: bugfix-release
   cancel-in-progress: false
@@ -170,7 +169,11 @@ jobs:
         # head sha (path-filtered pull_request triggers) — dispatch only what
         # has no run there (idempotent); the Full CI gate after the pre-flight
         # blocks publish until green.
-        if: steps.resolve.outputs.proceed == 'true'
+        # EMERGENCY fast mode (owner 2026-10-17): dispatch is already a
+        # human-picked ref; with fast=true the human explicitly owns skipping
+        # this lane matrix — version guards and the build sanity below still
+        # run.
+        if: steps.resolve.outputs.proceed == 'true' && inputs.fast != true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -180,9 +183,9 @@ jobs:
           export GITHUB_REF_NAME="${{ steps.resolve.outputs.branch }}"
           node scripts/release-ci-gate.mjs --dispatch
 
-      - name: Pre-flight gate
+      - name: Pre-flight gate (full suite)
         # keep the claude-native live e2e subtests in this pre-publish gate (#1248)
-        if: steps.resolve.outputs.proceed == 'true'
+        if: steps.resolve.outputs.proceed == 'true' && inputs.fast != true
         env:
           ACP_TEST_CLAUDE_NATIVE: "1"
         run: |
@@ -191,12 +194,23 @@ jobs:
           npm test
           npm run build
 
+      - name: Pre-flight gate (fast mode — build sanity only)
+        # EMERGENCY fast mode: keep the cheap sanity (install/typecheck/build)
+        # so a broken tree still fails loudly, but skip the full npm test —
+        # the lane matrix above was skipped by explicit human choice.
+        if: steps.resolve.outputs.proceed == 'true' && inputs.fast == true
+        run: |
+          echo "::warning::FAST MODE — full CI lanes and the full npm test were SKIPPED by an explicit human choice (workflow_dispatch fast=true). Publish sanity = version guards + npm ci + typecheck + build only."
+          npm ci
+          npm run typecheck
+          npm run build
+
       - name: Full CI gate (all lanes green at this sha)
         # Hard precondition for publish: lanes dispatched above (plus the PR's
         # own lane runs at the head sha) ran in parallel with the pre-flight;
         # wait them out now. Any red lane or timeout ⇒ release fails, nothing
         # is published.
-        if: steps.resolve.outputs.proceed == 'true'
+        if: steps.resolve.outputs.proceed == 'true' && inputs.fast != true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           CI_GATE_TIMEOUT_MIN: "60"

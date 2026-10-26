@@ -53,7 +53,7 @@ Fetch once at plugin startup.
 }
 ```
 
-Register the tools natively with your agent, in whichever wire format your agent speaks — register exactly what `toolNames` lists. `acp_rule` is advertised only when the proxy's config enables it (`compress.rules: true`, opt-in). Calling a tool that is known but disabled answers `200` with an explanatory `result` instead of an error (#1192). If `protocolVersion` is higher than you know, still register the tools — extra fields in schemas are ignored by agents.
+Register the tools natively with your agent, in whichever wire format your agent speaks — register exactly what `toolNames` lists. `absorb` appears only when the proxy's config enables it; `acp_rule` is advertised only when the proxy's config enables it (`compress.rules: true`, opt-in). Calling a tool that is known but disabled answers `200` with an explanatory `result` instead of an error (#1192). If `protocolVersion` is higher than you know, still register the tools — extra fields in schemas are ignored by agents.
 
 ### 2. Request headers
 
@@ -65,6 +65,8 @@ On **every model request** the plugin sends:
 - `x-bili-plugin-instructions-mutable: 1` (optional; send only if true) — declares that your conversation ids are **persona-scoped**: one id per persona, and the request's system/instructions text may change mid-conversation without changing the persona (e.g. opencode re-renders AGENTS.md into `instructions` on every edit). The proxy now keys plugin conversation ids verbatim by default (#1106), so this flag is vestigial for current proxies — keep stamping it for compatibility with older proxy versions, which use it to stop mixing the instructions text into the compression-namespace fingerprint.
 
 - `x-bili-plugin-agent: main` (optional) — vetoes side-request demotion for this one request. Requests are otherwise demoted to the verbatim side lane when they look like auxiliary traffic (#388: small `max_tokens`, or a known side persona such as opencode's title generator). A full main turn that re-sends the conversation can still trip those heuristics; stamping `main` keeps it on the kernel path so it captures history, stays compressible and remains forkable. Any other value declares the side persona id itself (it is then matched against the known side-request persona set, not treated as `main`).
+
+Every proxied 2xx response carries `x-bili-session: <server-side session id>` (#4082) — the id the proxy itself keys this conversation by. A client that keeps its own conversation object may store it from any response and send it back as `x-bili-plugin-conversation` on later requests (retries, model switches, resends after resume), keeping identity stable even when the request is driven from an execution context the plugin cannot attribute. The dsh bridge does this automatically in-process (it learns the mapping while attribution works and re-stamps when it breaks); other hosts may adopt the header directly.
 
 Effects on the proxy for that session:
 
@@ -98,7 +100,7 @@ Notes:
 - Execution happens **under the session lock**, against the same view the model was shown on the last request (refs match what the model sees).
 - Optional `expectedRevision` is the opaque `parentRevision` from a snapshot. It requires an explicit `conversationId` and is checked under the same session lock immediately before execution. A stale revision returns `409 PARENT_REVISION_CONFLICT` without executing the tool. This also avoids witness routing to another conversation. Existing callers omitting it retain their routing and execution behavior.
 - `compress` mutates state. Inline `decompress` marks a block restored for re-folding; range restores queue content for the next request. Successful restores also update the estimated context footprint. `search_context` / `acp_status` are read-only.
-- Errors: `400` invalid JSON / missing `conversationId` / unknown tool, `404` unknown conversation (no model request has arrived with that conversation id yet), `500` execution failure. A **known but disabled** opt-in tool (`acp_rule`) is not an error: it answers `200` with `ok: true` and a `result` explaining that the feature is off on this proxy (#1192).
+- Errors: `400` invalid JSON / missing `conversationId` / unknown tool, `404` unknown conversation (no model request has arrived with that conversation id yet), `500` execution failure. A **known but disabled** opt-in tool (`absorb` / `acp_rule`) is not an error: it answers `200` with `ok: true` and a `result` explaining that the feature is off on this proxy (#1192).
 
 ### 4. `GET /__bili/plugin/status?conversationId=<id>`
 
