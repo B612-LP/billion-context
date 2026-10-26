@@ -106,10 +106,20 @@ export function maskUrlForLog(url: string): string {
     return `${u.protocol}//${host}${u.pathname}`;
 }
 
-/** Mask every http(s) URL embedded anywhere in an arbitrary string (request
- *  paths like /bili/http://relay.internal/v1/..., error text). */
+// #4191: find ANY scheme://… URL embedded in free text, not just http(s).
+// maskUrlForLog already strips userinfo/query/hash via new URL for every
+// scheme, but the entry regex had to actually LET non-http schemes through —
+// socks5://user:pass@host (self-relay forwarding addresses), ws/wss, ftp etc.
+// carried their inline credentials verbatim into logs / diagnostics / publish
+// blobs. No leading \b on purpose: a word-char-glued URL (xhttps://…) must
+// stay masked exactly as before; over-matching is safe, under-matching leaks.
+const EMBEDDED_URL_RE = /[a-z][a-z0-9+.-]*:\/\/[^\s"'<>]+/gi;
+
+/** Mask every scheme://… URL embedded anywhere in an arbitrary string
+ *  (request paths like /bili/http://relay.internal/v1/..., error text,
+ *  socks5://user:pass@host forwarding addresses — #4191). */
 export function maskUrlsInText(text: string): string {
-    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => maskUrlForLog(m));
+    return text.replace(EMBEDDED_URL_RE, (m) => maskUrlForLog(m));
 }
 
 /** #3811: publish-path URL masking for artifacts that land in a PUBLIC GitHub
@@ -130,12 +140,12 @@ function maskUrlForPublish(url: string): string {
     return `${u.protocol}//${host}${u.pathname}`;
 }
 
-/** #3811: mask the host of every http(s) URL embedded in an arbitrary string,
- *  unconditionally (see maskUrlForPublish). Catches URLs wherever they appear
- *  in serialized text — object values AND object keys (the providers table
- *  uses upstream URLs as keys). */
+/** #3811: mask the host of every scheme://… URL embedded in an arbitrary string,
+ *  unconditionally (see maskUrlForPublish; any scheme since #4191). Catches URLs
+ *  wherever they appear in serialized text — object values AND object keys (the
+ *  providers table uses upstream URLs as keys). */
 export function maskUrlsForPublish(text: string): string {
-    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => maskUrlForPublish(m));
+    return text.replace(EMBEDDED_URL_RE, (m) => maskUrlForPublish(m));
 }
 
 function escapeRegExp(s: string): string {
@@ -146,17 +156,32 @@ function escapeRegExp(s: string): string {
  *  publish-boundary text, rewriting it to `~` (the shell universal for $HOME).
  *  This is the identity leak #3959 proved in the wild — a public diagnostics
  *  report naming /home/<user>/... hands a stranger the reporter's username and
- *  home layout. Only THIS machine's os.homedir() is rewritten, as an ANCHORED
- *  match on BOTH flanks: preceded by start-of-string or a non-token boundary
- *  (whitespace / quote / bracket / colon / equals) AND followed by a path
- *  separator (/ or \), a quote, whitespace or end-of-string — so sibling homes
- *  (/home/<other>), URL hosts and URL pathnames are all left alone. The result
- *  stays actionable: ~/.cache/billion-context/... is exactly where the user
- *  looks to recover. Idempotent (~ has no homedir in it). */
+ *  home layout. Every spelling of THIS machine's home root is rewritten —
+ *  os.homedir() plus the $HOME and %USERPROFILE% env values (on Windows they
+ *  diverge: os.homedir() reads USERPROFILE while git-bash-style tool output
+ *  carries $HOME paths, so masking only one leaks the other; POSIX values
+ *  dedupe to one root) — each as an ANCHORED match on BOTH flanks: preceded by
+ *  start-of-string or a non-token boundary (whitespace / quote / bracket /
+ *  colon / equals) AND followed by a path separator (/ or \), a quote,
+ *  whitespace or end-of-string — so sibling homes (/home/<other>), URL hosts
+ *  and URL pathnames are all left alone. The result stays actionable:
+ *  ~/.cache/billion-context/... is exactly where the user looks to recover.
+ *  Idempotent (~ has no homedir in it). */
+function publishHomeRoots(): string[] {
+    const roots = new Set<string>();
+    for (const raw of [os.homedir(), process.env.HOME, process.env.USERPROFILE]) {
+        if (typeof raw !== "string") continue;
+        const r = raw.replace(/[/\\]+$/, "");
+        if (r) roots.add(r);
+    }
+    return [...roots].sort((a, b) => b.length - a.length);
+}
+
 export function maskPathsForPublish(text: string): string {
-    const home = os.homedir();
-    if (!text || !home) return text;
-    const re = new RegExp("(?<![/\\w.\\-])" + escapeRegExp(home) + "(?=[/\\\\\"'\\s]|$)", "g");
+    if (!text) return text;
+    const roots = publishHomeRoots();
+    if (roots.length === 0) return text;
+    const re = new RegExp("(?<![/\\w.\\-])(" + roots.map(escapeRegExp).join("|") + ")(?=[/\\\\\"'\\s]|$)", "g");
     return text.replace(re, "~");
 }
 
@@ -196,10 +221,11 @@ export function maskUrlForDiagnostics(url: string): string {
 }
 
 /** Text-level twin of maskUrlForDiagnostics (#3651): masks every embedded
- *  http(s) URL with the loopback-exempt rule; unparseable fragments pass
- *  through (the IP scrubber neutralizes bare IP literals separately). */
+ *  scheme://… URL with the loopback-exempt rule (any scheme since #4191);
+ *  unparseable fragments pass through (the IP scrubber neutralizes bare IP
+ *  literals separately). */
 export function maskUrlsForDiagnostics(text: string): string {
-    return text.replace(/https?:\/\/[^\s"'<>]+/gi, (m) => {
+    return text.replace(EMBEDDED_URL_RE, (m) => {
         try {
             void new URL(m);
             return maskUrlForDiagnostics(m);
@@ -262,6 +288,27 @@ function isIpv4Literal(s: string): boolean {
 
 function isLoopbackIp(ip: string): boolean {
     return ip === "::1" || ip === "0:0:0:0:0:0:0:1" || ip === "0.0.0.0" || ip.startsWith("127.");
+}
+
+/** #4254: is this a loopback host name/address? Loopback identifies a LOCAL
+ *  relay/endpoint, never an external party, so the diagnostic DISPLAY path
+ *  renders it verbatim (matching maskUrlForDiagnostics / maskIpsInText's
+ *  exemption) instead of masking it. Bracketed IPv6 and letter-case normalize. */
+export function isLoopbackHost(host: string): boolean {
+    const h = host.replace(/^\[|\]$/g, "").toLowerCase();
+    return h === "localhost" || isLoopbackIp(h);
+}
+
+/** #4254: display form of a `host[:port]` target under the LOOPBACK-EXEMPT rule —
+ *  the user-facing counterpart of maskHostPortForLog. Loopback renders verbatim
+ *  (so "127.0.0.1:7864" stays readable and actionable); any other non-public host
+ *  is masked with its port kept. Used by the upstream-failure egress path so one
+ *  message never mixes a raw loopback next to a masked <private-host>. */
+export function maskHostPortForDisplay(target: string): string {
+    const i = target.lastIndexOf(":");
+    if (i <= 0) return isLoopbackHost(target) ? target : maskHostForLog(target);
+    const host = target.slice(0, i);
+    return `${isLoopbackHost(host) ? host : maskHostForLog(host)}${target.slice(i)}`;
 }
 
 /**

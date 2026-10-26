@@ -5,7 +5,38 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 ## [Unreleased]
 
+### Fixed
+- 块区间边界在重存时不再回退:折叠后客户端重发的视图不含已覆盖原文,重入库时该批次无法重新解析区间(-1/-1),旧逻辑会把已解析的真实区间抹掉。现在区间证据一旦解析即持久(入库 `CASE` 保留;sqlite/mysql 双后端),未知块保持诚实缺口(#4608)。
+
 ### Added
+
+### D5-5 — 渲染源窗口化 + 判官 tailStart 视图域修复
+
+- **渲染分窗(storage-review D5-5)**:`buildView` 不再全表加载正史行(数万行 × 每行媒体水合 = 每请求读放大)。新两层查询:`messageIdRows`(seq+msg_id 列,无字节,全行,驱动块锡定+接缝链)+ `uncoveredRows`(仅覆盖区间外的行取字节+媒体;covered 字节永不读——covered 行腐败不再导致渲染降级)。块锡定从字节匹配改 `msg_id` 列匹配零语义变化;两查询间隙新行的竞态→一次全量回退兼音。`unifiedTailViewRows` 保留为回退路径。
+- **判官 tailStart 视图域(#4241 回归修复)**:`snapshotRenderTailStart` 原记客户端域下标(clientJoin),但判官用它索引 `judgeBaseline`(渲染视图)——视图前缀压缩后 clientJoin 可指向视图末尾之外→判官空转(total=0 空转 clean,T1 合车后把 #4241 牙齿测试打红)。改记视图域(视图行数 − 尾巴数)。牙齿测试同步改注尾巴行(引擎尾随 nudge 占末位,最后一条尾巴在 exitCores.length − 2):渲染前缀豁免是设计内(#4241:跨轮前缀稳定归 seamLcp/shadow),尾巴行丢失必须开火。
+
+### #4316 层 3 PR3/3 — 存量编号一次性对齐正史 + fork 克隆保号
+
+- **kernel `restampRefsToLedger`**:把既有引用空间一次性重排到正史账本(ref = store 行 seq + 1)。计数器路径按到达顺序发号但受保护消息不占号,而行 seq 照发 → 两者天然漂移;编辑与 churn 拉大缺口。重排后引用空间与存储真值一致,churn 不再改写编号。诚实边界:无映射 id 留给 assignRefs 的章路径;BLOCKED 仍不占号;死 ref 保留;被夺号的无行引用重安居新号(id 永不复用契约不破);多代(同 id 多行编辑)id 由 `seqByRaw` 排除不误绑。`CompressionState.refLedgerAligned` 标记一次性(`state-hydration` 字段单一事实源自动持久化)。
+- **挂点=服务触达(getSession)非 loadSync**:loadSync 保持纯对等视图(corpus manifest 摘要钉死不动);`getSession` 双路径(内存命中/盘重载)首次触达触发对齐——同进程重启边界语义不变(新进程无 in-flight compress,半重排映射不可见)。
+- **superseded 守卫**:重排换手的旧 ref → rawId 映射记在 `Session.restampSuperseded`(进程生命周期);重发 in-flight compress 调用引用旧号 → 诚实拒绝(绝不静默折错段),提示重读 acp_status 后重发。拒绝安全不会错折,一次性代价后消失。
+- **fork 克隆保号**:`cloneSessionRows`(store+mysql 双后端)把父会话行整段复制到子(session,seq) 保号 + lineage 列(parentSessionId/forkPointSeq 真值)+content/media CAS refcount 提升 + 幂等重放;子 append 自然从父 maxSeq+1(remapPlanToAbsolute)。fork 端点接线,存储不可用降级=kernel-only 克隆(现行为)。
+- **验收桩**:kernel 4 测(BLOCKED 偏移重排/交换原子性/无行引用保留+被夺号重安居+死 ref 不动/已对齐幂等)+host 4 测(整段克隆保号+lineage+幂等+子续号/部分分支/superseded 拒绝+当前号通过/冷加载纯视图+服务触达对齐一次+二次幂等)。
+
+### 面板内置博客与长文(#4587)
+
+- **`/__bili/blog` JSON feed + `/__bili/blog-assets/*` 图片路由**:随 npm 包内置的 markdown(website/blog/posts/*.md + website/articles.json 清单列出的仓库长文,paper 中英文)由服务端 `web/markdown.ts`(转义优先、XSS-safe)渲染进面板自己的「博客 Blog」页——卡片列表点展正文,双语随面板语言切换,离线可读;`web/markdown.ts` 顺带支持了图片引用(http(s)/面板资产路由以外的一律丢弃)和 GFM 管道表格(复用 .data 表格样式)。图片路由带穿越/编码/扩展名三重门。内容随自更新前进,GitHub Pages(#4561)仍是永远最新的完整文库。零新配置键/env/磁盘缓存。
+
+### 修复 master 回归(搭乘)
+
+- **#4525 合并把 `sidScope` 改名 `dispatchScope` 漏改一处**:dsh fork-blind-spot 日志(C10b,#4215)仍读旧名 → master tsc 红(`TS2304: Cannot find name 'sidScope'`,dsh-native.ts:1287,CI run 40093629255 failure 同因)。修复=读 `dispatchScope.getStore()` 并按 `{sid,msgIds}` 形状取 `.sid`,语义不变(作用域归因活跃判定)。
+
+### 折叠记账迁正史 seq 区间(#4316 层3 PR2/3)
+
+- **kernel 双轨覆盖**:CompressionBlock 增 `startSeq`/`endSeq`(可选,仅当折叠范围全部带章且区间精确才记录,任一无章/有洞=不记——never guess);prune 的 rebuildMessages 在 id 覆盖判定后加区间判定 `isCoveredBySeq`(带章消息落任意活跃块区间即压制原件,与 id churn 解耦);syncBlocks 块活性判定加第三析取项 `blockSeqPresent`(块有界+任一在场消息带章落区间=块仍活着,防 id 重铸引发 deactivate)。
+- **章的传输与重钉**:插件车道 canonical 行带 `ledgerSeq`(store 0 基→显示 1 基)经 `biliLedgerSeqs` 平行数组随 turn body 传输(与 biliMsgIds 同位,校验严格、拒绝降级不上游泄漏);prepare-anthropic 与 msgid pin 同位重钉(章只进内核态,不改 wire 格式);lane 侧 assembly 对本 turn 未落库尾部按 maxSeq+1 递增投影;`recordCanonicalPointers` 每 wrap-up 回写行章。
+- **行身份免疫章**:`identityInputOf` 剥除清单加 `ledgerSeq`(服务端晚加的位置章非逻辑内容,不参与行身份哈希——否则每轮带章重入库整段换血)。
+- **验收桩**:kernel 侧 4 测(盖章折叠记区间+id churn 后按区间压制/对照无章丢覆盖=snapshot 现状文档化;sync 盖章 churn 视图保块活性;部分盖章不记界;相邻联合区间精确+空洞不记录);lane 侧端到端 1 测(12 消息 lane 折叠→store `start_seq`/`end_seq` 落真值+payload 区间章+出站压制原件+首用户钉存活+摘要乘 #1567 载体回显)。
 
 ### 判官渲染基准(#4241)
 
@@ -66,6 +97,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 - dsh 归因丢失协商回退(#4082/#3918/#2975):宿主重试/切模型/睡眠恢复的请求脱离 agent 执行链,归因为空时此前直接裸发上游(无压缩无护栏,且会话永久失守)。现在 shim 在归因正常时学习「车道 → 会话 + 边界指纹」(该次请求最后一条消息),归因丢失时若请求历史包含某已知边界且唯一命中,则由 takeover 门认领并原子补盖 x-bili-plugin-conversation(#3370 纪律),请求照常走插件车道;fork 从中间分叉不含边界 → 不认,行为与今天逐字节一致;无证据/多义 → 维持直发。每个 2xx 响应新增 x-bili-session 头(协议级,配合客户端可自持身份,见 PLUGIN.md);认领事件进 client 日志可见。
 ### 压缩
 
+- **过小的陈旧 usage 样本不再冻结计量(#4383)**:同一会话 id 下的小而真实的 usage-grade 样本(标题生成/探测等侧车请求)被 settleUsageReport 无条件写进 lastUsageGradeTokens,所有输入基线读者(statusInputBaseline / effectiveTokenCount)原样信任——kernel 的 growth reference 是低水位标记(#1595)会跟到该值,growth ≡0、压力带失效,自动折叠整段停摆(复现:一次 4733-token 样本把 303k 上下文冻在 usage=1% 达 4h07m,154 次 nudge 全部 idle、零折叠;换模型前重启也不愈合)。现在两个共享读者都走同一个 stale-small 守卫:锚点低于当前出站 billing-caliber 本地估算(contextEstimateTokens)的 25%、且已被其后的一次主发送超越(contextTokensSource="estimate"——主发送逐次盖章、settle 翻回 "usage")时,降级为该估算值——即 #1595 书面承诺的"改用本地估算"兜底。新鲜度闸门区分"陈旧侧车样本"与"新鲜小样本"(后者保持权威,#1820 B 不变量有测试钉死);高于估算的锚点保持 #1839 优先(单向);无估算/无新鲜度戳的旧会话行为逐字节不变。preflight 本就自校正(max(baselineFloor, calibratedPayload)),不受影响;kernel 未动,无新增配置。
 - **压缩区间跨越受保护消息时在边界截断,不再挖洞(#3953)**:此前模型选的区间如果中途扫过受保护消息(最近 N 条/最近一条用户消息),受保护消息会被从覆盖名单里挖掉、两侧照折——其回复(在受保护提问之后的消息)被摘要盖住,而摘要锚点落在提问之前,模型看到"答案摘要排在自己的问题上方"。现在区间在首个受保护消息处截断:从该位置起(受保护消息与其后的回复)全部保持可见,因果序不再被打穿。受保护消息恰在区间尾部的常规擦边(咨询式保护区原本设计的形状)行为逐字节不变;截断会清空区间或会劈开工具调用/结果对的形状退回原挖洞语义(吸收保护的吸收对不受影响)。
 - **compress-from-store：被逐出的会话对着统一存储的原始视图折叠，不再永久拒收（#3982，根治 #3918 Phase 4）**：超过常驻池预算（默认 512 MiB）的大会话每次模型请求后都被逐出，活内存视图永不存活，`compress` 工具因此永久 REFUSED——而统一存储（#3911）本就每次保存把完整原始客户端视图镜像进 messages 表。现在 applyRanges 与外部摘要链在"有效视图为空"时先从统一正史恢复视图（只读、只窥探——绝不隐式建库；任一行不可解析维持诚实拒收），折叠落在持久化 state 上，与"下一轮模型请求后重试"路径完全同构。活视图在场时存储从不被咨询（零行为变化）；无存储/legacy 模式拒收回执逐字节不变。
 
@@ -117,6 +149,7 @@ Versions follow the merge of a `*_release-v*` branch; CI publishes to npm on tag
 
 - **bili-authored dsh client compaction: the #1729 guard can now ANSWER instead of refuse (#3733, fixes #3723's growth loop).** dsh's own compaction was refused locally since #1729 because a landed dsh checkpoint durably shadows the raw history; post-#3644 that substrate concern is gone (the server snapshot is the base), but a native checkpoint is still a foreign summary and — worse — with the refusal standing, dsh's context gauge only grows while its session file balloons unboundedly (#3723: a 39.7 MB / 9001-message file choked the desktop UI). With `BILI_DSH_AUTHORED_COMPACTION=1` (env-only rollout window, read per-request), when the guard fires AND the session holds an active fold block, bili answers the compaction summarize call LOCALLY — zero egress, the autoModeForge discipline — with OUR folded snapshot as the payload: one identity header line `<bili-snapshot v1 conv="…" seq="…" blocks="…" />` plus every active block's summary in the kernel render format. dsh records that as its checkpoint, so the client file shrinks while the recorded content is byte-identical to what the upstream already reads — client display, model context and server state finally agree. The identity tag rides in the message text, so replay recognition is declarative (`carriesBiliSnapshotCheckpoint`, the #2621 carrier+novelty discipline): the #2432 rebase handles the landing exactly like a foreign checkpoint but records `dshAuthoredCheckpointLanded` and logs info instead of warn. Precedence: an explicit `allowDshCompaction` (forward natively) still wins; no active blocks → falls through to the same 422; the passthrough-lane guard (no session) is untouched. Originals stay recoverable via CCR/export/fork; `dshCompactionRefusedBytes` keeps recording the raw-ledger high-water on authored answers too, so the #2490 output-clamp regimes keep planning against the raw scale.
 - **存储收尾六修+缺省模式翻 full（#3818，修复 #3135）**：`storage.unified` 缺省从 shadow 翻为 full——shadow 干跑自 #2815 起对账干净，索引成为默认加载路径；JSON 信封照写，legacy 仍是一行逃生口。同车修六项：①writerOff 存档在边车 3-strike 自禁用的当拍立即补写 JSON 信封（消除「两边都没有」窗口）；②BILI_PERSIST=0/持久化关闭视为有意退出（banner 不再假报降级）；③存档印章改为实例真实印章（边车开不了/自禁用→盖 legacy，不再把请求模式盖到只存在 JSON 上的记录上）；④verifyDrift 计数上 /__bili/status wire，漂移会话回退信封供数直到下次采样干净；⑤自举缓存损坏（Node 大版本升级等）从「警告并永不再试」改为删缓存重下一次钉死下载（sha512 保证重试安全）；⑥有界 boot 并入纯索引会话（jsonWriter=off 用户的会话重启后可枚举；并入仍受 maxSessions+解码字节双预算约束，预算口径=序列化记录字节，与文件路径 #2803 同律）。加保：索引无法忠实表达的记录（blockContents 带孤儿 id、state.blocks 无对应块——手搓档案/web seeds 形状）跳过镜像与 viewFor 重建，永远从 JSON 信封供数（orphanSkips 计数可见）——修掉该形状首载后 contents 静默丢失。真实 #2695 收割形状（块从 state.blocks 移除、原文保留给 decompress 兜底）同样命中该守卫并被钉为『永不入索引』语义；writerOff 下该形状触发安全阀强制落一份 JSON 信封（索引跳过+无文件=零副本死亡的窗口不存在）。
+- **`bili claude` stops leaking a proxy and a CA into the child it spawns.** The claude lane routes over a plain http loopback URL (`ANTHROPIC_BASE_URL` → `/bili/…`), so there is no TLS hop for a proxy to tunnel and no certificate for `NODE_EXTRA_CA_CERTS` to vouch for. What the bili-owned `HTTPS_PROXY` did there depended on the client build — older ones ignored it, Claude Code ≥ 2.1.301 honours it and the `/bili/` leg self-tunnelled (#3446) — and in every case the variable was inherited by each process the child spawned, so in-session `curl`/`git`/`npm` issued CONNECT through bili's MITM, logging CONNECT destinations the compression pipeline never sees. Both are gone from the claude env; a user's own proxy variables now ride through untouched, and a child that has none of its own is handed the proxy THIS instance resolves for auxiliary egress (file-config `upstreamProxy`, or the shell proxy the launcher forwards as `BILI_INHERITED_*`) via a new `auxProxy` field on `/__bili/health` — so egress survives without bili sitting in the child's path. Keeping the `/bili/` leg direct when the child DOES carry a proxy is the `NO_PROXY` loopback merge in `buildClientEnv` (#3446), which holds whatever proxy the child brings. **Attaching to a proxy instance started by an older build** reports no `auxProxy`, and then nothing is handed over rather than guessing — restart the proxy on this build if your only proxy comes from the config file.
 
 - **WS 摘图门收窄到真 WebSocket 传输（#3701 Finding 1）**：`network.wsOutboundBytes` 的发送前摘图门原先对「任何受管自定义传输」生效——dsh-inline 的受管 HTTP fetch 也被卷入，超 10 MiB 的 HTTP 请求会被无谓摘图（同一载荷走 HTTP 曾观测 16 MiB 正常送达，从无 1009 门限）。现在门只认 `markWsLaneTransport` 打标的 Responses-WS 传输（responses-ws.ts）；文档「仅 WS 车道生效」的表述自此为真。回归钉：受管 HTTP 传输形状原样透传、零摘图。
 
