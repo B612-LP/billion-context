@@ -2271,7 +2271,9 @@ export async function forceInstallVersion(
         if (result.ok) {
             const channel = installSource ?? `advisory:${advisoryId}`;
             await persistLastInstall(diskUnderLock ?? opts.currentVersion, targetVersion, channel);
-            loggerLog("info", `[update] ${channel}: installed ${diskUnderLock ?? opts.currentVersion} → ${targetVersion}. Restart to finish.`);
+            // Advisory callers keep their pre-existing log wording exactly (#4791 review); only explicit sources get the channel label.
+            const logLabel = installSource ? channel : `advisory ${advisoryId}`;
+            loggerLog("info", `[update] ${logLabel}: installed ${diskUnderLock ?? opts.currentVersion} → ${targetVersion}. Restart to finish.`);
             await runProfileBundlesRefresh(targetVersion, loggerLog);
             await refreshDshDesktopCopy(targetVersion, loggerLog, process.env, opts.resolveProxy);
             notifyStaleInstall(opts, targetVersion);
