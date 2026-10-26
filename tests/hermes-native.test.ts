@@ -677,6 +677,7 @@ elif SCENARIO == "spawn-clobber":
     mod.register(ctx)
     out["spawn_mode"] = mod._state.get("mode")
     out["spawn_origin"] = mod._state.get("origin")
+    out["spawn_instance_id"] = mod._state.get("instance_id")
 elif SCENARIO == "registry-find":
     # #4656 acceptance criteria for _find_spawned_in_registry: accept ONLY our child's own pid
     # with a live origin; never a live foreign instance (its own launchToken) nor a stale marker
@@ -770,6 +771,7 @@ interface DriverOut {
     command_results?: Array<{ session: string; panel: string; cache: string }>;
     spawn_mode?: string | null;
     spawn_origin?: string | null;
+    spawn_instance_id?: string | null;
     rf_own?: string | null;
     rf_foreign?: unknown;
     rf_dead?: unknown;
@@ -1128,6 +1130,7 @@ describe("python plugin runtime (subprocess)", () => {
         assert.ok(out, err);
         assert.equal(out!.spawn_mode, "spawn", "own healthy child adopted despite the clobbered shared pointer");
         assert.equal(out!.spawn_origin, out!.origin, "adopted origin is the child's self-registered origin");
+        assert.equal(out!.spawn_instance_id, "drv-spawn", "registry adoption records the adopted instance's id (#4656)");
         assert.deepEqual(out!.tools_registered, ["acp_status", "compress", "decompress"], "plugin became active, not inert");
         assert.equal(out!.marker_left, false, "starting marker cleaned up");
     });

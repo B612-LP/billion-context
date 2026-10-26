@@ -1014,7 +1014,7 @@ def ensure_origin(sidecar: Dict[str, str]) -> Optional[str]:
                 return inst["origin"]
             mine = _find_spawned_in_registry(child.pid)
             if mine and probe_proxy(mine["origin"]):
-                _state.update(origin=mine["origin"], mode="spawn")
+                _state.update(origin=mine["origin"], mode="spawn", instance_id=mine["instance_id"])
                 return mine["origin"]
             if child.poll() is not None:
                 logger.warning("billion-context: proxy child exited before becoming healthy "
