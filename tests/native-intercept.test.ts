@@ -1846,3 +1846,30 @@ test("#4566: rewrite retry after a transient blip drops the stale hop too", asyn
     assert.equal(sink.length, 2, "failed first send + successful retry");
     for (const c of sink) assert.ok(!("proxy" in (c.init ?? {})), `stale hop must not ride ${c.url}`);
 });
+
+// #3617 gate-direction completion for #4566: the loopback strip gate also has
+// a keep direction (a hop must RIDE when the final target is NOT loopback —
+// remote bili instances, e.g. container networking), and the dsh-compaction
+// divert site carries the same strip as the other loopback sites.
+
+test("#4566 negative: a non-loopback bili origin keeps the host's own hop", async () => {
+    const state: NativeInterceptState = { origin: "http://bili-host.example:41006", ready: Promise.resolve("http://bili-host.example:41006") };
+    const hop: HopInit = { method: "POST", proxy: "http://corp-proxy.example:3128" };
+    const { sink } = await withHopPatch(state, async (fetch) => {
+        const res = await fetch("https://api.anthropic.com/v1/messages", hop);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink.map((c) => c.url), ["http://bili-host.example:41006/bili/https://api.anthropic.com/v1/messages"]);
+    assert.equal(sink[0].init?.proxy, "http://corp-proxy.example:3128", "only loopback targets are hopless — a remote bili origin keeps the host's proxy posture");
+});
+
+test("#4566: dsh-compaction divert drops the stale hop like the other loopback sites", async () => {
+    const state: NativeInterceptState = { origin: "http://127.0.0.1:41007", ready: Promise.resolve("http://127.0.0.1:41007"), takeoverGate: () => false };
+    const stale: HopInit = { method: "POST", proxy: "http://127.0.0.1:18788", body: dshCompactionEnvelope() };
+    const { sink } = await withHopPatch(state, async (fetch) => {
+        const res = await fetch("https://api.deepseek.com/v1/chat/completions", stale);
+        assert.equal(res.status, 200);
+    });
+    assert.deepEqual(sink.map((c) => c.url), ["http://127.0.0.1:41007/bili/https://api.deepseek.com/v1/chat/completions"]);
+    assert.ok(!("proxy" in (sink[0].init ?? {})), "stale hop must not ride the diverted dispatch");
+});
