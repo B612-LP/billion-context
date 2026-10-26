@@ -169,7 +169,7 @@ export const METADATA_LAST_RESPONSES_MODE = "lastResponsesMode";
  *  ride mutable per-request session state, so a flip between consecutive requests
  *  means the declared tool array changed; tool definitions render BEFORE system +
  *  messages, so that silently invalidates the whole prefix cache (full re-bill). */
-export const METADATA_TOOLSET_FP = "toolsetFp";
+const METADATA_TOOLSET_FP = "toolsetFp";
 /** Anchors are only kept for covered ids; 16k covered messages is far beyond
  *  any folded session, the cap only bounds pathological metadata. */
 const MAX_ANCHORS = 16384;
