@@ -32,7 +32,7 @@ import { resolveBackendName, backendSelectionNotice, selectedBackendRaw, openBac
 import { canonicalize, sha256 } from "./canonical.ts";
 import { recordSidecarInstance, recordSidecarOpenFailure } from "./runtime-status.ts";
 import type { SqliteEngineName, SqliteEngineSource } from "./driver.ts";
-import type { MessageRow } from "./store.js";
+import type { MessageRow, MessageRefContentRow } from "./store.js";
 import type { CoreMessage, MessageContentStore } from "acp-kernel";
 
 export const MAX_CONSECUTIVE_FAILURES = 3;
@@ -745,10 +745,33 @@ export class UnifiedShadow {
      *  coverage matcher needs (msgId for fast path, ref for the
      *  upgrade-tolerant interval path, contentHash for the exact-content
      *  dedup path). */
+    /** #D5-5: identity-only rows (no content bytes) for the render lane. */
+    messageIdRows(sessionId: string): { seq: number; msgId: string }[] {
+        if (this.sync === null) return [];
+        this.assertLive();
+        return this.sync.messageIdRows(sessionId);
+    }
+
+    /** #D5-5: content rows outside the covered intervals only. */
+    uncoveredRows(sessionId: string, intervals: readonly [number, number][]): (MessageRow & { contentHash: string })[] {
+        if (this.sync === null) return [];
+        this.assertLive();
+        return this.sync.uncoveredRows(sessionId, intervals);
+    }
+
     tailViewRows(sessionId: string): MessageRow[] {
         if (this.sync === null) return [];
         this.assertLive();
         return this.sync.getMessages(sessionId);
+    }
+
+    /** #4738: per-ref stored message bodies (sync store only, like
+     *  tailViewRows) — the web preview fallback when host-side native
+     *  compaction pruned the resident window. */
+    messageContentByRefNums(sessionId: string, refNums: readonly number[]): MessageRefContentRow[] {
+        if (this.sync === null || refNums.length === 0) return [];
+        this.assertLive();
+        return this.sync.messageContentByRefNums(sessionId, refNums);
     }
 
     sessionSummaries(): SessionSummaryRow[] {
@@ -762,6 +785,45 @@ export class UnifiedShadow {
         if (this.sync === null) return null;
         this.assertLive();
         return this.sync.getCcr(sessionId);
+    }
+
+    /** #4316 PR3/3: raw id → canonical seq (single-row ids only) for the
+     *  one-time ledger re-stamp. Shadow mode's index may lag files it has
+     *  not re-recorded, so like getCcr this is full-trust only: sync store
+     *  or nothing — a stale map would re-bind citations wrongly. */
+    seqByRaw(sessionId: string): Map<string, number> | null {
+        if (this.sync === null) return null;
+        this.assertLive();
+        return this.sync.seqByRaw(sessionId);
+    }
+
+    /** #4316 PR3/3: live (non-retired) message row count. */
+    liveRowCount(sessionId: string): number {
+        this.assertLive();
+        if (this.sync !== null) return this.sync.liveRowCount(sessionId);
+        return -1;
+    }
+
+    /** #4730: highest live seq — the fork endpoint's inclusive throughSeq
+     *  (NOT count - 1: tombstones keep their seq). Null when the unified
+     *  store is unavailable or the session has no live rows. */
+    lastLiveSeq(sessionId: string): number | null {
+        if (this.sync === null) return null;
+        this.assertLive();
+        return this.sync.lastLiveSeq(sessionId);
+    }
+
+    /** #4316 PR3/3: fork adoption row clone. Works in shadow AND full —
+     *  cloning parent rows the shadow has already mirrored keeps the child
+     *  view self-consistent in both modes; a parent with no rows (never
+     *  mirrored) clones nothing and the fork proceeds kernel-only. */
+    cloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
+        this.assertLive();
+        if (this.sync !== null) {
+            this.sync.cloneSessionRows(parentId, childId, throughSeq);
+            return true;
+        }
+        return false;
     }
 
     /** #2960 R2.2: web list rows (stats/metadata JSON + block aggregates). */

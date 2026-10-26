@@ -136,7 +136,8 @@
 | `native.attachUrl` | string | unset (discover per lane) | BILI_MCP_PROXY | native hook 附着的显式目标源（任意 URL）。设置后，hook 只附着到该精确 origin 而不是自动发现，若其不在线则自行派生；仍需代码兼容并通过生命周期门禁。BILI_MCP_PROXY 环境变量（CLI --origin 亦会设置它）优先于此文件值；空/空白视为未设置。 |
 | `claude.nativePort` | number | unset (lane sticky zone port) | BILI_CLAUDE_NATIVE_PORT | claude 原生车道钩子派生代理的精确端口钉死（严格端口：被占用时响亮拒绝而非跳端口）。 |
 | `pi.subagents` | object \| boolean | {} (acp_delegate enabled with package defaults) | PI_ACP_DELEGATE_FORCE_ENABLE, PI_ACP_DELEGATE_MAX_DEPTH, PI_ACP_DELEGATE_SYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_IDLE_TIMEOUT_MINUTES, PI_ACP_DELEGATE_ASYNC_TIMEOUT_MINUTES, PI_ACP_DELEGATE_MAX_CONCURRENT | 内置 pi lane 子代理（acp_delegate）面（#2230 配置搬家）。billion-context.json 的 pi.subagents 段拥有 delegate 配置；acp.json 四键（delegate/delegatePrompt/displayUsage/debug）为已废弃回退源，仅段缺失时读取。prompt 取代 delegatePrompt；debug 限定子代理子系统。布尔简写 subagents: false 整体关闭。完整字段表见 CONFIGURATION.md 的 pi 段。 |
-| `pi.inline` | boolean | false | BILI_PI_INLINE | pi 内联压缩通道（#3278）：pi 扩展在进程内直接压缩——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务。解析顺序 env > 文件 > 默认(off)：BILI_PI_INLINE=1/true 开启，BILI_PI_INLINE=0/false 显式关闭且优先于本文件值。 |
+| `pi.inline` | boolean | false | BILI_PI_INLINE | pi 内联压缩通道（#3278；需手动开启——#4687 收回 #4571 的默认翻转，默认仍是派生代理）：pi 扩展的压缩在进程内完成——不派生代理进程、无临时端口；模型流量与 /__bili//__acp 工具面由进程内引擎经伪源站服务，codex 的 Responses WebSocket 通道走随引擎启动的仅回环 WS 桥，Web UI 走随引擎启动的仅回环监听。设 true（或 BILI_PI_INLINE=1/on/yes/TRUE）开启。解析顺序 env > 文件；显式开启永远压过附着目标，未设置时行为与旧版一致（attach/spawn）。`bili pi-inline` 一键车道会预置该变量。 |
+| `opencode.inline` | boolean | false | BILI_OPENCODE_INLINE | opencode 内联压缩通道（#3278 移植；需手动开启——按 #4687 决定，默认仍是派生代理）：opencode 插件的压缩在进程内完成——不派生代理进程、无临时端口、无 MITM 证书；模型流量与 /__bili/ 工具面由进程内引擎经伪源站服务（已在 Bun 宿主验证）。设 true（或 BILI_OPENCODE_INLINE=1）开启。解析顺序 env > 文件；显式开启永远压过附着目标，未设置时行为与旧版一致（attach/spawn）。`bili opencode-inline` 一键车道。 |
 
 **MITM 通道**
 
@@ -174,6 +175,7 @@
 | `network.decodedBodyBytes` | number | 10737418240 | BILI_DECODED_BODY_BYTES | content-encoding 解压（gzip/deflate/br/zstd）后的解码字节上限，解码过程中增量检查（decode 阶段 413）。默认为接收预算的 2 倍，沿用旧的 decode=2×wire 关系；用于防解压炸弹。 |
 | `network.outboundBodyBytes` | number | 5368709120 | BILI_OUTBOUND_BODY_BYTES | 转发到上游的重建请求字节上限（forward 阶段 413），按最终 body 字符串的 UTF-8 字节计。在 fetch 之前检查，超预算的重建不会触发上游看门狗分配。 |
 | `network.wsOutboundBytes` | number | 10485760 | BILI_WS_OUTBOUND_BYTES | 仅针对 WebSocket 通道的软字节预算（#3701）：当最终序列化的 Responses WS 帧超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。若帧仍超出限制且上游在任何事件发出前即以 1009 关闭连接，则在同一请求内尝试一次严格更小的重发。设为 0 可禁用裁减（即恢复此前的原样发送行为）。HTTP 通道不受影响——硬性拒绝上限仍为 network.outboundBodyBytes。 |
+| `network.httpOutboundBytes` | number | 10485760 | BILI_HTTP_OUTBOUND_BYTES | 面向普通/代理/pi 原生 HTTP 中继通道的软字节预算（#3909）：当最终序列化的请求超出该预算时，优先从出站副本中裁减较早的图片（归档为占位符备注——原始文件仍保留在会话存储中，可通过 read_original_image / decompress 恢复），随后对剩余内容通过 jimp maxDim 阶梯进行有界降采样。它补上图片密集会话留下的缺口：token 空间折叠按 token 决策，而上游按字节/像素解码 CPU 拒收（Cloudflare Worker 503），于是 ~48 MiB 的请求会永远 503、每次重试都重发同样的像素。仅在未安装受管传输（即 spawn 出来的中继）时生效；WebSocket 通道用 network.wsOutboundBytes，受管 HTTP 传输（inline-engine / dsh-inline）在此从不裁减（#3701 Finding 1）。设为 0 可禁用（恢复此前的原样发送）；硬性拒绝上限仍为 network.outboundBodyBytes。 |
 | `network.caFile` | string | unset | BILI_CA_FILE | PEM 文件路径，包含要额外信任的根 CA（#3776），仅作用于 bili 自己的上游 fetch。与 Node 内置根证书及 NODE_EXTRA_CA_CERTS 中的条目合并——从不替换。安全软件做 HTTPS/加密连接扫描（卡巴斯基、企业 DLP）或企业 MITM 代理重签上游时使用：把该厂商根证书导出为 PEM 并指向此键。未设置 = 默认信任，行为逐字节不变。 |
 | `guardrails` | object | {} (all defaults) | — | 守卫集合：pi/omp 插件的工具输出守卫（#3066）及代理侧流式 text-run 守卫（#3406）。 |
 | `guardrails.bashTimeout` | number | 60 | BILI_GUARDRAIL_BASH_TIMEOUT | 模型未写 timeout 时注入到 bash 工具的秒数（#3066 owner 有意为之，#3366 重申：无人看管的 bash 会把 pi 会话挂死一整天——宿主 schema 本身无默认值）。设 N 调整秒数，设 0 关闭注入（恢复 pi 原生行为）。 |
@@ -289,6 +291,7 @@
 | `compress.reasoningGuard` | object | off | — | gpt-5.x/6.x 推理格截断自动修复（最多 3 轮继续提示）。 |
 | `compress.outputSteering` | object { enabled?, verbosityLevel?, effortRouting? } | enabled false · verbosityLevel 2 | — | 向系统提示词尾部附加简洁度指令；只收紧机械延续请求。 |
 | `compress.priceProfile` | { w?, r?, q? } | unset (registry, kernel fallback {1, 0.1, 4}) | — | w/r/q 相对输入价的比率（写入/缓存读/输出）；仅供报告，不影响触发条件或线上行为。 |
+| `compress.externalSummary` | object | opt-in (disabled) | — | 把压缩摘要交给 providers 表引用的独立配置模型；三级 compress 均为整链替换语义。 |
 | `compress.acknowledgePromptsRisk` | boolean | false | — | 必须先置 true，自定义 prompts 才会生效。 |
 | `compress.absorb.enabled` | boolean | false | — | 启用 absorb 蒸馏块。 |
 | `compress.absorb.minToolTokens` | number | 1000 | — | 可被吸收的工具结果的最小估算 token 大小。 |
@@ -353,6 +356,7 @@
 |-----|------|---------|-----|-------------|
 | `BILI_DSH_AUTHORED_COMPACTION` | boolean | true (on, #3901 flip) | — | 让 bili 本地应答 dsh 压缩摘要请求（返回折叠快照而非拒绝，#3733）：身份头 + 内核渲染格式的块摘要，零出口流量；重放经 #2432 再基线识别。 |
 | `BILI_DSH_CONTEXT_TAB` | boolean | true | — | dsh.contextTab 的 env 层（#4237）：0/false 移除 DSH 顶栏「上下文」标签页（其余一切照常工作）；其他取值强制开启并覆盖文件层；缺省 = 按文件层取值（默认 true）。下次页面加载 / dsh 重启生效。 |
+| `BILI_DSH_MAX_TESTED_VERSION` | string | 0.2.0-rc.2 (CI e2e anchor) | — | “dsh native lane 启动提示的“我们测过的最高版本”上限（#4545）：从注入包上方最近的 node_modules/@deepseek-ai/dsh/package.json 读出运行中的构建,**严格高于**上限才弹一条启动提示(持久日志 + 横幅),建议先回滚到上限版本。只覆盖"更新"一个方向:≤ 上限保持静默(旧版已知坏法有专门的失锁探测)。只提示、绝不拦截或阻断流量;新版本验证通过后抬高上限,空字符串 = 关闭本 lane 检查;读不到/解析不了的版本按静默处理。” |
 | `BILI_STORAGE_BACKEND` | sqlite\|mysql | sqlite | — | storage.backend 的环境变量层（#3931）：sqlite（默认）或 mysql（已接线，#3388 第二+三步 —— 保存经异步影子队列入 mysql,同步读走 JSON 信封,replicas/ext/GC 走异步孪生;export 同样支持）。优先于文件层。 |
 | `BILI_MYSQL_DSN` | string | unset | — | storage.backend="mysql" 的 MySQL DSN（mysql://user:pass@host:3306/db）（#3388，#3931）。优先于文件键 storage.mysql.dsn。留空 = mysql 后端无法打开;文档化错误会列出两个旋钮。连接池惰性打开;closeQuietlyAsync 排空入队事务并关闭。 |
 | `BILI_STORAGE_ARCHIVE_AFTER_DAYS` | integer | 365 | — | GC 年龄清扫窗口（天，#3463）：闲置超过该时长的会话被归档（单文件归档日志 archive/archive.jsonl 追加一行 + 墓碑行保留标签 + 释放内容/媒体引用）。0 关闭年龄清扫；手动入口 POST /__bili/storage/gc 始终可用。配置文件键 storage.archiveAfterDays 为持久形式。 |
@@ -394,7 +398,9 @@
 | `BILI_NATIVE_OMP` | boolean-ish | off | — | 宿主姿态：标记 omp 原生插件进程。 |
 | `BILI_NATIVE_OPENCODE` | boolean-ish | off | — | 宿主姿态：标记 opencode 原生插件进程。 |
 | `BILI_NATIVE_PI` | boolean-ish | off | — | 宿主姿态：标记 pi 原生插件进程。 |
-| `BILI_PI_INLINE` | boolean-ish | off | — | 宿主姿态：pi 内联压缩通道（#3278）——pi 扩展在进程内通过伪源站直接压缩，不再另起代理进程；优先于预置的 BILLION_CONTEXT_PROXY 附着目标。 |
+| `BILI_PI_INLINE` | boolean-ish | off (opt-in) | — | 宿主姿态：pi 内联压缩通道（#3278）——pi 扩展在进程内通过伪源站直接压缩，不再另起代理进程；优先于预置的 BILLION_CONTEXT_PROXY 附着目标。需手动开启：#4687 收回 #4571 的默认翻转，不设置时行为与旧版完全一致（attach/spawn）；除 0/false/no/off 外任何非空值均算开启（on/yes/TRUE 均可）。codex 的 Responses WS 流量改走随引擎启动的仅回环桥；桥起不来时该通道退回直连（打 warn），HTTP 压缩仍留在进程内。 |
+| `BILI_OPENCODE_INLINE` | boolean-ish | off (opt-in) | — | 宿主姿态：opencode 内联压缩通道（#3278 移植）——opencode 插件在进程内通过伪源站直接压缩，不再另起代理进程；优先于预置的 BILLION_CONTEXT_PROXY 附着目标。需手动开启：按 #4687 决定，opencode 通道默认保持旧行为（另起代理），只有本环境变量或 "opencode": {"inline": true} 显式开启才切换；除 0/false/no/off 外任何非空值均算开启（on/yes/TRUE 均可）。已在 Bun 宿主上验证（无 node:sqlite 时引擎 boot/dispatch 正常）。 |
+| `BILI_INLINE_DEBUG` | boolean-ish | off | — | 仅内联通道（#3278）：把引擎日志保留在 stderr 上（默认关闭——内联引擎跑在 pi 进程里，stderr 就是交互终端，每行 [persist]/[storage]/[inline] 都会把输入框挤掉；默认只写 bili.log）。 |
 | `BILI_NATIVE_ZCODE` | boolean-ish | off | — | 宿主姿态：标记 zcode 原生插件进程。 |
 | `BILI_PI_BIN` | string | pi (PATH lookup) | — | 宿主姿态：pi 客户端二进制的显式路径。 |
 | `BILI_DSH_BIN` | string | dsh (PATH lookup) | — | 宿主姿态：dsh 客户端二进制的显式路径。 |
@@ -1282,6 +1288,8 @@ URL 键通道（或带 `bind` 的命名条目）可以向上游发送**自己的
 
 两个可选旋钮可把这条链升级为**代理驱动的自动折叠器**（`autoFold`）：`"autoFold": true` 后代理不再等模型调压缩工具 —— 原本只守溢出窗口的零模型折叠引擎同样会在转发前把对话折到 `autoFoldTargetTokens`（默认：模型窗口的一半）以下，范围由内核选定、摘要由外部链完成。主模型完全看不到 nudge，也不会把思考预算花在起草压缩方案上。该旋钮随整链替换语义生效，且只在链本身启用时才起作用——在链未启用（或省略 `enabled`）时设置任一旋钮均无效，并会记录一次警告而非静默失效；`autoFoldTargetTokens` 必须是 `[8192, 10000000]` 内的整数。失败时 fail-open：链在折叠时出错则照常转发请求，退避 10 分钟内暂停自动折叠并恢复经典 advisory nudge。一个例外（#2662）：若零进展完全由队列丢弃造成——批次已提交但因共享池饱和、没有任何一次摘要调用真正派发——则不触发退避（那是调度拥塞而非链故障），auto-fold 在下一轮直接重试。
 
+auto-fold 的增长触发是**收益门槛制**（#3444），不是裸阈值：只有文本通道超出有效目标预算至少 **4096 token** 才会武装增长折叠——已坐在目标上（或刚刚过线）的载荷会直接照常转发，不会为了省不到固定成本的量去烧一整轮外部摘要往返。折叠后同一道门槛再算一次：一场增长折叠实际省下不足 4096 token，就按零进展同样处理，武装 10 分钟退避。图片主导的载荷豁免（图片不可折叠，其超出量永远算不上“预期收益”）；经典溢出折叠不受影响——那是必须触发的。另外，有效目标有一个**实测下限**：当会话不可压缩的基线（系统提示词 + 工具定义 + 存活尾巴）大于配置的 `autoFoldTargetTokens` 时，目标会被抬到实测值并告警提示真实数字——否则一个永远够不着的目标会在每轮请求上重复武装注定徒劳的折叠。下限永远不会把目标抬过模型窗口。
+
 #### Agent 上报的 providers（兜底层）
 
 ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报自己已配置的 providers（`POST /__bili/agent-providers`）：provider 名、base URL、线上协议、已解析的 API key 与模型清单。这些 recipes 构成一个**兜底层** —— 链可以直接引用 `"zhipu/glm-5"`，无需在文件里重复拨号字段；在 agent 自身配置过的 provider 可直接用作摘要目标。合并序为**文件优先**：同名 file recipe 会完全遮蔽 agent 对该 provider 的贡献（含模型清单）。agent 层永不落盘：key 只存在于代理进程内存，配置 API 不返回，也不进日志。上报侧的跳过规则：OAuth 认证的 provider、`auth.json`（“stored”）凭据、端点指回代理自身的 provider、以及没有摘要拨号协议的 provider（`bedrock`、`vertex`、`mistral`、`pi-messages`）都不会上报；plain-HTTP 非回环 baseUrl 同样不会发送（服务端会拒绝——内联 apiKey 不能走明文，#2585）。接收按条目隔离：被拒的条目只会被记录并出现在响应的 `skipped` 列表里，不再丢弃整份上报——其余条目照常注册。Web 面板的目标下拉里 agent 上报的模型带 `(agent)` 标记。
@@ -1385,20 +1393,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 - **类型：** `number`
 - **状态：** DEPRECATED（`minCompressRangeChars` 的弃用别名，向后兼容保留）
 - **说明：** `minCompressRangeChars` 的旧名，内核映射（`compress.minCompressRange`）与单位（字符）完全相同。同层两键并存时新名优先；跨层时更深层优先，与键名无关。
-
-#### `maxSummaryLength`
-
-- **类型：** `number`
-- **默认值：** *（内核默认值 `20000`）*
-- **状态：** ACTIVE（#3635）
-- **说明：** 单条生成摘要的硬上限，单位为**字符**。超长的回复被整段拒绝——模型自产摘要由内核的全有或全无长度检查拒绝，配置的摘要链由外部摘要执行器拒绝（不截断、不重试）。preflight 与模型工具两条压缩路径都会把这个确切上限提前告知外部摘要模型（preflight 自 #1775 起，compress 路径自 #3635 起），因此超长从「无声丢弃」变成有明确日志原因的模型合规问题。`0` 禁用上限。映射到内核字段 `compress.maxSummaryLength`。#3635 之前该键在任何层面都不被接受：面板 PUT 会静默丢弃它，手改配置文件也到不了生效配置，实际生效值永远是内核默认值。
-
-#### `minSummaryLength`
-
-- **类型：** `number`
-- **默认值：** *（内核默认值 `50`）*
-- **状态：** ACTIVE（#3635）
-- **说明：** 生成摘要的下限，单位为**字符**；过短的回复被整段拒绝。`0` 禁下限。映射到内核字段 `compress.minSummaryLength`。与 `maxSummaryLength` 相同的接受历史（#3635）。
 
 #### `tiers`
 
@@ -1797,6 +1791,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_GUARDRAIL_MAX_OUTPUT_BYTES` | `guardrails.maxOutputBytes` | 50000 |
 | `BILI_GUARDRAIL_REPETITION` | `guardrails.repetition` | true |
 | `BILI_GUARDRAIL_TEXT_RUN_THRESHOLD` | `guardrails.textRunThreshold` | 200 |
+| `BILI_HTTP_OUTBOUND_BYTES` | `network.httpOutboundBytes` | 10485760 |
 | `BILI_IMAGE_BILLING` | `imageBilling` | auto (resolves to pixels) |
 | `BILI_IMAGE_RESCALE` | `imageRescale` | true |
 | `BILI_IMAGE_TOKEN_CAP` | `imageTokenCap` | unset (uncapped) |
@@ -1814,6 +1809,7 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_NATIVE_ATTACH_POLICY` | `native.attachPolicy` | own-lane |
 | `BILI_NON_HTTP_PROVIDERS` | `compactionOptIn` | false |
 | `BILI_NO_CACHE_CONTROL` | `compat.noCacheControl` | false |
+| `BILI_OPENCODE_INLINE` | `opencode.inline` | false |
 | `BILI_OUTBOUND_BODY_BYTES` | `network.outboundBodyBytes` | 5368709120 |
 | `BILI_PERSIST` | `persist.enabled` | true |
 | `BILI_PERSIST_DEBOUNCE_MS` | `persist.debounceMs` | 500 |
@@ -1990,7 +1986,6 @@ ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报�
 | `BILI_CLAUDE_UPSTREAM` | claude 直连模式：当 `ANTHROPIC_BASE_URL` 已指向某个 relay 时，用它指定你的 relay 端点（否则会被旁路）。 |
 | `BILI_CLAUDE_NATIVE_PORT` | 为 claude 原生通道 hook 拉起的代理钉死**确切端口**（#964/#1660）：严格端口语义——口上的占用者被大声拒绝而不是跳口——烘进受管 `ANTHROPIC_BASE_URL`。不设则 hook 骑自管区（`BILI_ZONE_PORT` 基准 + 每 lane 粘性），且每次会话把受管 URL 重钉到存活 origin，端口漂移自愈（#1660）。 |
 | `BILI_CODEX_COMPACT` | codex 原生压缩处理。默认 `intercept`：安全门通过时（transform 成功 + 稳态用量 < 窗口 90% + 至少一个活跃压缩块）拦截 codex 的压缩请求，在本地伪造向 ACP 状态的交接——trigger 形态伪造 2 帧 SSE，endpoint 形态伪造 `{output}`——且不接触上游。作用范围（#3008）：覆盖显式形态（compaction_trigger + /responses/compact）与以普通请求形态过线的内联自动压缩（按 SUMMARIZATION_PROMPT 模板检测）——用户自定义 compact_prompt 后锚点失配、按原样转发；bili 仅旁路观察到的压缩（pass/安全阀放行）走事后 rebase（#2372）。伪造的 ACP 摘要经历史承载交接消息注入（缺席时 developer 消息兜底），保证 codex 截断历史后压缩内容仍可见。设为 `pass` 可退出，把 codex 的压缩请求转发给上游（原生压缩兜底）。任一安全门失败则原样透传。codex 客户端判定（本项生效范围，同时用于窗口 clamp 与会话身份指纹）：User-Agent 须以已注册前缀开头（`codex_cli_rs/`、`codex_exec/`、`codex desktop/`——大小写不敏感，因 Codex Desktop 等变体首字母大写，#1169），或含某个以**小写** `codex` 开头的空白分隔组件（未知变体如 `codex_sdk_ts/…`，#645——#1641 起从裸子串收窄为 token 级前缀，UA 中仅在括号内/路径段提及 "codex" 的非 codex 客户端不再被误判；兜底有意保持大小写敏感，排除 "Codex"-形中继，#1106）。 |
- | `BILI_CODEX_STATE_MODE` | codex 状态处理（#2222、#3203）。默认 `auto`：当 codex 二进制支持 `CODEX_SQLITE_HOME`（codex-cli ≥ 0.147.0，经缓存的 `--version` 探测判定）时，bili 将其指向**真实** `$CODEX_HOME` —— codex 的 WAL 模式状态库留在真实 home 内的单一物理路径上，bili 与原生运行共享同一个活库。每次启动从有界池（`<CODEX_HOME>-bili-s1..s16`）取一个独立的每会话 overlay 槽位：生成文件（.env、config.toml）与代理绑定都按槽位隔离，因此同一个 `$CODEX_HOME` 下最多可有 16 个独立会话并发运行，各自走自己的代理（代理各跑在独立 lane `codex-s<N>` 上 —— 同构建的两次启动若共享一个 lane，会在端口层互相拒绝，#3044）。槽位持久保留并复用 —— 绝不自动删除，因为冷启动的线程记录要经由槽位解析（#43bf59fc9）—— 崩溃会话的槽位会被下一次启动直接回收。没有逐次启动的数据库拷贝，就没有退出时的合并回写、也没有 `.bili-conflict` 隔离代（#381/#1917/#1918/#1919/#1951/#1965/#2195 补丁族在此模式下退役）。#3203 之前的固定名 `<CODEX_HOME>-bili` overlay 在首次 shared 模式启动时按同一套溯源仲裁一次性迁回真实 home；若仍有存活的旧版 launch 持有它，本次启动会被拒绝。`shared` 强制此模式（二进制过旧时大声降级为 legacy）；`legacy` 强制旧的逐次拷贝 / 合并回写机制及其单一独占 overlay（一次只能一个会话）。仅环境变量的逃生舱 —— **没有**文件等效项。用户自设的 `CODEX_SQLITE_HOME` 原样尊重（原生与 bili 运行必须共享同一逻辑库）；managed requirements.toml 的 `sqlite_home` 压过两者。 |
 
 ---
 
@@ -2123,7 +2118,7 @@ openai_base_url = "http://localhost:8787/bili/https://chatgpt.com/backend-api/co
 "baseUrl": "http://localhost:8787/bili/https://api.anthropic.com"
 ```
 
-**Claude Code** —— 把 `ANTHROPIC_BASE_URL` 环境变量设成 `/bili/` URL。（`/bili/` 形式是手动方式：旧版 claude 完全忽略代理环境变量，而新版（如 2.1.301）会遵守 `HTTPS_PROXY` —— 如果你的环境把 loopback 流量走代理，请把 loopback 主机加进 `NO_PROXY`，让这个 URL 直连而不是绕回代理（#3446）。）
+**Claude Code** —— 把 `ANTHROPIC_BASE_URL` 环境变量设成 `/bili/` URL。（claude 的 undici fetch 忽略 `HTTPS_PROXY`，所以 `/bili/` URL 形式是唯一的手动方式 —— 证书 MITM 拦不到它。）
 
 ```bash
 export ANTHROPIC_BASE_URL="http://localhost:8787/bili/https://api.anthropic.com"
@@ -2193,7 +2188,7 @@ MITM 只对一份**白名单**中的模型域名生效（`open.bigmodel.cn`、`a
    - **HTTP 代理**： `http://127.0.0.1:8787`
    - **代理 CA 证书路径**： 本机 bili 实际生成的 CA 文件 —— Linux/macOS 为 `~/.local/share/billion-context/ca/root-ca.pem`，Windows 为 `%USERPROFILE%\.local\share\billion-context\ca\root-ca.pem`。Web UI「接入」页的 ZCode 卡片直接显示本机实际路径并提供复制按钮，照抄即可。
    - （可选）**No-proxy 列表**： `localhost,127.0.0.1`
-   - （ZCode 具体位置：**Settings → Network**。Claude Code 无需任何一步：启动器用 `ANTHROPIC_BASE_URL` 路由，模型流量走回环 http，子进程环境也不再带 `HTTPS_PROXY`/`NODE_EXTRA_CA_CERTS`——自己设上只会把会话内的工具指向一个并不需要的代理。）
+   - （ZCode 具体位置：**Settings → Network**。Claude Code 则设 `HTTPS_PROXY` 环境变量、`NODE_EXTRA_CA_CERTS` 指向 CA 路径。）
 
    > **Windows 注意：** ZCode 在 Windows 上**不会展开 `~`**，填 `~/...` 形式的路径会找不到文件（与当前工作目录无关，每个目录都识别不了）。必须填完整绝对路径，例如 `C:\Users\<用户名>\.local\share\billion-context\ca\root-ca.pem`（#342）。
 
@@ -2221,14 +2216,14 @@ MITM 只对一份**白名单**中的模型域名生效（`open.bigmodel.cn`、`a
 | pi | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env 清单（扩展 `registerProvider`） | `NODE_EXTRA_CA_CERTS` |
 | omp | `HTTPS_PROXY` + `BILI_PROVIDER_REWRITES` env 清单（扩展 `registerProvider`）+ 用户未设置 `PI_PROXY` / `PI_PROXY_ANTHROPIC` 时的 `PI_PROXY_ANTHROPIC=<proxy>`（将 OMP 的 Cowork anthropic 通道经代理路由而非 node:https 直连，#2583/#3556） | `NODE_EXTRA_CA_CERTS` |
 | codex | `HTTPS_PROXY` + `-c key=value` 覆盖 | `SSL_CERT_FILE` → `combined-ca.pem` |
-| claude | `ANTHROPIC_BASE_URL` = `/bili/` URL（Vertex：`ANTHROPIC_VERTEX_BASE_URL`，当 `CLAUDE_CODE_USE_VERTEX=1`；+ `NO_PROXY`/`no_proxy` loopback 合并，#3446） | 无需 |
+| claude | `ANTHROPIC_BASE_URL` = `/bili/` URL（Vertex：`ANTHROPIC_VERTEX_BASE_URL`，当 `CLAUDE_CODE_USE_VERTEX=1`） | 无需 |
 | opencode | `HTTPS_PROXY` + 隔离 `OPENCODE_CONFIG` | `NODE_EXTRA_CA_CERTS` |
 | hermes | `HTTPS_PROXY`（明文 http 走 absolute-form 正向代理请求） | `SSL_CERT_FILE` → `combined-ca.pem`（另设旧版 `HERMES_CA_BUNDLE` → `root-ca.pem`） |
 | dsh | `HTTPS_PROXY`（明文 http 另加 `HTTP_PROXY`）+ `DEEPSEEK_BASE_URL`；**仅回环**隔离 `DSH_HOME` | `SSL_CERT_FILE` → `combined-ca.pem` |
 
 `NODE_EXTRA_CA_CERTS` 是**追加**到内置信任库，所以只指向 MITM 根证书（`root-ca.pem`）即可。`SSL_CERT_FILE` 会**替换**默认 CA bundle，所以 codex/dsh/hermes 指向 `combined-ca.pem` —— 包含 MITM 根证书**加上**操作系统信任库与 Node 公共根。合并 OS 信任库很关键：部分被启动的客户端把这个文件当作**整个**信任池（codex 的 rustls HTTP 栈是替换而非追加，#1807），它们的直连（不经代理）连接只能靠这个文件校验，因此文件必须是 OS 自身信任集合的超集（Windows 经 PowerShell 读证书库、macOS 经 `security(1)` 读钥匙串；Linux 本就直读文件系统 bundle；最多每 24 小时重建一次）。最初引入该 bundle 是为了让子进程环境里 pip/git/curl 类 TLS（盲转发、真证书）不受影响（#152；hermes 自 #1375 起，因为当前 hermes 只经 `SSL_CERT_FILE` 解析环境信任；OS 信任库合并自 #1807 起）。
 
-Claude Code 不走证书 MITM，一律改走 `/bili/` URL 形式、通过客户端自己的 base URL 变量下发 —— 覆盖所有上游，包括预先配置的 `ANTHROPIC_BASE_URL` relay，以及 `CLAUDE_CODE_USE_VERTEX=1` 下的 Vertex 端点；无需任何 CA 信任。旧版构建完全忽略代理环境变量，但新版（如 2.1.301）会遵守 `HTTPS_PROXY`，因此 launcher 会把 loopback 主机合并进 `NO_PROXY`/`no_proxy`（保留已有值），确保无论子进程是哪种行为，`/bili/` 这一腿都保持直连（#3446）。
+Claude Code 的 undici fetch 忽略 `HTTPS_PROXY`，所以证书 MITM 拦不到它。claude 的所有上游 —— 包括预先配置的 `ANTHROPIC_BASE_URL` relay，以及 `CLAUDE_CODE_USE_VERTEX=1` 下的 Vertex 端点 —— 一律改走 `/bili/` URL 形式，通过客户端自己的 base URL 变量下发；无需任何 CA 信任。
 
 上游从哪里发现（只读）：
 

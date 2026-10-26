@@ -58,6 +58,10 @@ export type Mysql2Module = typeof import("mysql2/promise");
 
 const MYSQL_SCHEMA_VERSION = 7;
 
+/** PR #4725 N3 (mirror of store.ts): covered-seq span point queries chunk the
+ *  msg_id IN (…) list at the same 500 batch size for cross-backend parity. */
+const SEQ_SPAN_QUERY_BATCH = 500;
+
 /** Fresh-install DDL: the schema.ts v7 shape in MySQL dialect. LONGTEXT for
  *  every verbatim JSON/bytes column (byte-exact round-trip; the JSON type
  *  re-orders keys), BIGINT for ms-epoch timestamps and seqs, VARCHAR keys
@@ -519,21 +523,36 @@ export class MysqlBackend implements StorageBackend {
                 await c.query("DELETE FROM blocks WHERE session_id = ? AND block_id = ?", [s.sessionId, stale.block_id]);
             }
             // #4316 layer 3 (mirror of store.ts): resolve coverage to canonical
-            // seq bounds from the append-only transcript; unresolvable keeps 0.
+            // seq bounds from the append-only transcript; unresolvable stores
+            // the -1 "no claim" sentinel (PR #4725 N1) — a [0,0] would pass
+            // the #4608 IF(>=0) guard and overwrite real bounds with a bogus
+            // claim over seq 0. Point query over the covered ids only
+            // (PR #4725 N3): a full-session scan taxed every save.
             const seqSpanById = new Map<string, [number, number]>();
             if (input.blocks.length > 0) {
-                const spanRows = (await c.query(
-                    "SELECT msg_id, seq FROM messages WHERE session_id = ?",
-                    [s.sessionId],
-                )) as unknown as Row[][];
-                for (const r of spanRows[0]) {
-                    const msgId = str(r.msg_id);
-                    const seq = Number(r.seq);
-                    const cur = seqSpanById.get(msgId);
-                    if (!cur) seqSpanById.set(msgId, [seq, seq]);
-                    else {
-                        if (seq < cur[0]) cur[0] = seq;
-                        if (seq > cur[1]) cur[1] = seq;
+                const wanted = new Set<string>();
+                for (const b of input.blocks) {
+                    try {
+                        const cov = JSON.parse(b.payloadJson) as { effectiveMessageIds?: string[]; directMessageIds?: string[] };
+                        for (const id of [...(cov.effectiveMessageIds ?? []), ...(cov.directMessageIds ?? [])]) wanted.add(id);
+                    } catch { /* malformed payload: no covered ids to resolve */ }
+                }
+                const wantedIds = Array.from(wanted);
+                for (let i = 0; i < wantedIds.length; i += SEQ_SPAN_QUERY_BATCH) {
+                    const ids = wantedIds.slice(i, i + SEQ_SPAN_QUERY_BATCH);
+                    const spanRows = (await c.query(
+                        `SELECT msg_id, seq FROM messages WHERE session_id = ? AND msg_id IN (${ids.map(() => "?").join(", ")})`,
+                        [s.sessionId, ...ids],
+                    )) as unknown as Row[][];
+                    for (const r of spanRows[0]) {
+                        const msgId = str(r.msg_id);
+                        const seq = Number(r.seq);
+                        const cur = seqSpanById.get(msgId);
+                        if (!cur) seqSpanById.set(msgId, [seq, seq]);
+                        else {
+                            if (seq < cur[0]) cur[0] = seq;
+                            if (seq > cur[1]) cur[1] = seq;
+                        }
                     }
                 }
             }
@@ -548,8 +567,8 @@ export class MysqlBackend implements StorageBackend {
                         if (sp[0] < lo) lo = sp[0];
                         if (sp[1] > hi) hi = sp[1];
                     }
-                } catch { /* malformed payload: keep the 0 placeholder */ }
-                return hi < 0 ? [0, 0] : [lo, hi];
+                } catch { /* malformed payload: keep the no-claim sentinel */ }
+                return hi < 0 ? [-1, -1] : [lo, hi];
             };
             for (const b of input.blocks) {
                 const [bStartSeq, bEndSeq] = boundsForCovered(b.payloadJson);
@@ -574,7 +593,11 @@ export class MysqlBackend implements StorageBackend {
                        summary_hash, one_hash, supersedes_block_id, active, created_at, covered_hash, payload_json)
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                      ON DUPLICATE KEY UPDATE
-                       ord = VALUES(ord), start_seq = VALUES(start_seq), end_seq = VALUES(end_seq),
+                       ord = VALUES(ord),
+                        // #4608: keep durable interval evidence when a later batch can no
+                       // longer re-derive it (post-fold client resends carry no covered raws)
+                       start_seq = IF(VALUES(start_seq) >= 0, VALUES(start_seq), start_seq),
+                       end_seq = IF(VALUES(end_seq) >= 0, VALUES(end_seq), end_seq),
                        start_ref = VALUES(start_ref), end_ref = VALUES(end_ref), tier = VALUES(tier),
                        summary_hash = VALUES(summary_hash), one_hash = VALUES(one_hash),
                        supersedes_block_id = VALUES(supersedes_block_id), active = VALUES(active),
@@ -663,7 +686,7 @@ export class MysqlBackend implements StorageBackend {
             if (num(row.seq) + 1 > nextSeq) nextSeq = num(row.seq) + 1;
         }
         const planToAbs = new Map<number, number>();
-        const repairs: { seq: number; from: string; to: string; content: string }[] = [];
+        const repairs: { seq: number; msgId: string; from: string; to: string; content: string }[] = [];
         const messages = input.messages.map((m) => {
             const key = `${m.msgId}\u0000${m.identity ?? identityOfStoredContent(m.content)}`;
             let abs = seqByIdentity.get(key);
@@ -677,12 +700,32 @@ export class MysqlBackend implements StorageBackend {
                 // CAS-corruption healing), never keep the stored generation.
                 const fresh = m.contentHash ?? sha256Hex(m.content);
                 const stored = hashBySeq.get(abs);
-                if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, from: stored, to: fresh, content: m.content });
+                if (stored !== undefined && stored !== fresh) repairs.push({ seq: abs, msgId: m.msgId, from: stored, to: fresh, content: m.content });
             }
             planToAbs.set(m.seq, abs);
             return { ...m, seq: abs };
         });
         for (const r of repairs) {
+            // #4793: mirror of the sqlite lane — a sibling row may already hold
+            // the target bytes for this msg_id (old generation stamped EMPTY
+            // identity by a pre-#4390 build, or two generations of one edited
+            // message). Same content_hash ⇒ same CAS blob ⇒ retiring it loses
+            // nothing; otherwise the UPDATE below throws UNIQUE and three
+            // throws trip the shadow's process-wide disable. A retired
+            // duplicate still occupies the triple (constraint is not partial)
+            // and is byte-identical, so it is dropped outright.
+            await c.query(
+                "UPDATE messages SET retired_at = ? WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NULL",
+                [Date.now(), s.sessionId, r.msgId, r.to, r.seq],
+            );
+            const [leftovers] = (await c.query(
+                "SELECT seq FROM messages WHERE session_id = ? AND msg_id = ? AND content_hash = ? AND seq <> ? AND retired_at IS NOT NULL",
+                [s.sessionId, r.msgId, r.to, r.seq],
+            )) as unknown as Row[][];
+            for (const l of leftovers) {
+                await c.query("DELETE FROM message_media WHERE session_id = ? AND seq = ?", [s.sessionId, num(l.seq)]);
+                await c.query("DELETE FROM messages WHERE session_id = ? AND seq = ?", [s.sessionId, num(l.seq)]);
+            }
             await this.putContent(c, r.content, r.to);
             await c.query("UPDATE messages SET content_hash = ? WHERE session_id = ? AND seq = ?", [r.to, s.sessionId, r.seq]);
             await this.releaseContent(c, r.from);
@@ -890,6 +933,93 @@ export class MysqlBackend implements StorageBackend {
             sessionId: str(r.session_id),
             claimedAt: num(r.claimed_at),
         }));
+    }
+
+    /** #4316 PR3/3 — MySQL twin of UnifiedStore.liveRowCount. */
+    async liveRowCount(sessionId: string): Promise<number> {
+        const [rows] = (await this.pool.query(
+            "SELECT COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL",
+            [sessionId],
+        )) as unknown as Row[][];
+        return num(rows[0].n);
+    }
+
+    /** #4730 — MySQL twin of UnifiedStore.lastLiveSeq: highest live seq (NOT
+     *  the live count — tombstones keep their seq, so count - 1 would drop
+     *  the newest live rows at fork). Null when no live rows. */
+    async lastLiveSeq(sessionId: string): Promise<number | null> {
+        const [rows] = (await this.pool.query(
+            "SELECT MAX(seq) AS m FROM messages WHERE session_id = ? AND retired_at IS NULL",
+            [sessionId],
+        )) as unknown as Row[][];
+        const m = rows[0].m;
+        return m === null || m === undefined ? null : num(m);
+    }
+
+    /** #4316 PR3/3 — MySQL twin of UnifiedStore.seqByRaw. */
+    async seqByRaw(sessionId: string): Promise<Map<string, number> | null> {
+        const [rows] = (await this.pool.query(
+            "SELECT msg_id, MIN(seq) AS seq, COUNT(*) AS n FROM messages WHERE session_id = ? AND retired_at IS NULL GROUP BY msg_id",
+            [sessionId],
+        )) as unknown as Row[][];
+        const out = new Map<string, number>();
+        for (const r of rows) {
+            if (num(r.n) === 1) out.set(str(r.msg_id), num(r.seq));
+        }
+        return out;
+    }
+
+    /** #4316 PR3/3 — MySQL twin of UnifiedStore.cloneSessionRows. */
+    async cloneSessionRows(parentId: string, childId: string, throughSeq: number): Promise<boolean> {
+        const parent = await this.getSessionRow(parentId);
+        if (parent === null) return false;
+        const existing = await this.getSessionRow(childId);
+        if (existing !== null) {
+            const [alreadyRows] = (await this.pool.query(
+                "SELECT COUNT(*) AS n FROM messages WHERE session_id = ?",
+                [childId],
+            )) as unknown as Row[][];
+            if (num(alreadyRows[0].n) > 0) return true; // idempotent replay
+        }
+        const conn = await this.pool.getConnection();
+        try {
+            await conn.beginTransaction();
+            await conn.query(
+                `INSERT INTO messages (session_id, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at)
+                 SELECT ?, seq, msg_id, ref, ref_num, role, kind, content_hash, identity, retired_at FROM messages
+                 WHERE session_id = ? AND seq <= ?`,
+                [childId, parentId, throughSeq],
+            );
+            await conn.query(
+                `INSERT INTO message_media (session_id, seq, media_hash)
+                 SELECT ?, seq, media_hash FROM message_media
+                 WHERE session_id = ? AND seq <= ?`,
+                [childId, parentId, throughSeq],
+            );
+            const [hashes] = (await conn.query(
+                "SELECT DISTINCT content_hash AS h FROM messages WHERE session_id = ?",
+                [childId],
+            )) as unknown as Row[][];
+            for (const row of hashes) await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h]);
+            const [media] = (await conn.query(
+                "SELECT DISTINCT media_hash AS h FROM message_media WHERE session_id = ?",
+                [childId],
+            )) as unknown as Row[][];
+            for (const row of media) await conn.query("UPDATE content SET refcount = refcount + 1 WHERE hash = ?", [row.h]);
+            await conn.query(
+                `INSERT INTO sessions (session_id, created_at, updated_at, parent_session_id, fork_point_seq)
+                 VALUES (?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE parent_session_id = VALUES(parent_session_id), fork_point_seq = VALUES(fork_point_seq)`,
+                [childId, Date.now(), Date.now(), parentId, throughSeq],
+            );
+            await conn.commit();
+            return true;
+        } catch (err) {
+            await conn.rollback();
+            throw err;
+        } finally {
+            conn.release();
+        }
     }
 
     async getSessionRow(sessionId: string): Promise<SessionRow | null> {
