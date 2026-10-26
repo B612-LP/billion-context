@@ -9,9 +9,9 @@ import type { CoreMessage, CompressionBlock } from "acp-kernel";
 
 // #4316 layer 3 (owner ruling 2026-10-22): block coverage becomes a canonical
 // [start_seq, end_seq] interval so a client byte-rewrite can't churn held
-// m-numbers. RED today — start_seq/end_seq are hard-wired to 0 at the single
-// write site (src/storage/ingest.ts); GREEN once the store-layer fill resolves
-// covered ids -> seq from the append-only transcript.
+// m-numbers. Resolvable coverage carries the real first/last covered seq from
+// the append-only transcript; unresolvable coverage stores the -1/-1 no-claim
+// sentinel (planner/store convention, #4741) — never a degenerate [0,0].
 
 function msg(id: string, role: "user" | "assistant"): CoreMessage {
     return { id, role, contentType: "text", text: `body ${id}` };
@@ -86,7 +86,7 @@ test("#4316: a block whose covered messages are present carries their real seq b
     }
 });
 
-test("#4316: a block whose covered ids are absent from the transcript keeps placeholder 0 (no crash, honest gap)", () => {
+test("#4316: a block whose covered ids are absent from the transcript keeps the -1/-1 no-claim sentinel (no crash, honest gap)", () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "bili-4316-gap-"));
     try {
         const store = UnifiedStore.open(path.join(dir, "index.db"));
@@ -97,8 +97,8 @@ test("#4316: a block whose covered ids are absent from the transcript keeps plac
 
         assert.equal(seqOf(store, sid, "h_old"), undefined, "fixture sanity: h_old must NOT be a transcript row");
         const b = store.getBlocks(sid).find((x) => x.blockId === "b1")!;
-        assert.equal(b.startSeq, 0, "unresolvable coverage keeps the 0 placeholder, never a fabricated bound");
-        assert.equal(b.endSeq, 0, "unresolvable coverage keeps the 0 placeholder, never a fabricated bound");
+        assert.equal(b.startSeq, -1, "unresolvable coverage keeps the -1/-1 no-claim sentinel, never a fabricated bound");
+        assert.equal(b.endSeq, -1, "unresolvable coverage keeps the -1/-1 no-claim sentinel, never a fabricated bound");
     } finally {
         try { fs.rmSync(dir, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }); } catch { /* Windows stray handle */ }
     }
