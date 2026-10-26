@@ -338,11 +338,22 @@ describe("noteBiliToolSurface (#4789 tripwire)", () => {
         assert.equal(logs.length, 2, "each direction change is its own warn");
     });
 
-    test("no metadata → no-op, never throws", () => {
+    test("tracks and warns without any metadata field present", () => {
         const session = { state: { blocks: [] } } as unknown as Session;
         const logs: string[] = [];
-        noteBiliToolSurface(session, { ccr: true, imageRescale: true }, logOpts(logs));
-        assert.equal(logs.length, 0);
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        assert.equal(logs.length, 0, "first egress seeds silently");
+        noteBiliToolSurface(session, { ccr: false, imageRescale: false }, logOpts(logs));
+        assert.equal(logs.length, 1, "the flip is observed regardless of session fields");
+    });
+
+    test("never writes into session.metadata — persisted state bytes stay untouched (#4790 CI)", () => {
+        const session = empty();
+        const logs: string[] = [];
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        noteBiliToolSurface(session, { ccr: true, imageRescale: false }, logOpts(logs));
+        noteBiliToolSurface(session, { ccr: false, imageRescale: true }, logOpts(logs));
+        assert.equal(Object.keys(session.metadata ?? {}).length, 0, "the tripwire must stay pure observation: session.metadata is serialized into the state file and asserted byte-for-byte by the storage goldens");
     });
 
     test("outboundBiliSurface reads presence off the final array under every wire nesting", () => {
