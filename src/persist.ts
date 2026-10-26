@@ -1634,6 +1634,27 @@ export class SessionStore {
                     this.log("info", `[persist] remapped ${moves.length} token-snapshot entries onto ledger-aligned refs for ${session.id} (#4599)`);
                 }
             }
+            // #4797: vacated numbers that NO row re-granted identify no message
+            // anymore — tombstone them like every other dead ref (#3302
+            // discipline) so the suggestion side (excludeDeadRefRanges) stops
+            // advertising spans that cross them and acp_status names them in
+            // DEAD REFS. Re-granted numbers stay live: their current owner
+            // makes citations unambiguous.
+            if (outcome.superseded.size > 0) {
+                const byRefNow = state.messageRefs.byRef;
+                const merged = new Set(state.deadRefs ?? []);
+                let vacated = 0;
+                for (const oldRef of outcome.superseded.keys()) {
+                    if (byRefNow[oldRef] === undefined && !merged.has(oldRef)) {
+                        merged.add(oldRef);
+                        vacated++;
+                    }
+                }
+                if (vacated > 0) {
+                    state.deadRefs = [...merged].sort((a, b) => Number(a.replace(/^m/, "")) - Number(b.replace(/^m/, "")));
+                    this.log("info", `[persist] tombstoned ${vacated} vacated ref(s) as dead refs for ${session.id} (#4797)`);
+                }
+            }
             state.refLedgerAligned = true;
             this.log("info", `[persist] ledger-aligned refs for ${session.id}: kept=${outcome.kept} restamped=${outcome.restamped} rehomed=${outcome.rehomed} blocked=${outcome.blocked} superseded=${outcome.superseded.size} (#4316 PR3/3)`);
             this.scheduleSave(session);

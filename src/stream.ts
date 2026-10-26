@@ -815,15 +815,24 @@ export function findVisibleStubResubmissions(ctx: RewriteCtx, ranges: ParsedRang
 }
 
 /** #4316 layer 3 PR3/3: does this compress call cite a ref that changed
- *  hands in this process's one-time ledger re-stamp? Returns a one-line
- *  explanation when at least one cited ref is superseded, null when the call
- *  is clean (or the session never re-stamped — the common case). */
+ *  hands in this process's one-time ledger re-stamp AND no longer identifies
+ *  any message? Returns a one-line explanation when at least one cited ref is
+ *  genuinely stale, null when the call is clean (or the session never
+ *  re-stamped — the common case).
+ *
+ *  #4797: the re-stamp targets seq+1, which OVERLAPS the old counter space, so
+ *  most superseded numbers are re-granted as live refs of DIFFERENT messages.
+ *  Refusing every cited superseded number deadlocked every suggested range
+ *  after a drift-heavy restart (acp_status advertised exactly those live
+ *  refs and the gate refused them forever). Only a superseded number with no
+ *  current owner is truly stale — its old label points at nothing. */
 export function supersededRefRejection(
     ranges: { startRef: string; endRef: string }[],
     session: Session,
 ): string | null {
     const superseded = session.restampSuperseded;
     if (!superseded || superseded.size === 0) return null;
+    const byRef = session.state?.messageRefs?.byRef ?? {};
     const hits: string[] = [];
     for (const range of ranges) {
         const start = refToIndex(range.startRef);
@@ -831,7 +840,7 @@ export function supersededRefRejection(
         if (start === null || end === null) continue;
         for (let index = start; index <= end; index++) {
             const ref = indexToRef(index);
-            if (superseded.has(ref)) hits.push(ref);
+            if (superseded.has(ref) && byRef[ref] === undefined) hits.push(ref);
         }
     }
     if (hits.length === 0) return null;
@@ -911,10 +920,12 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
     ctx.log(`[acp-proxy: ctx has ${ctx.messages.length} message(s), state has ${Object.keys(ctx.session.state.messageRefs?.byRef ?? {}).length} ref(s) mapped]`);
     // #4316 PR3/3: this process re-stamped the citation space onto the ledger
     // at cold load; a resent in-flight call may still cite pre-restart numbers
-    // that now belong to DIFFERENT messages. Folding those would silently
-    // compress the wrong span — refuse, point at the fresh labels, let the
-    // caller re-read them. Cheap and safe: refusal never mis-folds, and the
-    // one-time cost disappears once the caller re-syncs.
+    // that identify NOTHING anymore (vacated and never re-granted). Folding
+    // those would silently compress the wrong span — refuse, point at the
+    // fresh labels, let the caller re-read them. #4797: superseded numbers
+    // that WERE re-granted are live refs again — refusing them deadlocked
+    // every suggested range after a drift-heavy restart, so they pass here
+    // and resolve to their current owner downstream.
     const supersededHit = supersededRefRejection(ranges, ctx.session);
     if (supersededHit !== null) {
         ctx.log(`[acp-proxy: refused compress citing superseded ref(s): ${supersededHit} (#4316 PR3/3)]`);
