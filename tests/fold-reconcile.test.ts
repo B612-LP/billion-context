@@ -9,6 +9,7 @@ import {
     resolveFoldReconcileMode,
     noteSystemPromptFingerprint,
     noteBiliToolSurface,
+    outboundBiliSurface,
     METADATA_FOLD_COVERAGE,
     resetNormalizedIdentityWork,
     turnContexts,
@@ -342,6 +343,26 @@ describe("noteBiliToolSurface (#4789 tripwire)", () => {
         const logs: string[] = [];
         noteBiliToolSurface(session, { ccr: true, imageRescale: true }, logOpts(logs));
         assert.equal(logs.length, 0);
+    });
+
+    test("outboundBiliSurface reads presence off the final array under every wire nesting", () => {
+        assert.deepEqual(outboundBiliSurface(undefined, "acp_retrieve"), { ccr: false, imageRescale: false });
+        assert.deepEqual(outboundBiliSurface([], "acp_retrieve"), { ccr: false, imageRescale: false });
+        assert.deepEqual(outboundBiliSurface([{ name: "acp_retrieve" }, { name: "other" }], "acp_retrieve"), { ccr: true, imageRescale: false });
+        assert.deepEqual(outboundBiliSurface([{ type: "function", function: { name: "acp_read_original_image" } }], "acp_retrieve"), { ccr: false, imageRescale: true });
+        assert.deepEqual(outboundBiliSurface([{ functionDeclarations: [{ name: "acp_retrieve" }, { name: "x" }] }], "acp_retrieve"), { ccr: true, imageRescale: false });
+        assert.deepEqual(outboundBiliSurface([null, 42, { name: "acp_retrieve" }, { type: "function", function: { name: "acp_read_original_image" } }], "acp_retrieve"), { ccr: true, imageRescale: true });
+        assert.deepEqual(outboundBiliSurface([{ name: "acp_retrieve" }], "my_custom_retrieve"), { ccr: false, imageRescale: false });
+    });
+
+    test("plugin-lane incident class: host-declared flip with zero proxy injection still warns (#4789 repro)", () => {
+        const session = empty();
+        const logs: string[] = [];
+        const opts = logOpts(logs);
+        noteBiliToolSurface(session, outboundBiliSurface([{ name: "read_file" }, { name: "bash" }], "acp_retrieve"), opts);
+        noteBiliToolSurface(session, outboundBiliSurface([{ name: "read_file" }, { name: "bash" }, { name: "acp_retrieve" }], "acp_retrieve"), opts);
+        assert.equal(logs.length, 1, "the 36→37 host-side flip must register even though the proxy injected nothing");
+        assert.match(logs[0], /\+(ccr) \/ -(-)/);
     });
 });
 

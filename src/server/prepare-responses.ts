@@ -11,7 +11,7 @@ import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, r
 import { excludeDeadRefRanges } from "../acp-status.js";
 import { mergeAdjacentConfigurationUpdates, patchResponsesInputWithToolImages as patchResponsesInput, responsesToCoreWithToolImages as responsesToCore } from "../responses-tool-output.js";
 import { dropWhitespaceResponsesMessages, normalizeResponsesMessageItems, sanitizeResponsesInputIds } from "../loop/adapter-responses.js";
-import { METADATA_LAST_RESPONSES_MODE, noteBiliToolSurface, noteCanonicalSystemFingerprint, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
+import { METADATA_LAST_RESPONSES_MODE, noteBiliToolSurface, noteCanonicalSystemFingerprint, outboundBiliSurface, reconcileFoldCoverage, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed, pluginLaneDegraded } from "../session-self-heal.js";
@@ -425,8 +425,8 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 toolsOut = responsesTextProtocol
                     ? injectResponsesTool(parsed.tools, ccrOn ? BILI_ACP_READONLY_TOOLS_RESPONSES : BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, surface?.toolPrompts, externalSummaryEnabled(config))
                     : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...(ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), ...respExtra] : (ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), surface?.toolPrompts, externalSummaryEnabled(config));
-                // #4789: text-protocol mode ships only the readonly core ACP set — no ccr/image-rescale extras — so their surface is off there.
-                noteBiliToolSurface(session, { ccr: ccrOn && !responsesTextProtocol, imageRescale: imageRescaleToolArmed(session) && !responsesTextProtocol }, { sessionId, log });
+                // #4789: observe the FINAL outbound array — text-protocol mode ships only the readonly core ACP set, so its surface reads off as empty there; plugin lanes' host-declared presence is caught too.
+                noteBiliToolSurface(session, outboundBiliSurface(toolsOut, retrieveToolName(session)), { sessionId, log });
             }
         } else if (tagsOnlyPrompt !== "" || projection.systemParts.length > 0 || forgedSummaries.length > 0) {
             const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])].join("\n\n---\n\n");

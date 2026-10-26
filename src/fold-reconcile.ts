@@ -137,6 +137,7 @@ import { reapDestroyedSubstrate, type Session } from "./session.js";
 import { coveredRealHistoryIds, isResponsesTurnSeparatorId } from "./session.js";
 import { dshNativeCompactionWitness, recordConflict } from "./conflict-watch.js";
 import { log as loggerLog } from "./logger.js";
+import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "./compress-tool.js";
 
 type FoldReconcileMode = "off" | "warn" | "repair";
 
@@ -2263,4 +2264,24 @@ export function noteBiliToolSurface(session: Session, surface: { ccr: boolean; i
         }
     }
     session.metadata[METADATA_TOOLSET_FP] = { fp, tags };
+}
+
+/** #4789 tripwire coverage: derive the surface from the FINAL outbound tools
+ *  array instead of "did the proxy inject" — in plugin lanes injectTools is
+ *  structurally false and the host-declared array IS the wire surface, so an
+ *  injection-side observation is blind exactly where #4789 fired. Presence =
+ *  the name appears under any wire nesting (flat `name`, OpenAI
+ *  `function.name`, Gemini `functionDeclarations[].name`); proxy-mode
+ *  mergeOwnedTools dedup makes inbound-carried ∪ proxy-injected collapse to
+ *  one entry per name, so both lanes read off the same artifact. */
+export function outboundBiliSurface(tools: readonly unknown[] | undefined, ccrName: string): { ccr: boolean; imageRescale: boolean } {
+    const names = new Set<string>();
+    for (const raw of tools ?? []) {
+        if (typeof raw !== "object" || raw === null) continue;
+        const t = raw as { name?: unknown; function?: { name?: unknown }; functionDeclarations?: readonly { name?: unknown }[] };
+        if (typeof t.name === "string") names.add(t.name);
+        if (typeof t.function?.name === "string") names.add(t.function.name);
+        for (const d of t.functionDeclarations ?? []) if (typeof d?.name === "string") names.add(d.name);
+    }
+    return { ccr: names.has(ccrName), imageRescale: names.has(READ_ORIGINAL_IMAGE_TOOL_NAME) };
 }

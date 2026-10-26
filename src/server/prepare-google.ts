@@ -8,7 +8,7 @@ import { currentCalibrationFactor } from "../util.js";
 import { diagNudge, diagTagSummary, deriveTitle, effectiveTokenCount, imageBillingFor, imageReserveFor, imageTokenCapFor, isAutoInjectedNotification, reapOrphansLogged, resolveKnownOutputCeiling, runNudgeDecision, stripKernelSummaries, usageGradeInputBaseline, type Prepared } from "../server.js";
 import { buildDecisionPrompt, buildDirectiveText, consumeFallback, ladderMode, resolveDecisionRange, stripDecisionReasoningFields, type DecideConfig } from "../nudge-decide.js";
 import { excludeDeadRefRanges } from "../acp-status.js";
-import { reconcileFoldCoverage, noteBiliToolSurface, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
+import { outboundBiliSurface, reconcileFoldCoverage, noteBiliToolSurface, noteSystemPromptFingerprint, resolveFoldReconcileMode } from "../fold-reconcile.js";
 import { maybeSnapshotView } from "./snapshot-render.js";
 import { storedMessagesFor } from "../fold-decomposition-lookup.js";
 import { nudgeSuppressed } from "../session-self-heal.js";
@@ -306,7 +306,8 @@ export async function prepareGoogle(
         if (injectTools) {
             toolsOut = injectGoogleTool(parsed.tools, [...(absorbActive ? [absorbTools.google] : []), ...(rulesActive ? [RULE_TOOL_GOOGLE] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).google] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_GOOGLE] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
         }
-        if (!isTitleGen) noteBiliToolSurface(session, { ccr: injectTools && ccrEnabled(session), imageRescale: injectTools && imageRescaleToolArmed(session) }, { sessionId, log });
+        // #4789: observe the FINAL outbound array — in plugin lanes the proxy injects nothing, so host-declared presence must be read off the artifact itself.
+        if (!isTitleGen) noteBiliToolSurface(session, outboundBiliSurface(toolsOut, retrieveToolName(session)), { sessionId, log });
         if (sysNotes.length > 0) {
             rebuiltContents = appendGoogleNudge(rebuiltContents, sysNotes.join("\n\n---\n\n"));
         }
