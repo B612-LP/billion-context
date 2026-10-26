@@ -258,6 +258,17 @@ export interface PreflightDeps {
     upstreamOrigin?: string;
     /** #2133: compress.streamSummary resolved true for this request (three-level cascade). The self-learn flag only sees 400 "stream required" rejections, so gateways that time out long non-streaming completions (Cloudflare 524) can never self-heal — this forces SSE from the first attempt instead. */
     forceStreamSummary?: boolean;
+    /** #4288 rework: true ONLY when this invocation re-runs after the upstream
+     *  PROVED an overflow (the #1195/#3787 refold lanes pass the stated or
+     * armed window as a per-call override). There the usage baseline carries
+     * the upstream's own stated number (armOverflowShrink ran before us), so
+     * it is EVIDENCE, not staleness — the own-estimate round exit must stay
+     * off and folding judges on the floored quantity exactly as before.
+     * Absent (the normal growth/window path): a mid-session model switch
+     * leaves a stale baseline measured under the prior wider window, and the
+     * own-estimate exit stops the summarization ladder on payloads that
+     * already fit (#4288). */
+    upstreamProvedOverflow?: boolean;
     /** One external-summary deadline shared by every range/chunk in this invocation. */
     externalSummary?: ConfiguredSummaryPlan;
     /** #2155: compress.streamSummary resolved FALSE for this request (explicit operator opt-out anywhere in the cascade). Neither learn path (400 "stream required" nor the 524/504 gateway-timeout first-hit learn) may arm, and an already-armed session flag is ignored — the operator said this upstream must never stream summaries. */
@@ -2049,6 +2060,29 @@ export async function preflightCompress(deps: PreflightDeps, messages: CoreMessa
         // (the floor can be stale — see PreflightResult.payloadEstimate).
         result.payloadEstimate = roundText + imageReserve;
         if (startTokens < 0) startTokens = currentTokens;
+        // #4288: the round-boundary exit must judge on the payload's OWN
+        // estimate — the same floorless quantity the caller's forward gate
+        // trusts (#1839/#1492) — NOT on decisionTokens, which is floored by
+        // the session's usage baseline. After a mid-session switch to a
+        // smaller-window model that baseline was measured under the prior
+        // (wider) model and sits above the new target, so a floored
+        // comparison never trips and the loop burns the whole slow
+        // summarization ladder on a payload that already fits (the client
+        // then times out mid-ladder and the session appears stuck).
+        // EXCEPTION (#4288 rework): when the upstream PROVED the overflow
+        // (#1195/#3787 refold lanes — upstreamProvedOverflow), the baseline
+        // carries the upstream's stated number and outranks our own estimate:
+        // a locally-fitting payload was just rejected by the real window, so
+        // folding must continue on the floored quantity exactly as before
+        // (the original #4294 exit without this guard killed the #1195
+        // rescue: the mock upstream's stated 130k made a 17k payload look
+        // fitting and preflight returned an unchanged body).
+        if (deps.upstreamProvedOverflow !== true && result.payloadEstimate < limit) {
+            if (baselineFloor >= limit) {
+                deps.log("info", `[preflight] payload fits by its own estimate (~${Math.round(result.payloadEstimate)}/${limit}); stopping instead of folding further despite a higher usage baseline (~${Math.round(baselineFloor)} tok measured under a prior model/route) — forwarding (#4288)`);
+            }
+            break;
+        }
         if (decisionTokens < textTarget) break;
         // #847: drop sub-minimum ranges at list level too — every chunk of a
         // sub-min range fails the apply-side gate, so walking them only burns

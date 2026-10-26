@@ -3301,6 +3301,9 @@ export async function preflightCompressIfNeeded(
     anonymous: boolean,
     log: (level: string, msg: string) => void,
     instanceId: string,
+    /** #4288 rework: true only on the #1195/#3787 refold lanes (the upstream
+     *  PROVED the overflow); see PreflightDeps.upstreamProvedOverflow. */
+    upstreamProvedOverflow?: boolean,
 ): Promise<Prepared | PreflightFailFast> {
     const session = prepared.session;
     // #3450: when an upstream-stated overflow proved this provider bills the
@@ -3733,6 +3736,7 @@ export async function preflightCompressIfNeeded(
                 upstreamOrigin: currentOrigin,
                 forceStreamSummary,
                 streamSummaryOff,
+                ...(upstreamProvedOverflow === true ? { upstreamProvedOverflow: true } : {}),
             },
             prepared.originalMessages,
         );

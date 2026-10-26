@@ -2524,8 +2524,15 @@ async function handleRequest(
                 // request (the two-walls split let "usage=105%" and
                 // "target 1048576" coexist in the same second). Downward only
                 // — a stated ceiling above the declaration never loosens it.
+                let upstreamProvedOverflow = false;
                 if (overflowWindow !== undefined && typeof reqConfig.modelContextLimit === "number" && reqConfig.modelContextLimit > 0 && overflowWindow < reqConfig.modelContextLimit) {
                     reqConfig = { ...reqConfig, modelContextLimit: overflowWindow };
+                    // #4288 rework: this clamp is the signature of the #1195/#3787
+                    // refold lanes — the upstream PROVED the payload overflows, so
+                    // the usage baseline (armed from the stated number just before
+                    // us) is evidence, not staleness. preflight's own-estimate
+                    // round exit must stay OFF here.
+                    upstreamProvedOverflow = true;
                 }
                 prepared = await runPrepare();
                 memProbe(opts.debug, log, session.id, "prepared", typeof prepared.body === "string" ? Buffer.byteLength(prepared.body) : prepared.body.byteLength);
@@ -2622,6 +2629,7 @@ async function handleRequest(
                         anonAffinity !== null,
                         log,
                         instanceId,
+                        upstreamProvedOverflow,
                     );
                     if (isPreflightFailFast(outcome)) {
                         // #301: the payload still overflows the window and
