@@ -230,9 +230,15 @@ export class UnifiedShadow {
             // construction. No auto-delete: the index may hold pinned checkpoint
             // blobs (#2671 Phase 2) — destructive recovery is operator policy.
             const errStr = String(err);
+            // Deleting the index cannot fix a no-engine failure (this Node.js has neither builtin
+            // node:sqlite nor a loadable better-sqlite3) — that advice only fits a genuine open
+            // failure; the Node.js upgrade lever is surfaced via /__bili/status + the bootstrap warn.
+            const tail = /no SQLite engine available/i.test(errStr)
+                ? ""
+                : `${sqliteOpenFailureHint(errStr)}; delete the file to reset the index`;
             loggerLog(
                 "warn",
-                `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${sqliteOpenFailureHint(errStr)}; delete the file to reset the index`,
+                `[storage] unified sidecar failed to open ${dir}/index.db (${errStr}) — staying legacy-only${tail}`,
             );
             recordSidecarOpenFailure(errStr);
             return null;
@@ -369,6 +375,7 @@ export class UnifiedShadow {
                     refs: this.sync.getRefs(legacy.id),
                 };
                 const replayed = loadLegacyView(rows);
+                warnTailGaps(legacy.id, replayed);
                 const expectView = { ...legacy, blockContents: orderedBlockContents(completeBlockContents(legacy.blockContents, legacy.state.blocks)) };
                 const gotView = { ...replayed, blockContents: orderedBlockContents(replayed.blockContents) };
                 const expect = shadowDigest(expectView);
@@ -514,7 +521,9 @@ export class UnifiedShadow {
             // The view's `state` object carries every MERGE_STATE_FIELDS key by
             // construction; the declared Record<string, unknown> just needs a
             // widening cast to reach LegacySessionLike.
-            return loadLegacyView(rows) as LegacySessionLike;
+            const unified = loadLegacyView(rows) as LegacySessionLike;
+            warnTailGaps(id, unified as unknown as { tailGaps?: number });
+            return unified;
         } catch (err) {
             loggerLog("warn", `[storage] unified load failed for ${id} (${String(err)}) — falling back to the legacy file`);
             return null;
@@ -631,6 +640,14 @@ export class UnifiedShadow {
         return tip;
     }
 
+    /** #3301: message rows for specific ids (+ seq±1 neighbors) — stored
+     *  decompositions for fold-anchor backfill after a wire-shape flip. */
+    messagesForIds(sessionId: string, msgIds: readonly string[], includeNeighbors: boolean): { seq: number; msgId: string; content: string }[] {
+        this.assertLive();
+        if (!this.sync) return []; // network backends cannot serve the sync decomposition lookup (#3931 architecture)
+        return this.sync.messagesForIds(sessionId, msgIds, includeNeighbors);
+    }
+
     /** All sessions row ids present in the index (#2960 R2.1). Used by the
      *  full-mode boot union so rows whose legacy file disappeared remain
      *  enumerable. */
@@ -728,6 +745,20 @@ export class UnifiedShadow {
      *  coverage matcher needs (msgId for fast path, ref for the
      *  upgrade-tolerant interval path, contentHash for the exact-content
      *  dedup path). */
+    /** #D5-5: identity-only rows (no content bytes) for the render lane. */
+    messageIdRows(sessionId: string): { seq: number; msgId: string }[] {
+        if (this.sync === null) return [];
+        this.assertLive();
+        return this.sync.messageIdRows(sessionId);
+    }
+
+    /** #D5-5: content rows outside the covered intervals only. */
+    uncoveredRows(sessionId: string, intervals: readonly [number, number][]): (MessageRow & { contentHash: string })[] {
+        if (this.sync === null) return [];
+        this.assertLive();
+        return this.sync.uncoveredRows(sessionId, intervals);
+    }
+
     tailViewRows(sessionId: string): MessageRow[] {
         if (this.sync === null) return [];
         this.assertLive();
@@ -745,6 +776,36 @@ export class UnifiedShadow {
         if (this.sync === null) return null;
         this.assertLive();
         return this.sync.getCcr(sessionId);
+    }
+
+    /** #4316 PR3/3: raw id → canonical seq (single-row ids only) for the
+     *  one-time ledger re-stamp. Shadow mode's index may lag files it has
+     *  not re-recorded, so like getCcr this is full-trust only: sync store
+     *  or nothing — a stale map would re-bind citations wrongly. */
+    seqByRaw(sessionId: string): Map<string, number> | null {
+        if (this.sync === null) return null;
+        this.assertLive();
+        return this.sync.seqByRaw(sessionId);
+    }
+
+    /** #4316 PR3/3: live (non-retired) message row count. */
+    liveRowCount(sessionId: string): number {
+        this.assertLive();
+        if (this.sync !== null) return this.sync.liveRowCount(sessionId);
+        return -1;
+    }
+
+    /** #4316 PR3/3: fork adoption row clone. Works in shadow AND full —
+     *  cloning parent rows the shadow has already mirrored keeps the child
+     *  view self-consistent in both modes; a parent with no rows (never
+     *  mirrored) clones nothing and the fork proceeds kernel-only. */
+    cloneSessionRows(parentId: string, childId: string, throughSeq: number): boolean {
+        this.assertLive();
+        if (this.sync !== null) {
+            this.sync.cloneSessionRows(parentId, childId, throughSeq);
+            return true;
+        }
+        return false;
     }
 
     /** #2960 R2.2: web list rows (stats/metadata JSON + block aggregates). */
@@ -912,13 +973,15 @@ export class UnifiedShadow {
                 const backend = this.backend!;
                 const sessionRow = await backend.getSessionRow(id);
                 if (!sessionRow) return null;
-                return loadLegacyView({
+                const loaded = loadLegacyView({
                     session: sessionRow,
                     messages: await backend.getMessages(id),
                     blocks: await backend.getBlocks(id),
                     deadRefs: await backend.getDeadRefs(id),
                     refs: await backend.getRefs(id),
                 }) as LegacySessionLike;
+                warnTailGaps(id, loaded as unknown as { tailGaps?: number });
+                return loaded;
             } catch (err) {
                 loggerLog("warn", `[storage] unified load failed for ${id} (${String(err)}) — falling back to the legacy file`);
                 return null;
@@ -1091,6 +1154,15 @@ export class UnifiedShadow {
     }
 }
 
+/** #4390: tail/pluginSnapshot pointers whose backing row is gone used to be
+ *  silently dropped — the view shrank with no trace (legacy tail 缺行静默
+ *  缩水). Make it loud: every load path reports the gap count. */
+function warnTailGaps(id: string, view: { tailGaps?: number }): void {
+    if ((view.tailGaps ?? 0) > 0) {
+        loggerLog("warn", `[storage] ${view.tailGaps} tail pointer(s) for ${id} reference missing rows — view is shorter than the recorded tail (#4390)`);
+    }
+}
+
 function shadowDigest(view: unknown): string {
     return sha256(JSON.stringify(canonicalize(view)));
 }
@@ -1127,6 +1199,10 @@ export function describeViewDivergence(expectView: unknown, gotView: unknown): D
     const ser = (v: unknown): string | null => (v === undefined ? null : JSON.stringify(canonicalize(v)));
     const keys: string[] = [];
     for (const k of [...new Set([...Object.keys(e), ...Object.keys(g)])].sort()) {
+        // tailGaps is read-time diagnostic metadata, not parity surface (#4390) —
+        // the live legacy leg structurally lacks the key, so it must never be
+        // named as a diverged dimension (a real gap diverges lastMessages itself).
+        if (k === "tailGaps") continue;
         if (ser(e[k]) !== ser(g[k])) keys.push(k);
     }
     const diagnostics: DriftDiagnostics = { keys };
