@@ -207,6 +207,7 @@ test("e2e: the notification classifier rides the side passthrough — no polluti
         assert.notEqual(JSON.stringify(s1.state), JSON.stringify(createInitialState()), "main request mutates kernel state");
         assert.equal(s1.stats.lastInputTokens, MAIN_INPUT_TOKENS, "main usage captured as the baseline");
         assert.equal(s1.metadata.outputBudgetHighWater, 1024, "high-water learned from the healthy main turn");
+        assert.equal(s1.metadata.lastModel, MAIN_MODEL, "the main model is recorded as the session's last model");
 
         const stateAfterMain = JSON.stringify(s1.state);
         const statsAfterMain = JSON.stringify(s1.stats);
@@ -240,6 +241,7 @@ test("e2e: the notification classifier rides the side passthrough — no polluti
         assert.equal(JSON.stringify(s2.lastMessages), snapshotAfterMain, "notification must NOT clobber the message snapshot");
         assert.equal(s2.stats.requests, requestsAfterMain, "notification must NOT increment the main request counter");
         assert.equal(s2.metadata.outputBudgetHighWater, 1024, "the notification's 3072 max_tokens must NOT seed the high-water");
+        assert.equal(s2.metadata.lastModel, MAIN_MODEL, "the notification's Haiku model must NOT become the session's last model");
 
         // Main turn 2: the pipeline still works after the notification request.
         const r3 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: MAIN_MODEL, max_tokens: 1024, stream: true, messages: mainConversation(9) }) });
