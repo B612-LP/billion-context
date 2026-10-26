@@ -108,6 +108,43 @@ export function replayBaseDelayMs(): number {
     return Number.isFinite(v) && v >= 0 ? v : REPLAY_BASE_DELAY_MS;
 }
 
+// --- #4204 egress-side 429 throttle governor ---
+
+const THROTTLE_429_MAX_CONSECUTIVE = 5;
+const THROTTLE_429_BASE_DELAY_MS = 2_000;
+const THROTTLE_429_MAX_DELAY_MS = 30_000;
+
+/** BILI_THROTTLE_429 > network.throttle429Enabled > true. The egress 429
+ *  governor (#4204) is ON by default: consecutive upstream 429s put sends to
+ *  that origin+credential on local backoff instead of amplifying a
+ *  concurrency-style provider limit. "0"/"false" restores the legacy
+ *  always-forward behavior. Read per request so the switch flips live. */
+export function throttle429Enabled(): boolean {
+    const envRaw = process.env.BILI_THROTTLE_429;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false");
+    return fileNetwork().throttle429Enabled !== false;
+}
+
+/** BILI_THROTTLE_429_MAX_CONSECUTIVE > network.throttle429MaxConsecutive > 5.
+ *  Consecutive upstream 429s before the hold turns TERMINAL (local 424 answers
+ *  outside every known SDK retry set, so hosts stop re-driving). */
+export function throttle429MaxConsecutive(): number {
+    const v = tInt("BILI_THROTTLE_429_MAX_CONSECUTIVE", fileNetwork().throttle429MaxConsecutive);
+    return Number.isInteger(v) && v >= 1 ? v : THROTTLE_429_MAX_CONSECUTIVE;
+}
+
+/** BILI_THROTTLE_429_BASE_DELAY_MS > network.throttle429BaseDelayMs > 2000. */
+export function throttle429BaseDelayMs(): number {
+    const v = tNum("BILI_THROTTLE_429_BASE_DELAY_MS", fileNetwork().throttle429BaseDelayMs);
+    return Number.isFinite(v) && v >= 0 ? v : THROTTLE_429_BASE_DELAY_MS;
+}
+
+/** BILI_THROTTLE_429_MAX_DELAY_MS > network.throttle429MaxDelayMs > 30000. */
+export function throttle429MaxDelayMs(): number {
+    const v = tNum("BILI_THROTTLE_429_MAX_DELAY_MS", fileNetwork().throttle429MaxDelayMs);
+    return Number.isFinite(v) && v >= 0 ? v : THROTTLE_429_MAX_DELAY_MS;
+}
+
 /** BILI_MAX_SHRINK_PER_COMPRESS > network.maxShrinkPerCompress > unset (no steering). */
 export function maxShrinkPerCompress(): number | undefined {
     const v = tNum("BILI_MAX_SHRINK_PER_COMPRESS", fileNetwork().maxShrinkPerCompress);
@@ -152,14 +189,6 @@ const PREFLIGHT_HOLD_GRACE_DEFAULT_MS = 30_000;
 export function preflightHoldGraceMs(): number {
     const v = tNumLoose("BILI_PREFLIGHT_HOLD_MS", fileNetwork().preflightHoldMs);
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_HOLD_GRACE_DEFAULT_MS;
-}
-
-const PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS = 5 * 60_000;
-
-/** BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS > network.preflightDeadEndCooldownMs > 300000. */
-export function preflightDeadEndCooldownMs(): number {
-    const v = tNumLoose("BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS", fileNetwork().preflightDeadEndCooldownMs);
-    return Number.isFinite(v) && v >= 0 ? Math.floor(v) : PREFLIGHT_DEAD_END_COOLDOWN_DEFAULT_MS;
 }
 
 /** BILI_PROXY_KEEPALIVE_MAX_MS > network.proxyKeepAliveMaxMs > 55000 (0 = one-shot connections). */
@@ -521,6 +550,30 @@ export function dshAuthoredCompactionEnabled(): boolean {
     return true;
 }
 
+/** BILI_DSH_CONTEXT_TAB > dsh.contextTab > true (#4237). Whether the official
+ *  dsh client registers its per-session Context tab (conversation.view slot).
+ *  Default ON = today's behavior; "0"/"false" (env) or false (file) hides the
+ *  top-bar entry only — compression is untouched and the ledger stays
+ *  reachable through the settings section, the plugin bundle config face, the
+ *  Web UI and /acp. Resolved by the host half at page-load time and shipped to
+ *  the browser half via the __BILI__ snapshot / /bili/origin route. */
+export function dshContextTabEnabled(): boolean {
+    const envRaw = process.env.BILI_DSH_CONTEXT_TAB;
+    if (envRaw !== undefined) return !(envRaw.trim() === "0" || envRaw.trim().toLowerCase() === "false");
+    return loadConfigFile().dsh?.contextTab !== false;
+}
+
+/** dsh.contextTabLabel (#4237): custom label for that Context tab. File-only
+ *  on purpose (#2030 env-var discipline: a display preference, not a secret /
+ *  spawn channel / host posture) and settable from the Web config page. A
+ *  trimmed non-empty string wins over the built-in localized label; anything
+ *  else keeps it. */
+export function dshContextTabLabel(): string | undefined {
+    const f = loadConfigFile().dsh?.contextTabLabel;
+    const s = typeof f === "string" ? f.trim() : "";
+    return s.length > 0 ? s : undefined;
+}
+
 /** BILI_DECOMPRESS_TMP_CAP > decompressTmpCap > 50. */
 export function decompressTmpCap(): number {
     const v = tIntLoose("BILI_DECOMPRESS_TMP_CAP", loadConfigFile().decompressTmpCap);
@@ -631,6 +684,18 @@ export function renderNone(): boolean {
     return fileDiag().renderNone === true;
 }
 
+/** BILI_INVARIANT_JUDGE > diagnostics.invariantJudge > true (#3938 decision ②).
+ * The I1/I2 outbound-invariant judge runs as an L1 advisory on every request —
+ * violations log at warn, clean verdicts at debug, traffic is never blocked.
+ * "0"/"false" disarms (env precedence follows the boolean-off convention so an
+ * operator can silence a noisy judge without a config edit). */
+export function invariantJudgeEnabled(): boolean {
+    const envRaw = process.env.BILI_INVARIANT_JUDGE;
+    if (envRaw !== undefined) return !(envRaw === "0" || envRaw === "false" || envRaw === "off");
+    const f = fileDiag().invariantJudge;
+    return typeof f === "boolean" ? f : true;
+}
+
 /** ACP_NO_INJECT_TOOL > diagnostics.noInjectTool > false. */
 export function noInjectTool(): boolean {
     const envRaw = process.env.ACP_NO_INJECT_TOOL;
@@ -711,6 +776,18 @@ export function fileStorageAutoDownload(): boolean | undefined {
 export function fileStorageArchiveAfterDays(): number | undefined {
     const v = loadConfigFile().storage?.archiveAfterDays;
     return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+}
+
+export function fileStorageBackend(): string | undefined {
+    const v = loadConfigFile().storage?.backend;
+    return typeof v === "string" ? v : undefined;
+}
+
+/** storage.mysql.dsn (#3388 step 2): the DSN for storage.backend="mysql".
+ *  env BILI_MYSQL_DSN wins (resolveMysqlDsn applies the precedence). */
+export function fileStorageMysqlDsn(): string | undefined {
+    const v = loadConfigFile().storage?.mysql?.dsn;
+    return typeof v === "string" && v.trim().length > 0 ? v : undefined;
 }
 
 export function fileStorageWalJournalSizeLimit(): number | undefined {

@@ -21,7 +21,7 @@ import { APIG_RESIGN_HEADER, APIG_RESIGN_CREDENTIAL_HEADER, APIG_RESIGN_SCHEME, 
  *  (protocol-shaped 422, the #2709 precedent) because forwarding it
  *  uncompressed cannot succeed — the body provably exceeds the model's
  *  context window. */
-export type GateVerdict = boolean | "refuse-oversized";
+export type GateVerdict = boolean | "refuse-oversized" | "refuse-oversized-unattributed";
 
 /** #3304: prepareDirectSend's verdict for one fall-back send to the real
  *  upstream (see the state field). */
@@ -32,13 +32,23 @@ export type DirectSendPrep =
 
 /** #3654: why createLiveOriginResolver found nothing to route to — the
  *  refusal wording must tell a live-but-saturated proxy (the busy wait window
- *  exhausted) apart from a dead one or a failed bootstrap. */
-export type UnavailableReason = "busy-exhausted" | "dead" | "bootstrap-failed";
+ *  exhausted) apart from a dead one or a failed bootstrap. #4125:
+ *  "send-failed" marks the send-failure recovery paths (the held origin
+ *  answered its probe but the send threw, and recover() produced no
+ *  replacement) so a give-up line can name that branch too. */
+export type UnavailableReason = "busy-exhausted" | "dead" | "bootstrap-failed" | "send-failed";
 
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
      *  Written by the owner (pi-native.ts); read synchronously on each call. */
     origin: string | undefined;
+    /** Origin the WS wrapper should rewrite codex Responses URLs to, when it
+     *  differs from `origin`. Inline mode (#3278 follow-up): `origin` is the
+     *  never-dialable pseudo-origin, so the WS lane needs the loopback bridge
+     *  (inline-ws.ts) instead. Holds the bridge origin, a Promise settling to
+     *  it (bridge still booting; construction defers, bounded, then degrades
+     *  DIRECT if it settles undefined), or undefined (use `origin`). */
+    wsOrigin?: string | Promise<string | undefined>;
     /** Resolves to the proxy origin once healthy, or undefined on failure. */
     ready: Promise<string | undefined>;
     /** Owner hook: re-run the bootstrap (proxy died → respawn). */
@@ -49,9 +59,12 @@ export interface NativeInterceptState {
      *  the traffic. */
     onGiveUp?: () => void;
     /** #3654: set before createLiveOriginResolver returns undefined — why
-     *  nothing was routable ("busy-exhausted" | "dead" | "bootstrap-failed");
-     *  cleared on the next successful resolution. The refusal builder reads it
-     *  to keep a live-but-saturated proxy out of "proxy unavailable" wording. */
+     *  nothing was routable (see UnavailableReason: "busy-exhausted" | "dead"
+     *  | "bootstrap-failed", plus #4125's "send-failed" set by the send-failure
+     *  recovery paths just before they fire onGiveUp); cleared on the next
+     *  successful resolution. The refusal builder reads it to keep a
+     *  live-but-saturated proxy out of "proxy unavailable" wording; the dsh
+     *  give-up seam appends it to the client event line (#4125). */
     lastUnavailableReason?: UnavailableReason;
     /** Attach mode (#809): route through a user-supplied external proxy at
      *  state.origin instead of a spawned one. Set by the host entry when a
@@ -124,7 +137,7 @@ export interface NativeInterceptState {
      *  window; the fetch lane answers it with a protocol-shaped 422 instead
      *  of an upstream 400. The optional body size lets the gate make that
      *  call without re-reading the request. */
-    takeoverGate?: (url: string, body?: { bytes: number }) => GateVerdict | Promise<GateVerdict>;
+    takeoverGate?: (url: string, body?: { bytes: number }, init?: RequestInit) => GateVerdict | Promise<GateVerdict>;
     /** How long a pre-ready model request waits for the bootstrap before
      *  falling back to a direct (uncompressed) send. */
     readyTimeoutMs?: number;
@@ -217,13 +230,17 @@ function noteSignedDirect(url: string, scheme: string, why: string): void {
 // `/v1/messages`, OpenAI chat `/v1/chat/completions` (and legacy
 // `/v1/completions`), Responses `/v1/responses`, Mistral
 // `/v1/chat/completions`|`/v1/conversations`, Google native
-// `/v1beta/models/<model>:(streamGenerateContent|generateContent|countTokens)`
-// — exactly the three methods the proxy core's googlePathKind prepares
-// (#2493; other Google methods such as `:predict` have no pipeline and must
-// keep passing through direct). Version segment is optional and unpinned
-// (zhipuai uses `/v4/chat/completions`, bailian mounts
-// `/apps/anthropic/v1/messages`), so match on the trailing shape only.
-const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^/:?]+:(?:streamGenerateContent|generateContent|countTokens)$/;
+// `/v1beta/models/<model>:(streamGenerateContent|generateContent|countTokens)`,
+// and Google Cloud Code / Antigravity's v1internal dialect
+// `/v1internal:(streamGenerateContent|generateContent|countTokens)` (#4256).
+// The model methods are exactly the three the proxy core prepares
+// (#2493; other Google methods such as `:predict` have no pipeline); the
+// v1internal arm matches ONLY those same three so Antigravity's non-model
+// control-plane POSTs (loadCodeAssist, fetchUserInfo, … — see
+// isV1InternalControlPlanePath) keep passing through direct. Version segment
+// is optional and unpinned (zhipuai uses `/v4/chat/completions`, bailian
+// mounts `/apps/anthropic/v1/messages`), so match on the trailing shape only.
+const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^/:?]+:(?:streamGenerateContent|generateContent|countTokens)$|(?:^|\/)v1internal:(?:streamGenerateContent|generateContent|countTokens)$/;
 
 /** True when the URL points at a model-API endpoint worth proxying. Never
  *  true for bili's own proxy paths (`/bili/…`, `/__bili/…`) or non-HTTP(S). */
@@ -471,6 +488,26 @@ function oversizeRefusal(url: string): Response {
     return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal", message, retryable: false } }), { status: 422, headers });
 }
 
+/** #4068/#4079: local refusal for an UNATTRIBUTED body the gate proved cannot
+ *  fit any window. `none` verdicts keep #1117 direct semantics by design — an
+ *  agentless lane is not ours to manage — but a body whose optimistic
+ *  byte-floor token count already exceeds the window has no direct future:
+ *  the raw send 400s/413s upstream and the host retries the SAME oversized
+ *  history every turn (the #4068 loop: a 6,165,048-token send against a
+ *  1,048,580 window). Refusing locally is damage control, not management —
+ *  same 422 policy-refusal class as oversizeRefusal, distinct remedy wording
+ *  (there is no broken scope to restart). */
+function unattributedOversizeRefusal(url: string): Response {
+    const message =
+        "billion-context refused this request locally: it is not attributed to any bili-managed session, and its body provably exceeds even a 1,000,000-token window — sending it directly to the provider can only be rejected (every retry re-sends the same oversized history, #4068). " +
+        "Route the conversation through a bili-managed session so it can be compressed (check the client's bili plugin attribution), or trim/remove the oversized content (e.g. a giant paste or tool result), or start a fresh session.";
+    const headers = { "content-type": "application/json", "x-bili-gate": "oversize-refusal-unattributed" };
+    if (url.endsWith("/messages")) {
+        return new Response(JSON.stringify({ type: "error", error: { type: "invalid_request_error", message } }), { status: 422, headers });
+    }
+    return new Response(JSON.stringify({ error: { type: "server_error", code: "bili_gate_oversize_refusal_unattributed", message, retryable: false } }), { status: 422, headers });
+}
+
 async function withTimeout<T>(p: Promise<T>, ms: number): Promise<T | undefined> {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timeout = new Promise<undefined>((resolve) => {
@@ -499,6 +536,14 @@ export async function readyOrigin(state: NativeInterceptState): Promise<string |
 // Observing one is therefore DIRECT EVIDENCE that this process's model channel
 // is pinned — the attach lanes consume it to decide wait/fail over spawn.
 
+// #3923: lanes without an owner hook (spawn mode — pi/opencode/dsh/omp/zcode/
+// kimi all arm the hook only in ATTACH mode) used to absorb routed-channel
+// evidence SILENTLY: baked `/bili/` URLs kept passing through to their foreign
+// origin while raw URLs followed state.origin, splitting one conversation
+// across two live instances with zero signal. Warn once per foreign origin
+// instead. (Attach lanes keep their owner-hook behavior untouched.)
+const routedMismatchWarned = new Set<string>();
+
 /** Record the origin of an already-routed model URL on the shared state and
  *  fire the owner hook on a transition (first observation or a NEW origin).
  *  MUST be called before any gate/await in the dispatch path: the recording
@@ -515,6 +560,15 @@ export function noteRoutedOrigin(state: NativeInterceptState, url: string): void
     }
     if (state.routedOrigin === origin) return;
     state.routedOrigin = origin;
+    if (state.onRoutedOriginObserved === undefined) {
+        const held = state.origin;
+        const normalizedHeld = held === undefined ? undefined : held.replace(/\/+$/, "").toLowerCase();
+        if (held !== undefined && normalizedHeld !== origin.toLowerCase() && !routedMismatchWarned.has(origin)) {
+            if (routedMismatchWarned.size >= 128) routedMismatchWarned.clear();
+            routedMismatchWarned.add(origin);
+            logHostEvent("error", "[native-client]", `bili-native: model traffic observed at ${origin} but this process's proxy is ${held} — requests will split across two bili instances and same-conversation state will desync (#394); align your client's /bili/ base URL with ${held} or stop one of the instances (#3923)`);
+        }
+    }
     state.onRoutedOriginObserved?.(origin);
 }
 
@@ -974,15 +1028,16 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // below, and once a replacement lands the pre-emptive reroute
             // carries unattributed riders along (still passthrough-marked).
             if (state.takeoverGate !== undefined) {
-                const verdict = await state.takeoverGate(routedTarget, bodyByteSizeOf(init));
-                if (verdict === "refuse-oversized") {
+                const verdict = await state.takeoverGate(routedTarget, bodyByteSizeOf(init), init);
+                if (verdict === "refuse-oversized" || verdict === "refuse-oversized-unattributed") {
                     // #2924 direction 1 (routed lane): an already-routed body
                     // the gate could not claim and that provably cannot fit
                     // fails LOCALLY here too — the #1117 passthrough marker
                     // would forward it verbatim into the very upstream 400 the
-                    // raw lane already refuses.
+                    // raw lane already refuses. The unattributed variant
+                    // (#4068) covers the same shape without a broken scope.
                     state.onDispatch?.(url, "refused");
-                    return oversizeRefusal(url);
+                    return verdict === "refuse-oversized" ? oversizeRefusal(url) : unattributedOversizeRefusal(url);
                 }
                 if (verdict !== true) {
                     const stamped = withHeaders(input, init, { [BILI_PASSTHROUGH_HEADER]: "1" });
@@ -1064,6 +1119,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     }
                     return resp;
                 }
+                state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
                 if (!warned) {
                     warned = true;
@@ -1142,7 +1198,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // #2924: the gate may need async settle-retries on a `threw`
             // attribution, and may answer `"refuse-oversized"` — both await
             // fine; a plain sync boolean (every other host) is unchanged.
-            const verdict = await state.takeoverGate(url, bodyByteSizeOf(init));
+            const verdict = await state.takeoverGate(url, bodyByteSizeOf(init), init);
             if (verdict !== true) {
                 // #2592/#2709 residual leak: an agentless dsh compaction call on a
                 // RAW provider URL (no settings overlay → nothing routed it) rode
@@ -1151,9 +1207,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // marker-sniffed POSTs into the proxy's unattributed passthrough
                 // lane (same stamp the overlay-routed case above uses), where the
                 // #2709 guard runs the decisive check: refused (422; dsh logs
-                // "step compaction failed" and continues the turn) or, with
-                // allowDshCompaction (#2028), relayed verbatim by explicit user
-                // decision. Everything else — plain traffic, stream bodies that
+                // "step compaction failed" and continues the turn) — the former
+                // allowDshCompaction opt-out was removed (#3666), so the refusal
+                // is unconditional. Everything else — plain traffic, stream bodies that
                 // cannot be peeked, a dead proxy — keeps #1117's direct semantics.
                 if (fetchMethodOf(input, init) === "POST" && await dshCompactionMarkerInBody(input, init)) {
                     const compactionOrigin = await readyOrigin(state);
@@ -1168,9 +1224,9 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // riding #1117's direct send into a guaranteed upstream 400 —
                 // on a >window local history that 400 kills the whole session,
                 // because every later request carries the same history.
-                if (verdict === "refuse-oversized") {
+                if (verdict === "refuse-oversized" || verdict === "refuse-oversized-unattributed") {
                     state.onDispatch?.(url, "refused");
-                    return oversizeRefusal(url);
+                    return verdict === "refuse-oversized" ? oversizeRefusal(url) : unattributedOversizeRefusal(url);
                 }
                 return directSendOrRefuse(url, input, init);
             }
@@ -1242,6 +1298,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // lifetime. Degrade exactly like a bootstrap failure: actually
                 // send the request direct, then let the owner clear proxy-owned
                 // state.
+                state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
                 if (!warned) {
                     warned = true;

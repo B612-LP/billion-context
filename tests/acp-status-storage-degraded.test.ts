@@ -111,3 +111,71 @@ test("#3385: healthy storage stays quiet — no degrade line", () => {
         rmrf(base);
     }
 });
+
+test("#3894: an unsupported Node surfaces the artifact-table reason, not generic no-engine", () => {
+    // Unsupported-node refuses the engine BEFORE any load, so the sidecar open
+    // ALSO records a "no SQLite engine available" open-error. That reason must
+    // outrank the generic one — otherwise the user sees "better-sqlite3 not
+    // installed" when the real cause is the running Node (#3894 dead-code fix).
+    const base = mkdtempSync(path.join(tmpdir(), "acp-status-3894-"));
+    const snap = isolate(base);
+    let store: SessionStore | null = null;
+    try {
+        setSqliteEnginesUnavailableForTests(true);
+        _resetStorageRuntimeStatusForTest();
+        recordEngineBootstrap({ status: "unsupported-node", detail: "no pinned SQLite engine runs on Node.js 21.7.3 (ABI 120)" });
+        store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
+        _setStoreForTest(store);
+
+        const out = handleAcpStatus({}, makeCtx());
+        const text = out.text ?? "";
+        assert.ok(text.includes("STORAGE —"), "the storage line is present");
+        assert.ok(text.includes("⚠ degraded —"), `the degrade warning line is present (got: ${text.slice(-400)})`);
+        assert.ok(text.includes("no self-downloaded SQLite engine supports this Node.js"), `the specific reason surfaces (got: ${text.slice(-400)})`);
+        assert.ok(/Node\.js 21\.7\.3/.test(text), "the reason carries the runtime the table could not serve");
+    } finally {
+        store?.closeQuietly();
+        _setStoreForTest(null as unknown as SessionStore);
+        setSqliteEnginesUnavailableForTests(false);
+        _resetStorageRuntimeStatusForTest();
+        restore(snap);
+        rmrf(base);
+    }
+});
+
+test("#4444: an unsupported Node surfaces the Node.js upgrade lever on the degrade reason", () => {
+    // Node 21 has NO pinned band (neither builtin node:sqlite nor a prebuild), so
+    // bootstrap is refused before any download -> unsupported-node. The degrade
+    // reason must carry BOTH the specific coverage detail (the #3894 ordering) AND
+    // the "upgrade Node.js" lever the sidecar-open branch carries — pre-#4444 the
+    // unsupported-node branch outranked it and dropped the lever entirely. The
+    // diagnosed runtime is forced to 21.6.1 so the lever is non-empty regardless
+    // of the runner's own (builtin-bearing) Node version.
+    const base = mkdtempSync(path.join(tmpdir(), "acp-status-4444-"));
+    const snap = isolate(base);
+    const origNodeDesc = Object.getOwnPropertyDescriptor(process.versions, "node");
+    let store: SessionStore | null = null;
+    try {
+        setSqliteEnginesUnavailableForTests(true);
+        _resetStorageRuntimeStatusForTest();
+        recordEngineBootstrap({ status: "unsupported-node", detail: "no pinned SQLite engine runs on Node.js 21.6.1 (ABI 120)" });
+        store = new SessionStore({ dir: process.env.BILI_SESSIONS_DIR, enabled: true });
+        _setStoreForTest(store);
+
+        Object.defineProperty(process.versions, "node", { value: "21.6.1", configurable: true, writable: true });
+        const text = handleAcpStatus({}, makeCtx()).text ?? "";
+        assert.ok(text.includes("STORAGE —"), "the storage line is present");
+        assert.ok(text.includes("⚠ degraded —"), `the degrade warning line is present (got: ${text.slice(-400)})`);
+        assert.ok(text.includes("no self-downloaded SQLite engine supports this Node.js"), "the specific coverage detail surfaces");
+        assert.ok(/Node\.js 21\.6\.1/.test(text), "the reason names the runtime the table could not serve");
+        assert.ok(/Node\.js >= 22\.5/.test(text), `#4444: the unsupported-node reason must carry the Node.js upgrade lever (got: ${text.slice(-400)})`);
+    } finally {
+        if (origNodeDesc) Object.defineProperty(process.versions, "node", origNodeDesc);
+        store?.closeQuietly();
+        _setStoreForTest(null as unknown as SessionStore);
+        setSqliteEnginesUnavailableForTests(false);
+        _resetStorageRuntimeStatusForTest();
+        restore(snap);
+        rmrf(base);
+    }
+});

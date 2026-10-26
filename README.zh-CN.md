@@ -145,6 +145,8 @@ npm install -g billion-context --prefix=~/.local
 
 这会安装 `bili` 命令(`bili-proxy` 保留为别名)。旧装的是 root 属主的 prefix、现在报 `EACCES`?用 `--prefix=~/.local` 重装即可根治(以后用 npm 重装 `bili` 时记得同样带上该参数)——不要用 `sudo`。
 
+想用容器?仓库根目录自带 `Dockerfile`——见下文[在 Docker 中运行](#在-docker-中运行)。
+
 ## 快速上手
 
 3种方式 —— 任选其一:
@@ -187,7 +189,7 @@ pi / omp / kimi / claude 没有客户端侧通道 —— 它们的配置条目�
 - OpenCode 旧会话、V1/V2 插件形态与全部注意事项:[OpenCode](CLIENTS.zh-CN.md#opencode)。
 - `kimi` 仅在自举时上报 runtime-info(静态头无法承载逐请求窗口/模型值);子代理工具调用由代理的出站 tool_use 见证环路由(#1685)——模型看不到任何会话 id。
 - `hermes` 的原生插件是 Python:健康检查通过后用环境变量把 hermes 的 httpx 栈指向代理,并经 `llm_request` 中间件打逐请求头。
-- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。#1821 起 MCP shell 还在会话内守护代理(30s × 3 次失败),代理死亡时自行重生,lane 内模型请求 ~90s 内恢复而无需新开会话(与 zcode 车道同语义)。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。**已知限制(#2290):** Claude Desktop 应用的 Code 标签页(`CLAUDE_CODE_ENTRYPOINT=claude-desktop`)会为其内嵌的 Claude Code 设置自己的 `ANTHROPIC_BASE_URL`,覆盖受管值——桌面会话完全绕过代理,而受管块的 `DISABLE_AUTO_COMPACT=1` 仍然生效,因此既没有 bili 压缩、也没有原生自动压缩。hook 会在会话开始时大声警告并记录下来供 `bili doctor` 展示(检测到本机装有 Claude Desktop 时,该 lane 也会显示 ⚠️ 提示);终端会话不受影响。**真机验证(2026-10-06,#2290):** 把 `HTTPS_PROXY` 写进 settings 的 `env` 块后,在 Claude Desktop 2.19675.1 / 内嵌 CC 2.1.288(Windows 11)上对一台开启 MITM 的存活代理**零 CONNECT 流量**——该变量没有到达应用内任何网络栈,与 CLI 侧「CC 的 undici 忽略 proxy env」的既有结论一致(这正是 `bili claude` 改用 `/bili/` base-URL 改写的原因)。截至该版本,桌面 Code 标签页不存在可用的路由缝隙;该 lane 继续在 [#2290](https://github.com/ranxianglei/billion-context/issues/2290) 跟踪,若上游行为变化再议。仅用桌面的用户可用 `bili plugin remove claude` 恢复原生自动压缩。
+- `claude` 有**原生姿态**(#964):受管 settings 块 + `SessionStart` hook + MCP shell;hook 骑自管端口区(#1660),每会话把受管 URL 重钉到存活 origin,端口漂移自愈。#1821 起 MCP shell 还在会话内守护代理(30s × 3 次失败),代理死亡时自行重生,lane 内模型请求 ~90s 内恢复而无需新开会话(与 zcode 车道同语义)。`BILI_NATIVE_CLAUDE=0` 退出(passthrough)。机制:[TECHNICAL-NOTES.zh-CN.md](TECHNICAL-NOTES.zh-CN.md)。**已知限制(#2290):** Claude Desktop 应用的 Code 标签页(`CLAUDE_CODE_ENTRYPOINT=claude-desktop`)会为其内嵌的 Claude Code 设置自己的 `ANTHROPIC_BASE_URL`,覆盖受管值——桌面会话完全绕过代理,而受管块的 `DISABLE_AUTO_COMPACT=1` 仍然生效,因此既没有 bili 压缩、也没有原生自动压缩。hook 会在会话开始时大声警告并记录下来供 `bili doctor` 展示(检测到本机装有 Claude Desktop 时,该 lane 也会显示 ⚠️ 提示);终端会话不受影响。**真机验证(2026-10-06,#2290):** 把 `HTTPS_PROXY` 写进 settings 的 `env` 块后,在 Claude Desktop 2.19675.1 / 内嵌 CC 2.1.288(Windows 11)上对一台开启 MITM 的存活代理**零 CONNECT 流量**——该变量没有到达应用内任何网络栈,与该时期的 CLI 行为一致——注意新版构建(CC 2.1.301 起)在 CLI 上会遵守 `HTTPS_PROXY`,这正是 `bili claude` 走 `/bili/` base-URL 改写的原因——launcher 不再为该 lane 设置代理、也不再设置 CA,而自带代理的子进程会把 loopback 主机合并进 `NO_PROXY`/`no_proxy`,确保无论子进程的代理行为如何,这一腿都保持直连(#3446)。截至该版本,桌面 Code 标签页不存在可用的路由缝隙;该 lane 继续在 [#2290](https://github.com/ranxianglei/billion-context/issues/2290) 跟踪,若上游行为变化再议。仅用桌面的用户可用 `bili plugin remove claude` 恢复原生自动压缩。
 - `zcode` 有**原生姿态**(#1145):受管 `~/.zcode/cli/config.json` 块 + 每会话 provider `baseURL` 改写。完整机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)。
 - `omp` 是自拉起原生插件;`codex` 性质不同 —— 它是 MCP shell 工具面配套:codex 的模型流量只能经 env 路由(默认 ChatGPT-登录 provider 没有可改写的配置缝 —— managed `model_providers` 块会强制 API-key 认证、废掉订阅登录),而 MCP 子进程无法向父进程注入 env,所以插件安装既不拉代理、也永远路由不了 codex 本体流量。`bili plugin install codex` 在 `~/.codex/config.toml` 写入 `[mcp_servers.bili]`(command = node,args = dist/mcp.js)注册四个 ACP 工具,会话启动时解析代理:env `BILI_MCP_PROXY` > 活实例登记(任一 lane 的代理或 `bili start` 守护)> 8787 用户区默认(#1660 去掉了安装时烘焙 origin,#403)—— 全不可达则 `tools/list` 报 -32003。结论:**先起 bili**(`bili start` 或任一客户端的 lane 代理),想要压缩再自行导出 HTTPS_PROXY;零配置全功能用 `bili codex`。机制:[CLIENTS.zh-CN.md](CLIENTS.zh-CN.md#codexopenai-codex-cli)。
 - `jcode`、`aider` 无原生模式(无插件/MCP/工具注入接缝:#962、#1048)—— 用 `bili jcode` / `bili aider`。
@@ -283,7 +285,7 @@ bili --version
 
 **`/acp` 显示什么?** 带原生插件的客户端(opencode、dsh)里,`/acp` 直接从代理取当前会话的 ACP 状态面板(会话、块、可压缩区间、用量);首个模型请求到来前显示空闲提示。`/acp-cache [full]` 打印上面的缓存报告。
 
-**能用网页查会话和配置吗?** 能 —— 打开 [http://localhost:8787](http://localhost:8787):总览仪表盘、会话列表(含逐会话详情)、实时日志、配置编辑器、上游连通性测试。全部功能同样以纯 JSON 提供(`/__bili/stats`、`/__bili/sessions`、`/__bili/config`、…),方便脚本化。
+**能用网页查会话和配置吗?** 能 —— 打开 [http://localhost:8787](http://localhost:8787):总览仪表盘、会话列表(含逐会话详情)、实时日志、配置编辑器、上游连通性测试。「博客」页还在面板内直接渲染几篇随装内置的发布笔记与长文(离线可看;完整文库在 GitHub Pages)。其余功能同样以纯 JSON 提供(`/__bili/stats`、`/__bili/sessions`、`/__bili/config`、…),方便脚本化。
 
 **压缩什么时候发生?** 由模型驱动:注入的上下文工具由模型在上下文增长时自行调用,温和的增长 nudge(按设计固定约 50K token 步长,可用 `compress.nudgeGrowthTokens` 调整)沿途提醒它,仅输入就超窗时预检作为硬兜底触发(#470)。用 `/acp` 或网页界面实时观察。
 
@@ -291,9 +293,33 @@ bili --version
 
 **bili 是透明的吗?怎么关掉?** 未识别端点原样转发([CLIENTS.zh-CN.md](CLIENTS.zh-CN.md)),且每种模式都能干净退出:原生安装用 `bili plugin remove <client>`,另两种模式停掉启动器命令 / 环境变量 / `/bili/` 前缀即可 —— 流量立刻恢复直连。
 
+**能配合模型路由网关(如 [magpie](https://github.com/yetone/magpie))用吗?** 能 —— 客户端指向 bili、bili 经 `/bili/` 前缀指向网关(前缀内嵌网关的绝对 URL):`http://localhost:8787/bili/http://127.0.0.1:3425…`。例:Claude Code → `ANTHROPIC_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425` + `ANTHROPIC_API_KEY=magpie`;OpenAI 系客户端 → `OPENAI_BASE_URL=http://localhost:8787/bili/http://127.0.0.1:3425/v1`(+ `OPENAI_API_KEY=magpie`)。压缩发生在路由*之前*——到达网关节点里任何账号的请求都已是压缩后的。凭据留在网关内:客户端的假 key 原样穿过,真实 key 不接触 bili。注意:① 会话中途切换账号会使 provider 前缀缓存失效——多账号路由的固有代价,与 bili 无关(见 `/acp-cache` 的 KEY SWITCHES 段);② 路由后的模型名对 bili 的窗口查询不透明——需在 providers 键 `http://127.0.0.1:3425` 下用 `models.<name>.context` 声明其上下文窗口,否则按兜底窗口运行(route-miss 警告,#2317);③ 中继若拒绝 bili Anthropic 车道的 `cache_control` 标记,设 `compat.noCacheControl`;④ 回环网关开箱即用;网关在非回环私网地址时可能还需 `network.allowPrivateHttpProviders`(#2984)。三条线(OpenAI Chat / Responses / Anthropic Messages,含跨协议转换)已端到端实测,#4433。
+
 **日志和会话数据存在哪?** 日志:`~/.local/state/billion-context/bili.log`(同时镜像到 stderr);会话状态:`~/.local/share/billion-context/`(XDG 可覆盖;Windows 杀软排除 #362、可选清理 #1082)—— 完整路径见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
 
 ## 运行代理
+
+### 在 Docker 中运行
+
+仓库根目录自带 `Dockerfile`——构建期从 npm 装已发布的包(被测试过的产物;镜像里不编译任何东西),把代理作为服务跑起来:
+
+```bash
+docker build -t billion-context .
+docker run -d --name bili -p 8787:8787 \
+  -v bili-config:/root/.config/billion-context \
+  -v bili-data:/root/.local/share/billion-context \
+  -v bili-cache:/root/.cache/billion-context \
+  -v bili-state:/root/.local/state/billion-context \
+  billion-context
+```
+
+然后把客户端 baseURL 指到 `http://<host>:8787/bili/…`,和上面方式 3 完全一样。
+
+- **基础镜像:** `node:24-slim` —— 直接用内置 `node:sqlite` 存储引擎(不发生 native addon 下载)。不要换成 Node 20 基础镜像:自举下载的 SQLite 引擎要求 Node ≥ 22,在 20 上会崩(#3341)。
+- **更新:** 容器内自更新**默认关闭**(`ACP_AUTO_UPDATE=0`)——容器化副本的合法升级通道是重建/pull 新镜像;原地自更新会在下次重建时被静默回退到镜像版本。想开回来用 `-e ACP_AUTO_UPDATE=1`;构建期钉版本用 `--build-arg BILI_VERSION=0.1.197`(默认 `latest`)。
+- **数据:** 四个挂载目录分别存放配置、会话状态、更新节流/锁 + 缓存的 SQLite 引擎、日志。挂 volume 或 bind mount 让它们跨容器替换存活;镜像也把这四个目录声明为 `VOLUME`,裸 `docker run` 也不会把它们落进容器层。
+- **安全:** 容器监听 `0.0.0.0:8787` 以便外部客户端接入——**没有认证**,端口只应暴露给可信网络(与下面 `--host 0.0.0.0` 的注意事项相同)。Web UI 和 `/__bili/*` JSON 端点经映射端口照常可用。
+- **健康检查:** 镜像自带 `HEALTHCHECK`,用 node 内置 fetch 探 8787 上的 `/__bili/health`(slim 基础无需 curl);若覆盖监听端口,注意探针仍钉在 8787。
 
 ### 命令行参数
 
@@ -337,7 +363,7 @@ bili --no-auto-update        # 本次启动禁用自动更新
 
 **升级撒点(#3619):** 发现新版本后,自动更新不再立即应用。每台实例在延迟窗口内随机抽取**一个**时刻(内置默认 **15 分钟 – 48 小时**),到点再升;抽中的时刻落盘持久化,重启不重摇。全量升级因此摊开在整个窗口内,而不是发版后十几分钟内全体升完,给坏发版留出中途拦截的响应窗(#3401/#3600/#3394)。窗口与紧急控制放在一个公开的策略文件里(本仓库的 `auto-update-policy.json`,匿名 GET + ETag 缓存):`hold` 全局冻结自动升级、`blocked` 跳过指定版本、`pinned` 设置升级天花板。按设计 fail-open——文件不可达或格式非法时直接回退本地默认;而且它只能调节奏/跳过/钉住,**永远控制不了装什么**。本机退出方式:手动 `bili update` 绕过 `hold`/撒点(但仍遵守 `blocked`/`pinned`)、`"staggerMinDelayMs": 0` + `"staggerMaxDelayMs": 0`(或 `BILI_UPDATE_STAGGER_MIN_MS`/`BILI_UPDATE_STAGGER_MAX_MS`)恢复旧版立即升级、`ACP_AUTO_UPDATE=0` 完全停用自动更新。完整格式与语义见 [CONFIGURATION.zh-CN.md → `update`](CONFIGURATION.zh-CN.md#update)。
 
-**插件模式**(`bili opencode` / `bili pi` / `bili dsh` —— 代理内嵌在长驻宿主里运行时),"重启 bili"指的是重启**宿主**:内嵌进程无法自行退出,所以一直开着的宿主会持续运行它启动时的那份代码,默默地错过自动更新报告为"已安装"的每一处修复(#1603)。启用 `--auto-restart-on-update` 可让它在安全点自重启;或运行 `/acp`(当前仅 OpenCode 宿主,pi/dsh 覆盖见 #2084)—— 当磁盘安装领先于运行进程时,状态面板会追加一行过期警告(运行版本 vs 已安装版本)。
+**插件模式**(`bili opencode` / `bili pi` / `bili dsh` —— 代理内嵌在长驻宿主里运行时),"重启 bili"指的是重启**宿主**:内嵌进程无法自行退出,所以一直开着的宿主会持续运行它启动时的那份代码,默默地错过自动更新报告为"已安装"的每一处修复(#1603)。启用 `--auto-restart-on-update` 可让它在安全点自重启;或运行 `/acp`(当前仅 OpenCode 宿主,pi/dsh 覆盖见 #2084)—— 当磁盘安装领先于运行进程时,状态面板会追加一行过期警告(运行版本 vs 已安装版本)。若注入代码在运行期损坏(如 agent scope 被销毁),模型流量会静默直连(不压缩),直到宿主重启;自 #3581 起该状态可见:无会话运行时插件上报归属闸门降级,Web UI 显示「接管已失效」横幅,`GET /__bili/status` / `/__bili/overview` 暴露每代理的 `attribution` 状态。**按设计无归属**的后台车道(如 dsh 标题生成 sidecar)本身不携带 initiator,其小体量一次性请求按定义直连——按 #3651 契约这类正常拦截**永不报告**,因此永远不会触发横幅。横幅只在归属查询本身抛错(宿主内部错误,如 agent scope 被销毁)时出现,并给出可诊断信息:抛出的错误文本、脱敏后的端点、起始时间、已直连的请求数、解决方法(重启宿主进程),以及复制/提交诊断按钮(预填 GitHub issue)。
 
 **自 v0.1.183 起,更新提示默认静默(#1977):**routine/recommended 版本不再在 `/acp` 面板脚注或 `acp_status` 中渲染更新行 —— 只有 `critical` 级别的版本会在那里显示(`CRITICAL UPDATE READY/AVAILABLE`)。检查"已安装未重启"版本的常设途径即上文所列的过期线索:Web UI 横幅、`/acp` 单行警告、以及 `GET /__bili/status`。刻意不设常驻提醒;严重缺陷公告通道(#1481)仍是唯一自动可见的严重路径。
 
@@ -441,6 +467,21 @@ bili --no-auto-update        # 本次启动禁用自动更新
 ### 会话文件清理（#1082）
 
 短命会话会留下永远不会再被恢复的小状态文件。清理是**可选开启(opt-in)**的:设 `BILI_SESSION_GC=1` 才启用(默认关闭 —— 会话文件属于用户数据,不应有静默删除策略)。启用且持久化开启时,bili 在启动时和每小时扫描会话目录,只有**两个条件同时满足**才删除一个文件:年龄超过 `BILI_SESSION_GC_MAX_AGE_DAYS`(默认 7 天),并且该会话**从未被压缩过**(没有折叠块)、最近一次请求体 ≤ `BILI_SESSION_GC_MAX_TOKENS` token(默认 1M)—— 删除只丢字节不丢内容。CCR 内容存储遵循其会话文件的生命周期;被压缩过的会话永不删除;每次删除都写审计日志。详见 [CONFIGURATION.zh-CN.md](CONFIGURATION.zh-CN.md)。
+
+### 存储维护 CLI（#3928）
+
+面板通过 HTTP(`POST /__bili/storage/gc`、`POST /__bili/storage/restore`)暴露的同一套存储维护操作,现在有一个薄的 CLI 层 —— 不需要代理进程,在持有会话目录的任何机器上都能直接跑:
+
+```bash
+bili sessions ls                 # id、label、解码后大小、最后更新时间、存储状态(active/archived)
+bili sessions rm <id>            # 完整删除(释放内容引用计数,含媒体);随后收缩 index.db(--no-vacuum 跳过)
+bili sessions archive <id>       # 导出到 archive/archive.jsonl + 清行;tombstone 保留 label 与身份
+bili sessions restore <id>       # 从日志行恢复已归档的会话
+bili storage gc [--days N] [--vacuum full|incremental] [--dry-run]
+                                 # 先打印清扫计划(超期会话、零引用内容行、可回收页数估算),再执行与 HTTP 端点相同的 gc();--dry-run 只打印计划
+```
+
+`archive`/`restore`/`gc` 需要统一存储(`BILI_STORAGE_UNIFIED=shadow|full` 或配置文件里的 `storage.unified`)—— legacy-only 安装会拒绝并给出提示。`--days` 默认取 `storage.archiveAfterDays`(365)。没有调度器:全部按需运行。所有命令都支持 `--json`。
 
 ## 状态
 
