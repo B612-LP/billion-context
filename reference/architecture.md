@@ -19,6 +19,7 @@ billion-context/
 │   │   ├── context-window.ts     #   Context-window resolution (launcher model channel, beta headers)
 │   │   ├── dsh-compaction-guard.ts #   Rejects dsh whole-prefix compaction replays (#1729)
 │   │   ├── handle.ts             #   Proxy request pipeline (route triage, compat relay, compress orchestration) (#1440 P2 cut 3)
+│   │   ├── handoff-response.ts   #   Retains parsed assistant output for handoff export without changing request snapshots
 │   │   ├── headers.ts            #   Client-provided id sanitization for dump filenames (#286)
 │   │   ├── inject.ts             #   Per-wire tool-injection wrappers + FORCE_TEXT_PROTOCOL switch (#1440)
 │   │   ├── observability.ts      #   Body dumps (dumps/req-*.json, raw/*), unrecognized-path stats
@@ -179,6 +180,8 @@ billion-context/
 │   │   └── native.ts             #   Routing scope/exemptions policy (#1622)
 │   └── web/                      # Web UI (config editor, sessions, logs)
 │       ├── api.ts                #   REST handlers (config get/put with parse-state guard)
+│       ├── blogfeed.ts           #   Panel blog/articles feed from bundled markdown (#4587)
+│       ├── changelog.ts          #   GitHub Releases feed for the panel changelog (#3719)
 │       ├── sessions-data.ts      #   Read-only session browsing (live pool + on-disk, #1420); tier tree + lazy block content (#3917)
 │       ├── logs-query.ts         #   GET /__bili/logs selection engine
 │       ├── markdown.ts           #   Escape-safe Markdown → HTML (#1420)
