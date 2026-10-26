@@ -130,13 +130,52 @@ const PLUGIN_REQUEST_AGENT_HEADER = "x-bili-plugin-agent";
 
 const PLUGIN_PROTOCOL_VERSION = 1;
 
-/** #1567: folds executed through POST /__bili/plugin/tool are minted this
- *  synthetic callId, which the client can never echo back — its own re-sent
- *  compress pair is the summary carrier for such blocks, so the kernel's
- *  in-place acp_summary anchor is redundant and must be stripped (#1567). */
+/** #1567: legacy callers without a native tool-call id get a synthetic id.
+ *  Their resent compress pair is recognized by range as a summary carrier. */
 const PLUGIN_FOLD_CALLID_PREFIX = "plugin_";
 export function isPluginFoldCallId(callId: string | undefined): boolean {
     return typeof callId === "string" && callId.startsWith(PLUGIN_FOLD_CALLID_PREFIX);
+}
+
+/** Reconnect legacy plugin blocks before the kernel mistakes their live carriers for orphans. */
+export function reconcilePluginFoldCallIds(session: Session, messages: CoreMessage[]): number {
+    const blocks = new Map<string, typeof session.state.blocks>();
+    for (const block of session.state.blocks) {
+        if (!block.active || !block.startRef || !block.endRef) continue;
+        const key = JSON.stringify([block.startRef, block.endRef]);
+        const sameRange = blocks.get(key) ?? [];
+        sameRange.push(block);
+        blocks.set(key, sameRange);
+    }
+    const calls = new Map<string, Set<string>>();
+    const results = new Map(messages.filter((m) => m.contentType === "tool-result" && m.toolCallId).map((m) => [m.toolCallId!, m.text ?? ""]));
+    for (const message of messages) {
+        if (message.contentType !== "tool-call" || message.toolName !== "compress" || !message.toolCallId) continue;
+        try {
+            const args = JSON.parse(message.text ?? "") as { content?: unknown; startId?: unknown; endId?: unknown };
+            for (const range of Array.isArray(args?.content) ? args.content : [args]) {
+                if (!range || typeof range.startId !== "string" || typeof range.endId !== "string") continue;
+                const key = JSON.stringify([range.startId, range.endId]);
+                if (!blocks.has(key)) continue;
+                const ids = calls.get(key) ?? new Set<string>();
+                ids.add(message.toolCallId);
+                calls.set(key, ids);
+            }
+        } catch { /* Invalid historical arguments cannot establish ownership. */ }
+    }
+    let changed = 0;
+    for (const [key, sameRange] of blocks) {
+        const block = sameRange[0]!;
+        const ids = calls.get(key);
+        if (sameRange.length !== 1 || !isPluginFoldCallId(block.compressCallId) || ids?.size !== 1) continue;
+        const id = ids.values().next().value!;
+        const receipt = results.get(id);
+        if (!receipt?.startsWith("[Compressed ") || !receipt.split("\n").some((line) => line.startsWith(` · ${block.blockId} full summary `))) continue;
+        block.compressCallId = id;
+        changed++;
+    }
+    if (changed > 0) markDirty(session);
+    return changed;
 }
 
 const VERSION = (() => {
@@ -936,6 +975,9 @@ export type PluginToolDeps = {
     // Browser-reachable origin of THIS proxy (http://host:port) for the human-facing
     // Web UI deep links inside panels/reports; absent in test harnesses/embeds.
     webOrigin?: string;
+    // #4571: true when the answering engine is the in-process inline lane —
+    // the status panel appends " · inline" so a screenshot names its mode.
+    inlineLane?: boolean;
     signal?: AbortSignal;
 };
 
@@ -1585,7 +1627,9 @@ function chainAdvisoryPanel(v: ChainVerdict): string {
  *  usable origin was provided (tests/embeds) or the id is empty. */
 function webSessionUrl(origin: string | undefined, sessionId: string): string | undefined {
     const o = typeof origin === "string" ? origin.trim().replace(/\/+$/, "") : "";
-    if (o.length === 0 || sessionId.length === 0) return undefined;
+    // ":0" = no real listener (the inline lane's web bind failed, or a test
+    // fixture) — printing a dead port is worse than printing nothing.
+    if (o.length === 0 || o.endsWith(":0") || sessionId.length === 0) return undefined;
     return `${o}/__bili/#/session/${encodeURIComponent(sessionId)}`;
 }
 
@@ -1708,7 +1752,7 @@ export function handlePluginStatus(conversationId: string, res: import("node:htt
         // same addition so the Session-only derivation (unpruned − sent) still
         // isolates pruned originals on one scale.
         panel = buildStatusPanel({
-            version: `billion-context@${PROXY_VERSION}${BUILD_COMMIT && BUILD_COMMIT !== "unknown" ? ` (${BUILD_COMMIT})` : ""} · pack: ${session.meta.activePack ?? "default"}`,
+            version: `billion-context@${PROXY_VERSION}${BUILD_COMMIT && BUILD_COMMIT !== "unknown" ? ` (${BUILD_COMMIT})` : ""} · pack: ${session.meta.activePack ?? "default"}${deps.inlineLane ? " · inline" : ""}${deps.webOrigin ? ` · via ${deps.webOrigin}` : ""}`,
             // #2671: effective storage mode — legacy/shadow/full, including
             // the encryption-blocked downgrade. Display-only, from the env the
             // store actually resolved.
@@ -1819,9 +1863,9 @@ export async function handlePluginTool(
     res: import("node:http").ServerResponse,
     deps: PluginToolDeps,
 ): Promise<void> {
-    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown };
+    let parsed: { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown; toolCallId?: unknown };
     try {
-        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown };
+        parsed = JSON.parse(payload) as { conversationId?: unknown; tool?: unknown; args?: unknown; expectedRevision?: unknown; nativeCaller?: unknown; toolCallId?: unknown };
         if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) throw new Error("expected tool object");
     } catch {
         res.writeHead(400, { "content-type": "application/json" });
@@ -1830,6 +1874,7 @@ export async function handlePluginTool(
     }
     const conversationId = typeof parsed.conversationId === "string" ? parsed.conversationId.trim() : "";
     const tool = typeof parsed.tool === "string" ? parsed.tool : "";
+    if (parsed.toolCallId !== undefined && (typeof parsed.toolCallId !== "string" || !parsed.toolCallId.trim() || parsed.toolCallId.length > 512)) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "toolCallId must be a non-empty string of at most 512 characters" });
     if (parsed.expectedRevision !== undefined && (typeof parsed.expectedRevision !== "string" || !/^[a-f0-9]{64}$/.test(parsed.expectedRevision))) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "expectedRevision must be a snapshot revision" });
     if (parsed.expectedRevision !== undefined && !conversationId) return forkReply(res, 400, { ok: false, code: "INVALID_REQUEST", error: "expectedRevision requires conversationId" });
     // Explicit ids never yield to another session's outbound witness. A
@@ -2015,7 +2060,7 @@ export async function handlePluginTool(
     // may still echo one — strip it before kernel arg parsing sees it (the
     // witness hash in tool-ring.ts strips the same key).
     delete args.conversation_id;
-    const callId = `${PLUGIN_FOLD_CALLID_PREFIX}${Date.now().toString(36)}`;
+    const callId = typeof parsed.toolCallId === "string" ? parsed.toolCallId : `${PLUGIN_FOLD_CALLID_PREFIX}${Date.now().toString(36)}`;
     acquireInFlight(session);
     let result: ProxyToolResult | undefined;
     let retrievalExport: RetrievalExport | undefined;
