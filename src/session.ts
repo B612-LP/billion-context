@@ -1394,6 +1394,7 @@ export function snapshotMessages(session: Session, messages: CoreMessage[]): voi
     if (messages.length > 0) {
         session.lastMessages = messages;
         session.lastMessagesFolded = false;
+        delete session.metadata.handoffResponse;
     }
 }
 
