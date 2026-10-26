@@ -1,7 +1,7 @@
 import type { WireProtocol } from "../util.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
-import { reserveOutputHeadroom, shouldReserveOutputHeadroom, systemCarrierTexts } from "../util.js";
+import { reserveOutputHeadroom, systemCarrierTexts } from "../util.js";
 import { type ResolvedImageBilling } from "../image-tokens.js";
 import { ACP_TOOL_NAMES, ABSORB_TOOL_NAME, RETRIEVE_TOOL_NAME, RULE_TOOL_NAME } from "acp-kernel";
 import { READ_ORIGINAL_IMAGE_TOOL_NAME } from "../compress-tool.js";
@@ -113,6 +113,65 @@ export function isDshTitleRequest(parsed: unknown): boolean {
     const p = parsed as Record<string, unknown>;
     if (Array.isArray(p.tools) && p.tools.length > 0) return false;
     return systemCarrierTexts(p).some((t) => t.startsWith(DSH_TITLE_SYSTEM_PREFIX));
+}
+
+// #4438: dsh's auto-review sidecar (@deepseek-ai/dsh-experimental-auto-review's
+// classifyRisk()) fires before every native tool call under the Auto permission
+// tier: a fixed REVIEW_POLICY system prompt + exactly ONE freshly-flattened user
+// blob (ENVIRONMENT / PROJECT_INSTRUCTIONS / FILTERED_HISTORY / PENDING_ACTION),
+// no tools, same conversation id as the main turn. On at least one deployment
+// class (web profile behind a gateway) the extension's own model client reaches
+// bili UNSTAMPED — no x-bili-plugin — while the session's sticky plugin binding
+// keeps the #2432 rebase gate armed for it: every header-gated isolation gate
+// (persona fork #1916, title clause #2503) misses the request, the blob rides
+// the raw main key through the FULL pipeline, its embedded old-checkpoint
+// framing false-positives the local-compaction carrier (#2621 class, total fold
+// state wipe), and its usage sample clobbers the main baseline so the next turn
+// skips the output clamp (#453) into permanent upstream 400s.
+// Shape-decisive WITHOUT a caller-side header gate — deliberately different from
+// isDshTitleRequest's discipline: the shape carries its own client evidence
+// (dsh's fixed REVIEW_POLICY first line, version-pinned like
+// DSH_TITLE_SYSTEM_PREFIX / DSH_COMPACTION_INSTRUCTION_PREFIX), and the header
+// gate is precisely what failed here. A main turn can never match: it carries a
+// tools surface and multi-turn history; the single-blob bar rejects every
+// history-replaying request.
+export const DSH_AUTO_REVIEW_SYSTEM_PREFIX = "You are the final authorization reviewer for exactly one pending tool call";
+
+export function isDshAutoReviewRequest(protocol: string | null, parsed: unknown): boolean {
+    if (protocol === null || !parsed || typeof parsed !== "object") return false;
+    const p = parsed as Record<string, unknown>;
+    // Same no-tools veto as isSideRequest/isDshTitleRequest: any action surface
+    // marks an agent turn, not the reviewer's one-shot call.
+    if (Array.isArray(p.tools) && p.tools.length > 0) return false;
+    // The fixed reviewer policy on ANY wire's system carrier (top-level system,
+    // instructions, systemInstruction.parts, or a role:system entry in
+    // messages[]/input[]) — systemCarrierTexts reads them all (#3149 lesson).
+    if (!systemCarrierTexts(p).some((t) => t.trimStart().startsWith(DSH_AUTO_REVIEW_SYSTEM_PREFIX))) return false;
+    const entries = protocol === "responses" ? p.input : protocol === "google" ? p.contents : p.messages;
+    if (!Array.isArray(entries)) return false;
+    let users = 0;
+    let userHasContent = false;
+    for (const entry of entries) {
+        if (entry === null || typeof entry !== "object") continue;
+        const rec = entry as Record<string, unknown>;
+        const role = rec.role;
+        if (role === "system" || role === "developer") continue;
+        // Responses-side typed items that are not plain messages (reasoning,
+        // function_call, …) can only appear in a real model round-trip.
+        if (role !== "user") return false;
+        if (rec.type !== undefined && rec.type !== "message") return false;
+        users += 1;
+        const c = rec.content ?? rec.parts;
+        if (typeof c === "string") {
+            if (c.length > 0) userHasContent = true;
+        } else if (Array.isArray(c) && c.length > 0) {
+            userHasContent = true;
+        }
+    }
+    // Exactly ONE non-system message with content: the freshly-flattened review
+    // snapshot. A replayed history (any assistant/tool turn or a second user
+    // message) vetoes — see the comment above the constant.
+    return users === 1 && userHasContent;
 }
 
 // #2170 measure 1: the two lane gates extracted from src/server.ts so they have
@@ -354,6 +413,22 @@ function noCeilingWarnText(sessionId: string, model: string, from: number, to: n
     return `[${sessionId}] output-budget restore has NO known output ceiling for model=${model} (raised ${from} -> ${to}) — the target was the client's own raw-history estimate, which decays unbounded; while it stays pathologically small every turn truncates at max-tokens. Declare the model's max output in the bili config (providers.<url>.models."${model}".output) or have the client report it to floor the restore higher (#1840/#3071)`;
 }
 
+// #3438: one-shot per SESSION+MODEL warn for the UNRESCUABLE dsh-lane mid-band —
+// a tool-carrying budget above the <=200 starve gate with NO known output ceiling
+// cannot be told apart from a deliberate cap, so it forwards verbatim; this warn
+// gives the previously silent high-water branch observability without spamming.
+const warnedDshMidBandNoCeiling = new Set<string>();
+function noteDshMidBandNoCeilingWarning(sessionId: string, model: string): boolean {
+    const key = `${sessionId}|${model}`;
+    if (warnedDshMidBandNoCeiling.has(key)) return false;
+    if (warnedDshMidBandNoCeiling.size >= WARNED_NO_OUTPUT_CEILING_CAP) warnedDshMidBandNoCeiling.clear();
+    warnedDshMidBandNoCeiling.add(key);
+    return true;
+}
+export function _resetDshMidBandWarningsForTest(): void {
+    warnedDshMidBandNoCeiling.clear();
+}
+
 // #2904: the no-ceiling degraded state surfaced by the /acp panel, the
 // /__bili/plugin/status?conversationId= JSON and the web session page while it holds. #1840's
 // once-per-model log warn is invisible to GUI hosts (stderr swallowed), so the
@@ -398,12 +473,27 @@ function clearNoCeilingDegraded(session: { metadata: Record<string, unknown> }, 
  *  providers that cap maxOutputTokens below 32K (availability over ideology,
  *  #3128). A non-starved value is always trusted and recorded verbatim as the
  *  high-water. The no-ceiling condition warns once per SESSION+model (the
- *  degradation is session-scoped). */
+ *  degradation is session-scoped).
+ *  #3438: on lanes whose host stamps the model-declared maxTokens onto every
+ *  main turn by contract (`dshLane` — the dsh host's pi-ai buildBaseOptions
+ *  default), a tool-carrying budget BELOW the known ceiling is a raw-history
+ *  collapse, not intent: the client's estimator sees zero real usage on
+ *  replayed history and falls back to chars/4 over the unfolded history, which
+ *  shrinks toward zero as the raw history approaches the window. Such mid-band
+ *  values (above the <=200 starve gate) are treated as starved too — restored
+ *  through the same target logic — and are NEVER recorded as the high-water
+ *  (they are collapse evidence, not proven health). With NO known ceiling the
+ *  lane cannot judge collapse from intent: the value forwards verbatim but
+ *  warns once per SESSION+model so the operator can declare the model's output
+ *  cap to arm the rescue. Non-dsh lanes keep the old behavior byte-exact — a
+ *  deliberately small budget elsewhere is intent, not collapse. */
 export function restoreOutputBudget(
     parsed: unknown,
     session: { id: string; metadata: Record<string, unknown> },
     log: (level: string, msg: string) => void,
     outputCeiling?: number,
+    /** #3438: true when this lane's host stamps the model-declared maxTokens onto every main turn by contract (dsh/pi-ai buildBaseOptions default) — see the doc above. */
+    dshLane?: boolean,
 ): void {
     const field = outputBudgetField(parsed);
     if (!field) return;
@@ -414,16 +504,25 @@ export function restoreOutputBudget(
     // A usable ceiling is known from some source (runtime-info / launcher /
     // configured route / registry); a value at/below the side threshold is not usable.
     const ceiling = typeof outputCeiling === "number" && outputCeiling > SIDE_REQUEST_MAX_TOKENS ? outputCeiling : undefined;
-    if (value > SIDE_REQUEST_MAX_TOKENS) {
+    // #3438: on the dsh lane a below-ceiling tool-carrying budget IS the collapse
+    // signature (see the doc above) — it must not pass through as "healthy", and
+    // it must not seed the high-water as if it were proven health.
+    const collapsed = dshLane === true && ceiling !== undefined && value < ceiling;
+    if (value > SIDE_REQUEST_MAX_TOKENS && !collapsed) {
         session.metadata.outputBudgetHighWater = value;
         // #2904: a healthy (non-starved) budget means the client's own estimate
         // recovered — the active no-ceiling pin for THIS model is gone, so drop
         // its marker (other models' markers are untouched).
         clearNoCeilingDegraded(session, modelName);
+        // #3438: dsh-lane mid-band with NO known ceiling — bili cannot judge
+        // collapse from intent here, so forward verbatim but surface the gap once.
+        if (dshLane === true && ceiling === undefined && Array.isArray(p.tools) && p.tools.length > 0 && noteDshMidBandNoCeilingWarning(session.id, modelName)) {
+            log("warn", `[${session.id}] dsh-lane main request carries output budget ${value} with NO known output ceiling for model=${modelName} — cannot tell a raw-history collapse from deliberate intent, forwarding verbatim; declare the model's max output (providers.<url>.models."${modelName}".output) to arm the mid-band collapse rescue (#3438)`);
+        }
         return;
     }
-    // Starved main request (tiny budget + tools present). A side request (no tools)
-    // never reaches here — restoring it would break its side status.
+    // Starved or #3438-collapsed main request (budget + tools present). A side
+    // request (no tools) never reaches here — restoring it would break its side status.
     if (!Array.isArray(p.tools) || p.tools.length === 0) return;
     const highWaterRaw = session.metadata.outputBudgetHighWater;
     const highWater = typeof highWaterRaw === "number" && highWaterRaw > SIDE_REQUEST_MAX_TOKENS ? highWaterRaw : undefined;
@@ -470,7 +569,12 @@ export function restoreOutputBudget(
             : (target === highWater
                 ? "; no known output ceiling — restored to the session's own recorded budget, never raised above it (#3406)"
                 : "; no known output ceiling — floored to the absolute capability minimum (#3071)");
-        log("info", `[${session.id}] output budget restored ${value} -> ${target} (#546: client shrank it from its raw-history estimate${note})`);
+        // #3438: the <=200 starve keeps its original wording; a mid-band
+        // collapse names itself so the incident log distinguishes the two entries.
+        const origin = collapsed && value > SIDE_REQUEST_MAX_TOKENS
+            ? "#3438: dsh-lane mid-band collapse above the <=200 starve gate"
+            : "#546: client shrank it from its raw-history estimate";
+        log("info", `[${session.id}] output budget restored ${value} -> ${target} (${origin}${note})`);
     }
     // #2904: persist the no-ceiling degraded state for the user-visible surfaces.
     // With the #3071 absolute floor a ceiling-less starve is ALWAYS restored (never
@@ -495,9 +599,12 @@ const SIDE_REQUEST_GUARD_TOLERANCE = 1.15;
  *  from this path. Block here instead of forwarding: estimate the RAW body
  *  (CJK-aware text + image tokens) against the effective window — the declared
  *  modelContextLimit (#987: no learned window exists anymore) minus the output
- *  reservation on wires where output counts against the window. blocked=false
- *  with limit<=0 means "window unknown — forward as before". blocked requires
- *  estimate >= limit x SIDE_REQUEST_GUARD_TOLERANCE (estimator bias). */
+ *  reservation on routes that carry one (#4205: decided by the caller via
+ *  shouldReserveOutputHeadroom with route+model evidence — the guard stays
+ *  pure mechanics and self-reserves once from the UNRESERVED limit it is
+ *  handed). blocked=false with limit<=0 means "window unknown — forward as
+ *  before". blocked requires estimate >= limit x SIDE_REQUEST_GUARD_TOLERANCE
+ *  (estimator bias). */
 export function sideRequestGuard(
     parsed: unknown,
     protocol: WireProtocol,
@@ -510,6 +617,11 @@ export function sideRequestGuard(
      *  prior) — replaces the internal billing-based estimate when provided so
      *  the guard sees the same image channel every other gate consumes. */
     imageReserve?: number,
+    /** #4205: whether THIS route reserves the output budget from the window —
+     *  policy lives at the call site (shouldReserveOutputHeadroom sees route +
+     *  model evidence the guard cannot); default false keeps non-reserving
+     *  callers byte-identical. */
+    reserveHeadroom: boolean = false,
 ): { blocked: boolean; estimate: number; limit: number } {
     let limit = modelContextLimit;
     // #987: no learned window exists, but a usage-grounded arm left by an
@@ -520,7 +632,7 @@ export function sideRequestGuard(
     if (armedLimit > 0 && (limit <= 0 || armedLimit < limit)) limit = armedLimit;
     const field = outputBudgetField(parsed);
     const maxOut = (field ? readOutputBudget(parsed as Record<string, unknown>, field) : undefined) ?? 0;
-    if (limit > 0 && shouldReserveOutputHeadroom(protocol)) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
+    if (reserveHeadroom && limit > 0) limit = reserveOutputHeadroom(limit, maxOut, headroomCap);
     const imageMass = imageReserve ?? imageTokensInParsedBody(protocol, parsed, imageBilling, configuredCap);
     const estimate = estimateRawBodyTokens(parsed) + imageMass;
     return { blocked: limit > 0 && estimate >= limit * SIDE_REQUEST_GUARD_TOLERANCE, estimate, limit };

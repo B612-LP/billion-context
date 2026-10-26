@@ -479,7 +479,7 @@ export const WEB_CLIENT = `(function () {
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
     }
 
-    const PAGES = ["overview", "sessions", "config", "connect", "logs"];
+    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs", "blog"];
     let current = "overview";
     let sessionsCache = [];
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
@@ -571,6 +571,7 @@ export const WEB_CLIENT = `(function () {
             + (live ? ' <span class="badge live" title="' + escapeHtml(t("ses.badge_live_tip")) + '">' + t("common.live") + "</span>" : "")
             + (s.selfHeal ? ' <span class="badge live" style="background:#8a6d3b" title="' + escapeHtml(t("det.self_heal_tip")) + '">' + t("det.self_heal_short") + "</span>" : "")
             + (s.autoModeForge ? ' <span class="badge live" style="background:#6d3b8a" title="' + escapeHtml(t("det.auto_mode_forge_tip")) + '">' + t("det.auto_mode_forge_short") + "</span>" : "")
++ (s.keepalive ? ' <span class="badge live" style="background:#3b6d8a" title="' + escapeHtml(t("det.keepalive_tip") + " · " + s.keepalive.tierLabel + " · " + (s.keepalive.cadenceMs >= 60_000 ? Math.round(s.keepalive.cadenceMs / 60_000) + "min" : Math.round(s.keepalive.cadenceMs / 1000) + "s") + (s.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(s.keepalive.lastHitAt).toISOString()) : "")) + '">' + t("det.keepalive_short") + "×" + s.keepalive.pingCount + "</span>" : "")
             + '<span class="row-id">' + escapeHtml(s.id) + "</span></a>";
     }
     // SAVED column prefers ledger-derived net savings; pre-tagging sessions fall back
@@ -628,9 +629,14 @@ export const WEB_CLIENT = `(function () {
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</span></td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td>' + savedTd(s) + '<td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         } else {
             const clientHint = s.clientHint ? String(s.clientHint) : "";
+            // #4571: inline sessions carry a lane chip beside the client hint so
+            // "did this run in-process?" is visible in the list, not just detail.
+            const laneChip = s.engineLane === "inline"
+                ? ' <span class="badge proto" title="' + escapeHtml(t("det.engine_lane_inline")) + '">inline</span>'
+                : s.engineLane === "server" ? ' <span class="badge proto dim" title="' + escapeHtml(t("det.engine_lane_server")) + '">srv</span>' : "";
             const clientCell = clientHint
-                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>"
-                : '<span class="dim">' + t("common.none") + "</span>";
+                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>" + laneChip
+                : '<span class="dim">' + t("common.none") + "</span>" + laneChip;
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td class="client-cell">' + clientCell + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         }
         let navTimer = null;
@@ -644,6 +650,332 @@ export const WEB_CLIENT = `(function () {
         });
         tr.addEventListener("dblclick", () => clearTimeout(navTimer));
         return tr;
+    }
+
+    // #3719: changelog section (overview page, collapsed card) — one fetch per
+    // page load; the server caches with a 10-minute throttle, so this costs at
+    // most one GitHub API hit per 10 minutes fleet-wide.
+    let chlogLoaded = false;
+    // Escaped-plain-text → anchor tags. Function-form replacer on purpose:
+    // URL characters ($, &) would corrupt "string" replacement patterns.
+    function linkifyText(escaped) {
+        return escaped.replace(/(https?:\\/\\/[^\\s<>]+)/g, (u) => '<a href="' + u + '" target="_blank" rel="noopener noreferrer">' + u + "</a>");
+    }
+function changelogCatOf(rawLine) {
+        const s = rawLine.replace(/^\\*?\\s*\\[PR\\]\\s*/i, "").trim();
+        if (/^kernel([(:\\s]|$)/i.test(s)) return "cat_kernel";
+        if (/(^|[.(,\\s])(dsh|pi(?:-subagents)?|codex|claude(?:-code)?|opencode(?:v?\\d)?|hermes|kimi|zcode|trae)([):,\\s]|$)/i.test(s)) return "cat_host";
+        const m = s.match(/^([a-z]+)(\\([^)]*\\))?[:\\s]/);
+        if (m) {
+            const p = m[1].toLowerCase();
+            if (p === "feat" || p === "feature" || p === "improve") return "cat_feat";
+            if (p === "fix" || p === "perf") return "cat_fix";
+            if (p === "docs") return "cat_web";
+            if (p === "ci" || p === "build" || p === "test" || p === "chore" || p === "refactor" || p === "style") return "cat_infra";
+        }
+        if (/(persist|storage|session|sqlite|index\\.db|unified)/i.test(s)) return "cat_store";
+        if (/(self-update|auto-update|update policy|release|publish|stagger|version bump)/i.test(s)) return "cat_upd";
+        if (/\\b(web|panel|i18n|changelog|favicon)\\b/i.test(s)) return "cat_web";
+        return "cat_other";
+    }
+    const CHLOG_CATS = ["cat_feat", "cat_fix", "cat_kernel", "cat_host", "cat_store", "cat_upd", "cat_web", "cat_infra", "cat_other"];
+    // One release body → intro (headings/prose) + categorized bullet groups.
+    function changelogBodyHtml(escaped) {
+        const intro = [];
+        let para = [];
+        const flushPara = () => { if (para.length) { intro.push('<div class="cl-p">' + para.map((s)=>s.replace(/\\*\\*([^*]+)\\*\\*/g,"<strong>$1</strong>")).join("<br>") + "</div>"); para = []; } };
+        const cats = {};
+        for (const raw of escaped.split("\\n")) {
+            const tl = raw.trim();
+            const bm = tl.match(/^(?:[-*]|\\d+[.)])\\s+(.*)$/);
+            if (bm) {
+                flushPara();
+                const item = linkifyText(bm[1]);
+                const key = changelogCatOf(bm[1]);
+                if (!cats[key]) cats[key] = [];
+                cats[key].push(item);
+            } else if (/^#{1,6}\\s/.test(tl)) {
+                flushPara();
+                intro.push('<div class="cl-h">' + linkifyText(tl.replace(/^#{1,6}\\s*/, "")) + "</div>");
+            } else if (tl === "") flushPara();
+            else para.push(linkifyText(tl));
+        }
+        flushPara();
+        let html = intro.join("");
+        for (const key of CHLOG_CATS) {
+            const items = cats[key];
+            if (!items) continue;
+            // Inline t() per key: the #1024 scanner counts literal t("…") refs only.
+            const label = { cat_feat: t("sys.changelog_cat_feat"), cat_fix: t("sys.changelog_cat_fix"), cat_kernel: t("sys.changelog_cat_kernel"), cat_host: t("sys.changelog_cat_host"), cat_store: t("sys.changelog_cat_store"), cat_upd: t("sys.changelog_cat_upd"), cat_web: t("sys.changelog_cat_web"), cat_infra: t("sys.changelog_cat_infra"), cat_other: t("sys.changelog_cat_other") }[key];
+            html += '<div class="cl-cat">' + label + ' <span class="dim">' + items.length + "</span></div>" + items.map(function (x) { return '<div class="cl-li">' + x + "</div>"; }).join("");
+        }
+        return html;
+    }
+    // Version-select → scroll that release open and flash it briefly.
+    function focusChangelogRelease(val) {
+        const el = $("changelog-body");
+        if (!el) return;
+        const want = String(val).replace(/^v/, "");
+        const items = el.querySelectorAll("details.cl-item");
+        if (typeof items.forEach !== "function") return;
+        items.forEach((it) => {
+            const hit = String(it.getAttribute("data-tag") || "").replace(/^v/, "") === want;
+            try { it.open = hit; } catch (_) { /* harness */ }
+            it.classList.remove("cl-flash");
+        });
+        const target = el.querySelector('details.cl-item[data-tag="' + want.replace(/"/g, "") + '"]');
+        if (!target) return;
+        try { target.open = true; } catch (_) { /* harness */ }
+        target.classList.add("cl-flash");
+        if (target.scrollIntoView) target.scrollIntoView({ behavior: "smooth", block: "start" });
+        setTimeout(() => target.classList.remove("cl-flash"), 2500);
+    }
+    function renderChangelog(d) {
+        const el = $("changelog-body");
+        if (!el) return;
+        const rels = (d && typeof d === "object" && Array.isArray(d.releases)) ? d.releases : [];
+        if (!rels.length) {
+            el.textContent = (d && d.error) ? t("sys.changelog_offline") : t("sys.changelog_empty");
+            return;
+        }
+        let html = "";
+        rels.forEach((r, i) => {
+            const tagRaw = String(r.tag || "");
+            const tag = escapeHtml(tagRaw);
+            const dataTag = tagRaw.replace(/^v/, "").replace(/"/g, "");
+            const name = (typeof r.name === "string" && r.name !== r.tag) ? escapeHtml(r.name) + " · " : "";
+            const latest = i === 0 ? ' <span class="badge cl-latest">' + t("sys.changelog_latest") + "</span>" : "";
+            const date = r.publishedAt ? ' <span class="dim">' + escapeHtml(String(r.publishedAt).slice(0, 10)) + "</span>" : "";
+            const view = '<a href="' + escapeHtml(String(r.url || "")) + '" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_view") + "</a>";
+            const body = typeof r.body === "string" && r.body.trim() ? '<div class="cl-body">' + changelogBodyHtml(escapeHtml(r.body)) + '<div class="cl-foot">' + view + "</div></div>" : view;
+            html += '<details class="cl-item" data-tag="' + dataTag + (i === 0 ? '" open>' : '">' ) + '<summary><span class="cl-tag">' + tag + "</span>" + name + latest + date + "</summary>" + body + "</details>";
+        });
+        html += '<div class="cl-actions"><button class="btn sm" id="cl-expand-all" type="button">' + t("up.cl_expand_all") + '</button><button class="btn sm" id="cl-collapse-all" type="button">' + t("up.cl_collapse_all") + '</button><a class="btn sm" href="https://github.com/ranxianglei/billion-context/releases" target="_blank" rel="noopener noreferrer">' + t("sys.changelog_all") + "</a></div>";
+        el.innerHTML = html;
+        const expandAll = $("cl-expand-all");
+        const collapseAll = $("cl-collapse-all");
+        if (expandAll) expandAll.addEventListener("click", () => el.querySelectorAll("details.cl-item").forEach((it) => { try { it.open = true; } catch (_) { /* harness */ } }));
+        if (collapseAll) collapseAll.addEventListener("click", () => el.querySelectorAll("details.cl-item").forEach((it) => { try { it.open = false; } catch (_) { /* harness */ } }));
+    }
+    async function loadChangelog() {
+        if (chlogLoaded) return;
+        const el = $("changelog-body");
+        if (!el) return;
+        chlogLoaded = true;
+        el.textContent = t("sys.changelog_loading");
+        try {
+            renderChangelog(await json(API_ROOT + "/changelog"));
+        } catch (e) {
+            // The endpoint itself never errors (fail-soft); reaching here means
+            // the PROXY is unreachable — same offline wording either way.
+            renderChangelog({ releases: [], error: "offline" });
+        }
+    }
+
+    // #3719 phase 2: dedicated 更新/Updates tab — self-update state, pushed
+    // notices, and install/rollback actions. All writes go through the
+    // admin-gated POST /__bili/update/* routes (same json() pattern as
+    // putCfg); one shared in-flight flag keeps ALL action buttons disabled
+    // while any action runs (the server dedupes a second call too).
+    let upBusyAction = false;
+    let upReleases = [];
+    function upSetButtons(on) {
+        [$("up-check"), $("up-upgrade-now"), $("up-install")].forEach((b) => {
+            if (!b) return;
+            b.classList.toggle("busy", on);
+            b.disabled = on;
+        });
+        // Install-selected additionally needs an actual selection.
+        const ins = $("up-install");
+        const sel = $("up-select");
+        if (ins) ins.disabled = on || !(sel && sel.value);
+    }
+    function showUpdateResult(msg, ok) {
+        const el = $("up-result");
+        if (!el || !msg) return;
+        el.hidden = false;
+        el.textContent = msg;
+        el.style.color = ok ? "var(--green)" : "var(--red)";
+    }
+    // Loose numeric compare on major/minor/patch — enough to decide the
+    // rollback confirm without pulling semver into the panel.
+    function upVerParts(v) {
+        return String(v || "").replace(/^v/i, "").split(/[.+]/).slice(0, 3).map((p) => parseInt(p, 10));
+    }
+    function upCmpVer(a, b) {
+        const x = upVerParts(a);
+        const y = upVerParts(b);
+        for (let i = 0; i < 3; i++) {
+            const d = (x[i] || 0) - (y[i] || 0);
+            if (d !== 0) return d < 0 ? -1 : 1;
+        }
+        return 0;
+    }
+    function renderNotices(items) {
+        const el = $("up-notices");
+        if (!el) return;
+        if (!items.length) { el.textContent = t("up.notice_empty"); return; }
+        let html = "";
+        items.slice().reverse().forEach((n) => {
+            const tier = n.tier === "critical" ? "critical" : (n.tier === "recommended" ? "recommended" : "routine");
+            // Fully literal keys below: the i18n dead-key scanner (#1024)
+            // greps t() call sites and would flag a dynamically built
+            // tier-prefix key.
+            const tierLabel = tier === "critical" ? t("up.tier_critical") : (tier === "recommended" ? t("up.tier_recommended") : t("up.tier_routine"));
+            // #3719 item4: locale-aware summary — zh picks summaryZh when the
+            // entry carries one; every other locale (and legacy payloads)
+            // falls back to the English one-liner.
+            const summaryText = (locale === "zh-CN" && typeof n.summaryZh === "string" && n.summaryZh) ? n.summaryZh : String(n.summary || "");
+            html += '<div class="ntc-item"><span class="badge' + (tier === "routine" ? " disk" : " ntc-" + tier) + '">' + escapeHtml(tierLabel) + "</span><span class='mono'>" + escapeHtml(String(n.version || "")) + "</span>" + (n.date ? ' <span class="dim">' + escapeHtml(String(n.date)) + "</span>" : "") + "<br>" + escapeHtml(summaryText) + "</div>";
+        });
+        el.innerHTML = html;
+    }
+    // Newest release known to the panel: the newest pushed notice wins, the
+    // changelog tag list is the fallback (tags arrive newest-first, capped at
+    // what the endpoint returns). Leading "v" is stripped before install —
+    // the updater takes plain semver.
+    function upNewestVersion(notices) {
+        if (notices && notices.length) return String(notices[notices.length - 1].version || "");
+        return String(upReleases[0] || "").replace(/^v/, "");
+    }
+    function applyUpdateButtons(st) {
+        const now = $("up-upgrade-now");
+        const target = upNewestVersion(st && st.notices);
+        if (now) {
+            const lbl = $("up-upgrade-now-label");
+            if (lbl) lbl.textContent = target ? t("up.upgrade_now", { v: target }) : t("up.upgrade_none");
+            now.disabled = upBusyAction || !target;
+        }
+    }
+    function renderUpdateState(st) {
+        if (!st || typeof st !== "object") return;
+        const set = (id, text) => { const el = $(id); if (el) el.textContent = text; };
+        set("up-running", st.running || "?");
+        set("up-disk", st.disk || t("common.none"));
+        set("up-latest", upNewestVersion(st.notices) || t("common.none"));
+        set("up-last-check", st.lastCheckAt ? new Date(st.lastCheckAt).toLocaleString() : t("common.none"));
+        const hint = $("up-pending-hint");
+        if (hint) hint.hidden = !st.pendingRestart;
+        renderNotices(Array.isArray(st.notices) ? st.notices : []);
+        const sel = $("up-select");
+        if (sel) {
+            const cur = sel.value;
+            let opt = '<option value="">' + t("up.select_placeholder") + "</option>";
+            upReleases.forEach((tag) => { opt += '<option value="' + escapeHtml(tag) + '">' + escapeHtml(tag) + "</option>"; });
+            sel.innerHTML = opt;
+            if (cur) sel.value = cur;
+        }
+        applyUpdateButtons(st);
+        // A check/install started from another tab of this process shows in
+        // the snapshot — keep the buttons held down until it settles.
+        if (st.checking || st.installing) upSetButtons(true);
+    }
+    // #4587: panel-embedded blog & articles — the server renders the bundled
+    // markdown with web/markdown.ts (escaped by construction), so this side only
+    // lays out cards and expands bodies. Language rides the page-level locale;
+    // switching languages reloads the page, so no incremental re-render hook.
+    let blogCache = null;
+    async function loadBlog(sub) {
+        const host = $("bl-list");
+        if (!host) return;
+        let data = blogCache;
+        if (!data) {
+            try {
+                data = blogCache = await json(API_ROOT + "/blog");
+            } catch (e) {
+                host.innerHTML = "";
+                toast(t("toast.failed", { msg: e.message }), "err");
+                return;
+            }
+        }
+        const items = (data && Array.isArray(data.items)) ? data.items : [];
+        const zhOn = locale === "zh-CN";
+        if (sub) {
+            const item = items.find((x) => String(x.id) === String(sub)) || null;
+            if (!item) {
+                host.innerHTML = '<div class="card"><div class="card-b"><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a> " + escapeHtml(t("bl.nf")) + "</div></div>";
+                return;
+            }
+            const kindLabel = item.kind === "post" ? t("bl.kind_post") : t("bl.kind_article");
+            const title = zhOn && item.titleZh ? item.titleZh : (item.title || "");
+            const html = zhOn ? (item.htmlZh || item.html || "") : (item.html || "");
+            host.innerHTML = '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a></div>"
+                + '<h3 class="bl-h">' + escapeHtml(title) + "</h3>"
+                + '<div class="card-b post-body">' + html + "</div></div>";
+            return;
+        }
+        if (!items.length) {
+            const wrap = document.createElement("div");
+            wrap.className = "card";
+            const box = document.createElement("div");
+            box.className = "card-b";
+            box.textContent = t("bl.empty");
+            wrap.appendChild(box);
+            host.innerHTML = "";
+            host.appendChild(wrap);
+            return;
+        }
+        host.innerHTML = '<div class="card">' + items.map((it) => {
+            const title = zhOn && it.titleZh ? it.titleZh : (it.title || "");
+            const alt = zhOn ? (it.title || "") : (it.titleZh || "");
+            let kindLabel;
+            if (it.kind === "post") kindLabel = t("bl.kind_post");
+            else kindLabel = t("bl.kind_article");
+            return '<a class="bl-row" href="#/blog/' + encodeURIComponent(String(it.id)) + '">'
+                + '<span class="mono bl-date">' + escapeHtml(it.date || "\u2014") + '</span>'
+                + '<span class="badge">' + escapeHtml(kindLabel) + '</span>'
+                + '<span class="bl-title">' + escapeHtml(title) + (alt ? ' <span class="bl-title-alt">' + escapeHtml(alt) + "</span>" : "") + "</span>"
+                + '<span class="bl-arrow">&#8594;</span></a>';
+        }).join("") + "</div>";
+    }
+    async function loadUpdates() {
+        try {
+            const [st, cl] = await Promise.all([json(API_ROOT + "/update/state"), json(API_ROOT + "/changelog")]);
+            upReleases = (cl && Array.isArray(cl.releases)) ? cl.releases.map((r) => String(r.tag || "")).filter(Boolean) : [];
+            renderUpdateState(st);
+        } catch (e) {
+            // Both endpoints are fail-soft 200s; reaching here = proxy unreachable.
+            toast(t("toast.failed", { msg: e.message }), "err");
+        }
+    }
+    async function upInstall(version) {
+        if (upBusyAction || !version) return;
+        const running = $($("up-running") && "up-running") ? $("up-running").textContent.replace(/^v/i, "") : "";
+        if (upCmpVer(version, running) < 0 && !window.confirm(t("up.rollback_confirm", { v: version }))) return;
+        upBusyAction = true;
+        upSetButtons(true);
+        showUpdateResult(t("up.installing", {}), true);
+        try {
+            const r = await json(API_ROOT + "/update/install", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: version }) });
+            if (r.already) showUpdateResult(t("up.already_in_flight"), true);
+            else if (r.ok) showUpdateResult(t("up.installed", { v: version }), true);
+            else showUpdateResult(String(r.error || t("toast.failed", { msg: "install failed" })), false);
+        } catch (e) {
+            showUpdateResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
+    }
+    function upUpgradeNow() { upInstall(upNewestVersion(null).replace(/^v/, "")); }
+    function upInstallSelected() { const sel = $("up-select"); if (sel && sel.value) upInstall(String(sel.value).replace(/^v/, "")); }
+    async function upCheckNow() {
+        if (upBusyAction) return;
+        upBusyAction = true;
+        upSetButtons(true);
+        try {
+            const r = await json(API_ROOT + "/update/check", { method: "POST", headers: { "content-type": "application/json" }, body: "{}" });
+            if (r.already) showUpdateResult(t("up.already_in_flight"), true);
+            else if (r.ok) showUpdateResult(t("up.check_ok"), true);
+            else showUpdateResult(String(r.error || t("toast.failed", { msg: "check failed" })), false);
+        } catch (e) {
+            showUpdateResult(e.message, false);
+        } finally {
+            upBusyAction = false;
+            upSetButtons(false);
+            loadUpdates();
+        }
     }
 
     async function loadOverview(silent) {
@@ -687,6 +1019,7 @@ export const WEB_CLIENT = `(function () {
                 pb.appendChild(tr);
             });
             $("sys-version").textContent = d.version ? (d.commit ? d.version + " (" + d.commit + ")" : d.version) : "?";
+            $("sys-lane").textContent = d.origin || t("common.none");
             $("sys-disk-version").textContent = d.diskVersion || t("common.none");
             $("sys-inflight").textContent = String(d.inFlight || 0);
             const bt = d.blindTunnels || {};
@@ -717,10 +1050,36 @@ export const WEB_CLIENT = `(function () {
                 // carries the MINIMUM fixed version, so each locale can say
                 // "v{version} 或更新版本" / "v{version} or newer" separately.
                 const vars = { version: u.version, summary: u.summary || "" };
+                // #3719 item3: locale-aware summary — zh gets summaryZh when
+                // the entry carries one (release-notes bilingual support).
+                if (locale === "zh-CN" && typeof u.summaryZh === "string" && u.summaryZh) vars.summary = u.summaryZh;
                 const line = u.kind === "ready" ? t("sys.update_ready", vars) : t("sys.update_available", vars);
                 ub.hidden = false;
                 ub.classList.add("show");
                 ub.innerHTML = "<strong>" + t("sys.update") + "</strong> " + escapeHtml(line);
+                // #3719 item3: one-click upgrade straight from the banner when
+                // the fix is still "available" (ready = already on disk, just
+                // restart). Reuses the phase-2 install endpoint + its safety
+                // chain; feedback stays inside the banner.
+                if (u.kind === "available") {
+                    const btn = document.createElement("button");
+                    btn.type = "button";
+                    btn.className = "banner-upgrade-now";
+                    btn.textContent = t("sys.update_now", { version: u.version });
+                    btn.addEventListener("click", async () => {
+                        btn.disabled = true;
+                        btn.textContent = t("sys.updating", {});
+                        try {
+                            const r = await json(API_ROOT + "/update/install", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ version: u.version }) });
+                            if (r && (r.ok || r.already)) btn.textContent = t("sys.update_done", { version: u.version });
+                            else { btn.textContent = String((r && r.error) || "install failed"); btn.disabled = false; }
+                        } catch (e) {
+                            btn.textContent = String((e && e.message) || e);
+                            btn.disabled = false;
+                        }
+                    });
+                    ub.appendChild(btn);
+                }
             } else {
                 ub.hidden = true;
                 ub.classList.remove("show");
@@ -828,6 +1187,69 @@ export const WEB_CLIENT = `(function () {
                 sh.hidden = true;
                 sh.classList.remove("show");
                 sh.innerHTML = "";
+            }
+        }
+        const spb = $("storage-second-process-banner");
+        if (spb) {
+            const sg2 = d.storage;
+            const sp = sg2 && typeof sg2 === "object" ? sg2.secondProcess : null;
+            if (sp && typeof sp.pid === "number") {
+                spb.hidden = false;
+                spb.classList.add("show");
+                // #3923/#3959: a known bili instance of a DIFFERENT lane sharing
+                // the machine-global sessions dir is the supported topology —
+                // informational styling, not a corruption alarm.
+                if (sp.benign === true) {
+                    spb.classList.remove("warn");
+                    spb.classList.add("info");
+                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_cross_lane_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_cross_lane", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
+                } else {
+                    spb.classList.remove("info");
+                    spb.classList.add("warn");
+                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
+                }
+            } else {
+                spb.hidden = true;
+                spb.classList.remove("show");
+                spb.innerHTML = "";
+            }
+        }
+        const sbb = $("split-brain-banner");
+        if (sbb) {
+            // #3923/#3959: a REAL contest — session id + title + both sides'
+            // pid/lane, with a dismiss action that clears the surfaced entry.
+            const sb = d.storage && typeof d.storage === "object" ? d.storage.splitBrain : null;
+            if (sb && typeof sb.sessionId === "string" && sb.self && typeof sb.self.pid === "number" && sb.peer && typeof sb.peer.pid === "number") {
+                sbb.hidden = false;
+                sbb.classList.add("show");
+                const laneOf = (x) => (x && typeof x.lane === "string" && x.lane ? x.lane : t("sys.split_brain_lane_undeclared"));
+                sbb.innerHTML = "<strong>" + escapeHtml(t("sys.split_brain_title")) + "</strong> "
+                    + escapeHtml(t("sys.split_brain", {
+                        title: typeof sb.title === "string" && sb.title ? sb.title : sb.sessionId.slice(0, 8),
+                        sid: sb.sessionId.slice(0, 8),
+                        selfPid: String(sb.self.pid),
+                        selfLane: laneOf(sb.self),
+                        peerPid: String(sb.peer.pid),
+                        peerLane: laneOf(sb.peer),
+                    }))
+                    + '<div style="margin-top:8px"><button id="split-brain-ack-btn" class="btn sm">' + escapeHtml(t("sys.split_brain_ack_btn")) + "</button></div>";
+                const ackBtn = $("split-brain-ack-btn");
+                if (ackBtn) ackBtn.addEventListener("click", async () => {
+                    busy(ackBtn, true);
+                    try {
+                        await json(API_ROOT + "/storage/split-brain/ack", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sb.sessionId }) });
+                        toast(t("sys.split_brain_acked"), "ok");
+                        await loadOverview(true);
+                    } catch (e) {
+                        toast(e instanceof Error ? e.message : String(e), "err");
+                    } finally {
+                        busy(ackBtn, false);
+                    }
+                });
+            } else {
+                sbb.hidden = true;
+                sbb.classList.remove("show");
+                sbb.innerHTML = "";
             }
         }
         const pt = $("passthrough-banner");
@@ -1068,8 +1490,7 @@ export const WEB_CLIENT = `(function () {
         }
         detEl.hidden = true;
         listEl.hidden = false;
-        trajState = null;
-        trajRange = null;
+        chartZooms.forEach((z) => { z.state = null; z.range = null; });
         await refreshSessions(true);
     }
     let hiddenEmptyN = 0;
@@ -1212,52 +1633,26 @@ export const WEB_CLIENT = `(function () {
     // #2489: chart geometry shared by the renderer and the brush interaction below.
     const TRAJ_W = 960, TRAJ_H = 260, TRAJ_PL = 56, TRAJ_PR = 16, TRAJ_PT = 14, TRAJ_PB = 26;
     const TRAJ_MIN_SAMPLES = 5;
-    function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
-        lines = (lines || []).filter((l) => Boolean(l));
-        if (!lines.length) return "";
-        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
-        const iw = W - PL - PR, ih = H - PT - PB;
-        let maxY = 0;
-        lines.forEach((l) => { if ((l.input || 0) > maxY) maxY = l.input; });
-        if (win && win > maxY) maxY = win * 1.05;
-        if (maxY <= 0) maxY = 1;
-        const x = (i) => PL + (lines.length === 1 ? iw / 2 : (i / (lines.length - 1)) * iw);
-        const y = (v) => PT + ih - (Math.max(0, v) / maxY) * ih;
-        const dt = (ms) => fmtDT(ms);
-        let grid = "", ticks = "";
-        for (let g = 0; g <= 4; g++) {
-            const v = (maxY / 4) * g;
-            const yy = y(v);
-            grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
-            ticks += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + fmtW(v) + "</text>";
-        }
-        let area = "M" + x(0).toFixed(1) + "," + y(lines[0].input || 0).toFixed(1);
-        let stroke = "";
-        lines.forEach((l, i) => {
-            area += " L" + x(i).toFixed(1) + "," + y(l.cached || 0).toFixed(1);
-            stroke += (i === 0 ? "M" : "L") + x(i).toFixed(1) + "," + y(l.input || 0).toFixed(1) + " ";
-        });
-        area += " L" + x(lines.length - 1).toFixed(1) + "," + (PT + ih).toFixed(1) + " L" + x(0).toFixed(1) + "," + (PT + ih).toFixed(1) + " Z";
-        // Cache-gap causes: color each sample's un-cached band (input − cached)
-        // by its most likely cause so gaps on the chart explain themselves.
-        // #2929: mirror the ledger's fold cold-tail window — a fold owns the
-        // first sample after it AND the cold continuation (hit < 85%) up to 4
-        // samples, closing on the first warm line. Ledger lines carry foldSeq
-        // directly; the fold-between-times heuristic stays as the opener and
-        // for pre-#2929 ledgers whose lines have no foldSeq. The tail counter
-        // arms ONLY on that opener path: foldSeq-stamped lines are the
-        // ledger's own attribution and must not re-arm, or the chart keeps
-        // coloring comp up to 4 lines past the ledger retiring the window.
+    // #3484: per-sample miss-cause palette + labels shared by the trajectory gap bands
+    // (#2929) and the hit-rate line markers — one definition so both charts paint the
+    // same bucket membership the economics card aggregates.
+    const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", ci: "#0969da", rest: "#9aa1a8" };
+    const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", ci: "det.leg_client", rest: "det.cause_ttl" };
+    // #2929/#3484: per-sample causes follow the LEDGER's authoritative attribution
+    // (foldSeq / seam / prov), not a parallel heuristic — the charts paint the same
+    // bucket membership the economics card aggregates. The gap heuristic remains only
+    // as the legacy fallback for old ledgers whose lines carry no attribution fields.
+    // The fold cold-tail window mirrors the ledger's own: a fold owns the first sample
+    // after it AND the cold continuation (hit < 85%) up to 4 samples, closing on the
+    // first warm line. Ledger lines carry foldSeq directly; the fold-between-times
+    // heuristic stays as the opener and for pre-#2929 ledgers without foldSeq. The
+    // tail counter arms ONLY on that opener path: foldSeq-stamped lines are the
+    // ledger's own attribution and must not re-arm, or the chart keeps coloring comp
+    // up to 4 lines past the ledger retiring the window.
+    function classifyLineCauses(lines, folds) {
         const GAP_MS = 600_000;
-        // #2929: per-sample causes follow the LEDGER's authoritative attribution
-        // (foldSeq / seam / prov), not a parallel heuristic — the chart paints
-        // the same bucket membership the economics card aggregates. The gap
-        // heuristic remains only as the legacy fallback for old ledgers whose
-        // lines carry no attribution fields.
-        const CAUSE_COLOR = { cold: "#6e7681", comp: "#bf8700", seam: "#cf222e", pt: "#1a7f37", ps: "#f0883e", rw: "#57606a", ci: "#0969da", rest: "#9aa1a8" };
-        const CAUSE_KEY = { cold: "det.cause_cold", comp: "det.cause_comp", seam: "det.legend_seam", pt: "det.leg_pttl", ps: "det.leg_pside", rw: "det.leg_rewind", ci: "det.leg_client", rest: "det.cause_ttl" };
         let foldTailClaims = 0;
-        const causes = lines.map((l, i) => {
+        return lines.map((l, i) => {
             if (i === 0) return !(l.cached || 0) ? "cold" : "new";
             const p = lines[i - 1];
             const missed = (l.input || 0) - (l.cached || 0);
@@ -1287,6 +1682,102 @@ export const WEB_CLIENT = `(function () {
             if (l.foldSeq == null && l.seam === undefined && l.prov === undefined && (l.at || 0) - (p.at || 0) > GAP_MS && missed > growth + 2048) return "rest";
             return "new";
         });
+    }
+    // #2489/#3484: vertical event marks shared by both detail charts. Folds stay
+    // dashed red, seams solid red (#1609 visual language); burst-folds share
+    // (near-)identical timestamps and thus the same pixel — merge them into one
+    // marker per pixel-bucket so stacked marks don't ghost into doubled lines.
+    function foldMarkLines(folds, lines, x, PT, ih) {
+        let foldMarks = "";
+        const foldBuckets = [];
+        (folds || []).forEach((f) => {
+            let idx = -1;
+            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= (f.at || 0)) { idx = i; break; } }
+            if (idx < 0) idx = lines.length - 1;
+            const fx = x(idx);
+            const bk = foldBuckets.find((b) => Math.abs(b.fx - fx) <= 1.5);
+            if (bk) bk.items.push(f); else foldBuckets.push({ fx, items: [f] });
+        });
+        foldBuckets.forEach((bk) => {
+            const n = bk.items.length;
+            const seqs = bk.items.map((m) => m.seq != null ? "#" + m.seq : "").filter(Boolean).slice(0, 5).join("·");
+            foldMarks += '<line x1="' + bk.fx.toFixed(1) + '" y1="' + PT + '" x2="' + bk.fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.2" stroke-dasharray="3 3"><title>'
+                + t("det.fold_short") + (n > 1 ? " ×" + n : "") + (seqs ? " " + seqs + (bk.items.length > 5 ? "…" : "") + " · " : " ") + fmtDT(bk.items[0].at) + " · " + fmtW(bk.items.reduce((a, m) => a + (m.S || 0), 0)) + "</title></line>";
+        });
+        return foldMarks;
+    }
+    // #1609: cache-seam suspects (#1606) get SOLID red marks at the first sample at/after
+    // the divergence time — folds stay dashed, so both read in the same visual language.
+    function seamMarkLines(seamEvents, lines, x, PT, ih) {
+        let seamMarks = "";
+        (seamEvents || []).forEach((ev) => {
+            if (!ev || !(ev.at > 0)) return;
+            let idx = -1;
+            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= ev.at) { idx = i; break; } }
+            if (idx < 0) idx = lines.length - 1;
+            const fx = x(idx);
+            const hit = typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) : "?";
+            const lcp = fmtB(ev.lcpBytes || 0);
+            const msg = ev.msgIndex != null ? ev.msgIndex : "?";
+            const prev = ev.prevMsgs != null ? ev.prevMsgs : "?";
+            const cur = ev.curMsgs != null ? ev.curMsgs : "?";
+            seamMarks += '<line x1="' + fx.toFixed(1) + '" y1="' + PT + '" x2="' + fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.8"><title>'
+                + t("det.seam_mark_tip", { seq: ev.seq != null ? ev.seq : "?", at: fmtDT(ev.at), hit, lcp, msg, prev, cur }) + "</title></line>";
+        });
+        return seamMarks;
+    }
+    // #2929/#3484: pixel-driven seq ticks shared by both detail charts — every band must map
+    // to a visible index, not "somewhere between 5 and 10". Thinning is PIXEL-driven, not
+    // count-driven: real sessions carry hundreds/thousands of samples (~0.4px/sample), where
+    // any flat count step either mosaics the axis or drops to two naked numbers. Vertical
+    // (rotated) ticks reclaim the unused Y range; hold a constant ≥24px HORIZONTAL pitch.
+    // NO Math.max(barW,1) floor — that clamps sub-pixel bars UP to 1 and silently disables
+    // thinning exactly on the dense sessions this exists for.
+    function seqTickLines(lines, x, W, H, PL, PR) {
+        const barW = lines.length > 1 ? (W - PL - PR) / (lines.length - 1) : 1;
+        const tStep = Math.max(1, Math.ceil(24 / barW));
+        const xtArr = [];
+        for (let i = lines.length - 1; i >= 0; i -= tStep) {
+            const l = lines[i];
+            xtArr.push('<text transform="translate(' + x(i).toFixed(1) + ',' + (H - 28) + ') rotate(-90)" text-anchor="end" font-size="10" fill="var(--text-muted)">' + l.seq + "</text>");
+        }
+        const xt = xtArr.join("");
+        const xtTime =
+            (lines[0] && lines[0].at ? '<text x="' + PL + '" y="' + (H - 8) + '" text-anchor="start" font-size="9.5" fill="var(--text-faint)">' + fmtDT(lines[0].at) + "</text>" : "")
+            + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + fmtDT(lines[lines.length - 1].at) + "</text>" : "");
+        return xt + xtTime;
+    }
+    function trajectorySvg(lines, folds, win, baseIn, seamEvents) {
+        lines = (lines || []).filter((l) => Boolean(l));
+        if (!lines.length) return "";
+        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
+        const iw = W - PL - PR, ih = H - PT - PB;
+        let maxY = 0;
+        lines.forEach((l) => { if ((l.input || 0) > maxY) maxY = l.input; });
+        if (win && win > maxY) maxY = win * 1.05;
+        if (maxY <= 0) maxY = 1;
+        const x = (i) => PL + (lines.length === 1 ? iw / 2 : (i / (lines.length - 1)) * iw);
+        const y = (v) => PT + ih - (Math.max(0, v) / maxY) * ih;
+        const dt = (ms) => fmtDT(ms);
+        let grid = "", ticks = "";
+        for (let g = 0; g <= 4; g++) {
+            const v = (maxY / 4) * g;
+            const yy = y(v);
+            grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
+            ticks += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + fmtW(v) + "</text>";
+        }
+        let area = "M" + x(0).toFixed(1) + "," + y(lines[0].input || 0).toFixed(1);
+        let stroke = "";
+        lines.forEach((l, i) => {
+            area += " L" + x(i).toFixed(1) + "," + y(l.cached || 0).toFixed(1);
+            stroke += (i === 0 ? "M" : "L") + x(i).toFixed(1) + "," + y(l.input || 0).toFixed(1) + " ";
+        });
+        area += " L" + x(lines.length - 1).toFixed(1) + "," + (PT + ih).toFixed(1) + " L" + x(0).toFixed(1) + "," + (PT + ih).toFixed(1) + " Z";
+        // Cache-gap causes: color each sample's un-cached band (input − cached)
+        // by its most likely cause so gaps on the chart explain themselves.
+        // Classification lives in classifyLineCauses (#2929/#3484) — shared with
+        // the hit-rate line markers so both charts name the same buckets.
+        const causes = classifyLineCauses(lines, folds);
         let bands = "", hovers = "";
         const swSeg = lines.length === 1 ? iw : iw / (lines.length - 1);
         lines.forEach((l, i) => {
@@ -1306,41 +1797,8 @@ export const WEB_CLIENT = `(function () {
                 + "\\nin " + fmtW(l.input || 0) + " · cached " + fmtW(l.cached || 0) + " · missed " + fmtW((l.input || 0) - (l.cached || 0)) + " · hit " + hitPctLine
                 + (c === "new" ? "" : "\\n" + t(CAUSE_KEY[c])) + "</title></rect>";
         });
-        let foldMarks = "";
-        // Burst-folds share (near-)identical timestamps and thus the same pixel — merge them
-        // into one marker per pixel-bucket so stacked marks don't ghost into doubled lines.
-        const foldBuckets = [];
-        (folds || []).forEach((f) => {
-            let idx = -1;
-            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= (f.at || 0)) { idx = i; break; } }
-            if (idx < 0) idx = lines.length - 1;
-            const fx = x(idx);
-            const bk = foldBuckets.find((b) => Math.abs(b.fx - fx) <= 1.5);
-            if (bk) bk.items.push(f); else foldBuckets.push({ fx, items: [f] });
-        });
-        foldBuckets.forEach((bk) => {
-            const n = bk.items.length;
-            const seqs = bk.items.map((m) => m.seq != null ? "#" + m.seq : "").filter(Boolean).slice(0, 5).join("·");
-            foldMarks += '<line x1="' + bk.fx.toFixed(1) + '" y1="' + PT + '" x2="' + bk.fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.2" stroke-dasharray="3 3"><title>'
-                + t("det.fold_short") + (n > 1 ? " ×" + n : "") + (seqs ? " " + seqs + (bk.items.length > 5 ? "…" : "") + " · " : " ") + dt(bk.items[0].at) + " · " + fmtW(bk.items.reduce((a, m) => a + (m.S || 0), 0)) + "</title></line>";
-        });
-        // #1609: cache-seam suspects (#1606) get SOLID red marks at the first sample at/after
-        // the divergence time — folds stay dashed, so both read in the same visual language.
-        let seamMarks = "";
-        (seamEvents || []).forEach((ev) => {
-            if (!ev || !(ev.at > 0)) return;
-            let idx = -1;
-            for (let i = 0; i < lines.length; i++) { if ((lines[i].at || 0) >= ev.at) { idx = i; break; } }
-            if (idx < 0) idx = lines.length - 1;
-            const fx = x(idx);
-            const hit = typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) : "?";
-            const lcp = fmtB(ev.lcpBytes || 0);
-            const msg = ev.msgIndex != null ? ev.msgIndex : "?";
-            const prev = ev.prevMsgs != null ? ev.prevMsgs : "?";
-            const cur = ev.curMsgs != null ? ev.curMsgs : "?";
-            seamMarks += '<line x1="' + fx.toFixed(1) + '" y1="' + PT + '" x2="' + fx.toFixed(1) + '" y2="' + (PT + ih) + '" stroke="#cf222e" stroke-width="1.8"><title>'
-                + t("det.seam_mark_tip", { seq: ev.seq != null ? ev.seq : "?", at: dt(ev.at), hit, lcp, msg, prev, cur }) + "</title></line>";
-        });
+        const foldMarks = foldMarkLines(folds, lines, x, PT, ih);
+        const seamMarks = seamMarkLines(seamEvents, lines, x, PT, ih);
         let ceiling = "";
         if (win && win > 0) {
             const yy = y(win);
@@ -1362,32 +1820,69 @@ export const WEB_CLIENT = `(function () {
             baseline = '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="#8b949e" stroke-width="1" stroke-dasharray="2 4"/>'
                 + '<text x="' + PL + '" y="' + Math.max(10, yy - 4).toFixed(1) + '" font-size="9.5" fill="#8b949e">' + t(baseMeasured ? "det.legend_base" : "det.legend_base_est") + " " + fmtW(baseVal) + "</text>";
         }
-        // #2929: per-sample seq labels — every band must map to a visible
-        // index, not "somewhere between 5 and 10". Thinning is PIXEL-driven,
-        // not count-driven: real sessions carry hundreds/thousands of samples
-        // (~0.4px/sample), where any flat count step either mosaics the axis
-        // or drops to two naked numbers. Vertical (rotated) ticks reclaim the
-        // unused Y range; hold a constant ≥24px HORIZONTAL pitch.
-        // (#2929 cont.) NO Math.max(barW,1) here — that floor clamps
-        // sub-pixel bars UP to 1 and silently disables thinning exactly on
-        // the dense sessions this exists for.
-        const barW = lines.length > 1 ? (W - PL - PR) / (lines.length - 1) : 1;
-        const tStep = Math.max(1, Math.ceil(24 / barW));
-        const xtArr = [];
-        for (let i = lines.length - 1; i >= 0; i -= tStep) {
-            const l = lines[i];
-            xtArr.push('<text transform="translate(' + x(i).toFixed(1) + ',' + (H - 28) + ') rotate(-90)" text-anchor="end" font-size="10" fill="var(--text-muted)">' + l.seq + "</text>");
-        }
-        const xt = xtArr.join("");
-        const xtTime =
-            (lines[0] && lines[0].at ? '<text x="' + PL + '" y="' + (H - 8) + '" text-anchor="start" font-size="9.5" fill="var(--text-faint)">' + dt(lines[0].at) + "</text>" : "")
-            + (lines.length > 1 && lines[lines.length - 1].at ? '<text x="' + (W - PR) + '" y="' + (H - 8) + '" text-anchor="end" font-size="9.5" fill="var(--text-faint)">' + dt(lines[lines.length - 1].at) + "</text>" : "");
+        const xt = seqTickLines(lines, x, W, H, PL, PR);
         return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid
             + '<path d="' + area + '" fill="var(--accent)" opacity="0.18"/>'
             + bands
             + hovers
             + '<path d="' + stroke.trim() + '" fill="none" stroke="var(--accent)" stroke-width="1.8"/>'
-            + foldMarks + seamMarks + ceiling + baseline + ticks + xt + xtTime + "</svg>";
+            + foldMarks + seamMarks + ceiling + baseline + ticks + xt + "</svg>";
+    }
+    // #3484: per-request cache hit-rate line — the trend view the numeric cards lack
+    // (overview/list/card show one aggregate; this shows which rounds dipped and how far).
+    // Y axis is fixed 0–100% so drops read at a glance; non-"new" samples get a cause dot
+    // from the exact ledger-backed classification the trajectory bands paint, and the
+    // hover column names the cause. Same geometry and brush-zoom contract as trajectorySvg.
+    function hitRateSvg(lines, folds, seamEvents) {
+        lines = (lines || []).filter((l) => Boolean(l));
+        if (!lines.length) return "";
+        const W = TRAJ_W, H = TRAJ_H, PL = TRAJ_PL, PR = TRAJ_PR, PT = TRAJ_PT, PB = TRAJ_PB;
+        const iw = W - PL - PR, ih = H - PT - PB;
+        const x = (i) => PL + (lines.length === 1 ? iw / 2 : (i / (lines.length - 1)) * iw);
+        const y = (pct) => PT + ih - (Math.max(0, Math.min(100, pct)) / 100) * ih;
+        const dt = (ms) => fmtDT(ms);
+        // Ledger lines carry hitPct; older ledgers compute it from input/cached.
+        // Zero-input samples have no defined rate — break the line there.
+        const hp = (l) => l.hitPct != null ? l.hitPct : ((l.input || 0) > 0 ? ((l.cached || 0) / l.input) * 100 : null);
+        let grid = "", ticks = "";
+        for (let g = 0; g <= 4; g++) {
+            const v = 25 * g;
+            const yy = y(v);
+            grid += '<line x1="' + PL + '" y1="' + yy.toFixed(1) + '" x2="' + (W - PR) + '" y2="' + yy.toFixed(1) + '" stroke="var(--border)" stroke-width="1"/>';
+            ticks += '<text x="' + (PL - 6) + '" y="' + (yy + 3).toFixed(1) + '" text-anchor="end" font-size="10" fill="var(--text-muted)">' + v + "%</text>";
+        }
+        const causes = classifyLineCauses(lines, folds);
+        let stroke = "", started = false;
+        lines.forEach((l, i) => {
+            const v = hp(l);
+            if (v == null) { started = false; return; }
+            stroke += (started ? "L" : "M") + x(i).toFixed(1) + "," + y(v).toFixed(1) + " ";
+            started = true;
+        });
+        let dots = "", hovers = "";
+        const swSeg = lines.length === 1 ? iw : iw / (lines.length - 1);
+        lines.forEach((l, i) => {
+            const c = causes[i];
+            const v = hp(l);
+            const x0 = Math.max(PL, x(i) - swSeg / 2), x1 = Math.min(W - PR, x(i) + swSeg / 2);
+            if (v != null && c !== "new") dots += '<circle cx="' + x(i).toFixed(1) + '" cy="' + y(v).toFixed(1) + '" r="2.5" fill="' + CAUSE_COLOR[c] + '"/>';
+            const hitTxt = v == null ? t("common.none") : v.toFixed(1) + "%";
+            hovers += '<rect x="' + x0.toFixed(1) + '" y="' + PT + '" width="' + Math.max(1, x1 - x0).toFixed(1) + '" height="' + ih + '" fill="transparent"><title>'
+                + (l.seq != null ? "#" + l.seq + " · " : "") + dt(l.at)
+                + "\\nin " + fmtW(l.input || 0) + " · cached " + fmtW(l.cached || 0) + " · missed " + fmtW((l.input || 0) - (l.cached || 0)) + " · hit " + hitTxt
+                + (c === "new" ? "" : "\\n" + t(CAUSE_KEY[c])) + "</title></rect>";
+        });
+        // Accent placeholder dot only when the sample carries no cause dot of its own —
+        // a 1-line cold session must keep its cold color, not an accent dot on top.
+        const singleDot = lines.length === 1 && hp(lines[0]) != null && causes[0] === "new"
+            ? '<circle cx="' + x(0).toFixed(1) + '" cy="' + y(hp(lines[0])).toFixed(1) + '" r="3" fill="var(--accent)"/>'
+            : "";
+        const foldMarks = foldMarkLines(folds, lines, x, PT, ih);
+        const seamMarks = seamMarkLines(seamEvents, lines, x, PT, ih);
+        const xt = seqTickLines(lines, x, W, H, PL, PR);
+        return '<svg viewBox="0 0 ' + W + " " + H + '" class="chart-svg" role="img">' + grid
+            + (stroke.trim() ? '<path d="' + stroke.trim() + '" fill="none" stroke="var(--accent)" stroke-width="1.8"/>' : "")
+            + dots + singleDot + hovers + foldMarks + seamMarks + ticks + xt + "</svg>";
     }
     function legendItem(style, label, dashed) {
         if (dashed) return '<span><span class="dot" style="background:none;border-top:2px dashed #cf222e;height:0;border-radius:0;width:14px"></span>' + label + "</span>";
@@ -1412,147 +1907,175 @@ export const WEB_CLIENT = `(function () {
     function detailSeamActive(seam) {
         return !!(seam && (seam.suspects > 0 || seam.missed > 0 || seam.events.length > 0 || seam.providerSide.count > 0 || seam.rewinds.count > 0 || seam.client.count > 0 || seam.abortCorrelated > 0));
     }
-    // #2489: zoom-to-selection over the context-trajectory chart. The data is already
+    // #2489/#3484: zoom-to-selection over the detail charts. The data is already
     // client-side, so zooming re-renders the SAME renderer over a filtered slice — no
     // server round-trip, and an un-zoomed view stays byte-identical to the full render.
-    let trajState = null;   // { lines, folds, seams, win, baseIn } of the rendered detail
-    let trajRange = null;   // absolute [i0, i1] into trajState.lines, or null = full view
-    let trajDrag = null;    // in-flight brush gesture
-    function trajVisible() {
-        if (!trajState) return null;
-        const L = trajState.lines;
-        let a = 0, b = L.length - 1;
-        if (trajRange) {
-            a = Math.max(0, Math.min(L.length - 1, trajRange[0]));
-            b = Math.max(a, Math.min(L.length - 1, trajRange[1]));
-        }
-        const lines = L.slice(a, b + 1);
-        // Full view passes EVERY fold/seam through unfiltered: the renderer clamps
-        // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
-        // the byte-parity acceptance criterion pins). Time-filtering only applies to a
-        // ZOOMED window, where a foreign mark would land on the wrong sample.
-        if (!trajRange) return { lines, folds: trajState.folds || [], seams: trajState.seams || [], offset: a };
-        const t0 = lines[0] ? (lines[0].at || 0) : 0;
-        const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
-        return {
-            lines,
-            folds: (trajState.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
-            seams: (trajState.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
-            offset: a,
-        };
-    }
-    function trajRender() {
-        const wrap = $("traj-chart");
-        const v = trajVisible();
-        if (!wrap || !v) return;
-        wrap.innerHTML = v.lines.length ? trajectorySvg(v.lines, v.folds, trajState.win, trajState.baseIn, v.seams) : "";
-        trajUpdateStatus(v);
-    }
-    function trajUpdateStatus(v) {
-        const st = $("traj-status");
-        if (!st) return;
-        if (!trajRange || !v || !v.lines.length) { st.hidden = true; st.innerHTML = ""; return; }
-        const L = trajState.lines;
-        const a = v.offset, b = v.offset + v.lines.length - 1;
-        const sa = L[a].seq != null ? "#" + L[a].seq : "#" + (a + 1);
-        const sb = L[b].seq != null ? "#" + L[b].seq : "#" + (b + 1);
-        const times = v.lines.map((l) => l.at).filter(Boolean);
-        st.hidden = false;
-        st.innerHTML = '<span class="mono small">' + escapeHtml(t("det.traj_zoomed", { a: sa.slice(1), b: sb.slice(1), times: times.length ? fmtDT(times[0]) + " \u2192 " + fmtDT(times[times.length - 1]) : t("common.none") })) + "</span>"
-            + '<button id="traj-reset" class="btn sm" type="button">' + escapeHtml(t("det.traj_reset")) + "</button>";
-        const rb = $("traj-reset");
-        if (rb) rb.addEventListener("click", () => trajSetRange(null));
-    }
-    function trajSetRange(r) {
-        trajRange = r && r[1] > r[0] ? [r[0], r[1]] : null;
-        trajRender();
-    }
-    function trajIdxFromX(x, n) {
+    // One gesture machinery serves both charts (context trajectory + cache hit rate):
+    // identical geometry and interaction; each instance supplies element ids, its
+    // state and its renderer.
+    function chartIdxFromX(x, n) {
         if (n <= 1) return 0;
         const iw = TRAJ_W - TRAJ_PL - TRAJ_PR;
         return Math.max(0, Math.min(n - 1, Math.round(((x - TRAJ_PL) / iw) * (n - 1))));
     }
-    function trajLocalX(wrap, ev) {
-        const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
-        if (!r || !(r.width > 0)) return null;
-        const x = (ev.clientX - r.left) * (TRAJ_W / r.width);
-        return Math.max(TRAJ_PL, Math.min(TRAJ_W - TRAJ_PR, x));
+    const chartZooms = [];   // live instances — Esc resets any zoomed chart (#2489 behavior)
+    function makeChartZoom(cfg) {
+        // cfg: { elId, statusId, resetId, render(lines, folds, seams) -> svg, link?: { members } }
+        const z = { range: null, drag: null, state: null, cfg };
+        z.visible = function visible() {
+            if (!z.state) return null;
+            const L = z.state.lines;
+            let a = 0, b = L.length - 1;
+            if (z.range) {
+                a = Math.max(0, Math.min(L.length - 1, z.range[0]));
+                b = Math.max(a, Math.min(L.length - 1, z.range[1]));
+            }
+            const lines = L.slice(a, b + 1);
+            // Full view passes EVERY fold/seam through unfiltered: the renderer clamps
+            // out-of-sample-range marks to the nearest edge (the pre-#2489 behavior, which
+            // the byte-parity acceptance criterion pins). Time-filtering only applies to a
+            // ZOOMED window, where a foreign mark would land on the wrong sample.
+            if (!z.range) return { lines, folds: z.state.folds || [], seams: z.state.seams || [], offset: a };
+            const t0 = lines[0] ? (lines[0].at || 0) : 0;
+            const t1 = lines.length ? (lines[lines.length - 1].at || 0) : 0;
+            return {
+                lines,
+                folds: (z.state.folds || []).filter((f) => (f.at || 0) >= t0 && (f.at || 0) <= t1),
+                seams: (z.state.seams || []).filter((e) => e && e.at > 0 && e.at >= t0 && e.at <= t1),
+                offset: a,
+            };
+        };
+        function updateStatus(v) {
+            const st = $(cfg.statusId);
+            if (!st) return;
+            if (!z.range || !v || !v.lines.length) { st.hidden = true; st.innerHTML = ""; return; }
+            const L = z.state.lines;
+            const a = v.offset, b = v.offset + v.lines.length - 1;
+            const sa = L[a].seq != null ? "#" + L[a].seq : "#" + (a + 1);
+            const sb = L[b].seq != null ? "#" + L[b].seq : "#" + (b + 1);
+            const times = v.lines.map((l) => l.at).filter(Boolean);
+            st.hidden = false;
+            st.innerHTML = '<span class="mono small">' + escapeHtml(t("det.traj_zoomed", { a: sa.slice(1), b: sb.slice(1), times: times.length ? fmtDT(times[0]) + " \u2192 " + fmtDT(times[times.length - 1]) : t("common.none") })) + "</span>"
+                + '<button id="' + cfg.resetId + '" class="btn sm" type="button">' + escapeHtml(t("det.traj_reset")) + "</button>";
+            const rb = $(cfg.resetId);
+            if (rb) rb.addEventListener("click", () => z.setRange(null));
+        }
+        z.render = function render() {
+            const wrap = $(cfg.elId);
+            const v = z.visible();
+            if (!wrap || !v) return;
+            wrap.innerHTML = v.lines.length ? cfg.render(v.lines, v.folds, v.seams) : "";
+            updateStatus(v);
+        };
+        z.setRange = function setRange(r) {
+            const nr = r && r[1] > r[0] ? [r[0], r[1]] : null;
+            const same = (nr === null && z.range === null) || (nr !== null && z.range !== null && nr[0] === z.range[0] && nr[1] === z.range[1]);
+            if (same) return;
+            z.range = nr;
+            z.render();
+            // #4317: linked charts share ONE brush window — a selection or reset on either
+            // re-renders its peers over the same sample indices. The length guard keeps a
+            // stale peer bound to another session's ledger out of the propagation.
+            if (cfg.link && z.state) cfg.link.members.forEach((m) => { if (m !== z && m.state && m.state.lines.length === z.state.lines.length) m.setRange(nr); });
+        };
+        function localX(wrap, ev) {
+            const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+            if (!r || !(r.width > 0)) return null;
+            const x = (ev.clientX - r.left) * (TRAJ_W / r.width);
+            return Math.max(TRAJ_PL, Math.min(TRAJ_W - TRAJ_PR, x));
+        }
+        function overlayShow(wrap, xa, xb) {
+            if (!z.drag || !z.drag.overlay) return;
+            const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
+            if (!r || !(r.width > 0)) return;
+            const o = z.drag.overlay;
+            o.style.left = (Math.min(xa, xb) * (r.width / TRAJ_W)).toFixed(1) + "px";
+            o.style.width = (Math.abs(xb - xa) * (r.width / TRAJ_W)).toFixed(1) + "px";
+            o.style.top = (TRAJ_PT * (r.height / TRAJ_H)).toFixed(1) + "px";
+            o.style.height = ((TRAJ_H - TRAJ_PT - TRAJ_PB) * (r.height / TRAJ_H)).toFixed(1) + "px";
+        }
+        function onDown(ev) {
+            if (!z.state || ev.button !== 0) return;
+            const wrap = $(cfg.elId);
+            const v = z.visible();
+            if (!wrap || !v || v.lines.length < TRAJ_MIN_SAMPLES) return;
+            ev.preventDefault();
+            const x0 = localX(wrap, ev);
+            if (x0 == null) return;
+            const o = document.createElement("div");
+            o.className = "chart-brush";
+            wrap.appendChild(o);
+            z.drag = { x0, cur: x0, n: v.lines.length, offset: v.offset, overlay: o };
+            overlayShow(wrap, x0, x0);
+            document.addEventListener("mousemove", onMove);
+            document.addEventListener("mouseup", onUp);
+        }
+        function onMove(ev) {
+            if (!z.drag) return;
+            const x = localX($(cfg.elId), ev);
+            if (x == null) return;
+            z.drag.cur = x;
+            overlayShow($(cfg.elId), z.drag.x0, x);
+        }
+        function onUp(ev) {
+            document.removeEventListener("mousemove", onMove);
+            document.removeEventListener("mouseup", onUp);
+            if (!z.drag) return;
+            const d0 = z.drag;
+            z.drag = null;
+            if (d0.overlay) d0.overlay.remove();
+            const x1 = localX($(cfg.elId), ev);
+            if (x1 == null) return;
+            const i0 = chartIdxFromX(Math.min(d0.x0, x1), d0.n);
+            const i1 = chartIdxFromX(Math.max(d0.x0, x1), d0.n);
+            if (i1 - i0 + 1 < TRAJ_MIN_SAMPLES) return;     // too narrow — treat as a click
+            if (i1 - i0 + 1 >= d0.n) return;                 // full-width drag — nothing to gain
+            z.setRange([d0.offset + i0, d0.offset + i1]);
+        }
+        z.bind = function bind(state) {
+            z.state = state && state.lines.length ? state : null;
+            z.range = null;
+            const wrap = $(cfg.elId);
+            if (!wrap || !z.state) { z.render(); return; }
+            wrap.addEventListener("mousedown", onDown);
+            wrap.addEventListener("dblclick", () => z.setRange(null));
+            z.render();
+        };
+        chartZooms.push(z);
+        if (cfg.link) cfg.link.members.push(z);
+        return z;
     }
-    function trajOverlayShow(wrap, xa, xb) {
-        if (!trajDrag || !trajDrag.overlay) return;
-        const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
-        if (!r || !(r.width > 0)) return;
-        const o = trajDrag.overlay;
-        o.style.left = (Math.min(xa, xb) * (r.width / TRAJ_W)).toFixed(1) + "px";
-        o.style.width = (Math.abs(xb - xa) * (r.width / TRAJ_W)).toFixed(1) + "px";
-        o.style.top = (TRAJ_PT * (r.height / TRAJ_H)).toFixed(1) + "px";
-        o.style.height = ((TRAJ_H - TRAJ_PT - TRAJ_PB) * (r.height / TRAJ_H)).toFixed(1) + "px";
-    }
-    function trajOnDown(ev) {
-        if (!trajState || ev.button !== 0) return;
-        const wrap = $("traj-chart");
-        const v = trajVisible();
-        if (!wrap || !v || v.lines.length < TRAJ_MIN_SAMPLES) return;
-        ev.preventDefault();
-        const x0 = trajLocalX(wrap, ev);
-        if (x0 == null) return;
-        const o = document.createElement("div");
-        o.className = "chart-brush";
-        wrap.appendChild(o);
-        trajDrag = { x0, cur: x0, n: v.lines.length, offset: v.offset, overlay: o };
-        trajOverlayShow(wrap, x0, x0);
-        document.addEventListener("mousemove", trajOnMove);
-        document.addEventListener("mouseup", trajOnUp);
-    }
-    function trajOnMove(ev) {
-        if (!trajDrag) return;
-        const x = trajLocalX($("traj-chart"), ev);
-        if (x == null) return;
-        trajDrag.cur = x;
-        trajOverlayShow($("traj-chart"), trajDrag.x0, x);
-    }
-    function trajOnUp(ev) {
-        document.removeEventListener("mousemove", trajOnMove);
-        document.removeEventListener("mouseup", trajOnUp);
-        if (!trajDrag) return;
-        const d0 = trajDrag;
-        trajDrag = null;
-        if (d0.overlay) d0.overlay.remove();
-        const x1 = trajLocalX($("traj-chart"), ev);
-        if (x1 == null) return;
-        const i0 = trajIdxFromX(Math.min(d0.x0, x1), d0.n);
-        const i1 = trajIdxFromX(Math.max(d0.x0, x1), d0.n);
-        if (i1 - i0 + 1 < TRAJ_MIN_SAMPLES) return;     // too narrow — treat as a click
-        if (i1 - i0 + 1 >= d0.n) return;                 // full-width drag — nothing to gain
-        trajSetRange([d0.offset + i0, d0.offset + i1]);
-    }
+    const trajAux = { win: 0, baseIn: 0 };
+    // #4317: both detail charts plot the SAME request timeline in two projections —
+    // one shared brush window keeps them in lockstep (select on either, both follow).
+    const detailChartLink = { members: [] };
+    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", link: detailChartLink, render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
+    const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", link: detailChartLink, render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
     function bindTrajectoryBrush(d) {
-        trajState = null;
-        trajRange = null;
         const ledger = d.ledger || {};
         const lines = (ledger.lines || []).filter((l) => Boolean(l));
-        if (!lines.length) return;
         const seam = detailSeam(ledger);
-        trajState = {
-            lines,
-            folds: ledger.folds || [],
-            seams: detailSeamActive(seam) && seam ? seam.events : [],
-            win: d.contextWindow || 0,
-            baseIn: d.systemPromptTokens || 0,
-        };
-        const wrap = $("traj-chart");
-        if (!wrap) return;
-        wrap.addEventListener("mousedown", trajOnDown);
-        wrap.addEventListener("dblclick", () => trajSetRange(null));
-        trajRender();
+        trajAux.win = d.contextWindow || 0;
+        trajAux.baseIn = d.systemPromptTokens || 0;
+        trajZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [] });
+    }
+    function bindHitRateChart(d) {
+        const ledger = d.ledger || {};
+        const lines = (ledger.lines || []).filter((l) => Boolean(l));
+        const seam = detailSeam(ledger);
+        hitZoom.bind({ lines, folds: ledger.folds || [], seams: detailSeamActive(seam) && seam ? seam.events : [] });
     }
     window.bili_trajSvg = trajectorySvg;
-    window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: trajIdxFromX, visible: () => trajVisible(), range: () => trajRange };
+    window.bili_hitSvg = hitRateSvg;
+    window.bili_causes = classifyLineCauses;
+    window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => trajZoom.visible(), range: () => trajZoom.range };
+    window.bili_hitZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => hitZoom.visible(), range: () => hitZoom.range };
     function blockTopic(b) {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
         const lead = String(b.summary || "").split("\\n").map((s) => s.trim()).find(Boolean) || "";
-        return lead.length > 48 ? lead.slice(0, 48) + "…" : lead || b.blockId;
+        const plain = lead.replace(/^#{1,6}\\s*/, "").replace(/^[*>-]+\\s*/, "");
+        return plain.length > 48 ? plain.slice(0, 48) + "…" : plain || b.blockId;
     }
     function detailBadges(d) {
         const live = d.live && !d.restored;
@@ -1584,20 +2107,33 @@ export const WEB_CLIENT = `(function () {
         if (lp < 0) return null;
         return { kind: kind, name: nameId.slice(0, lp), cid: nameId.slice(lp + 1), text: line.slice(mark + tailLen) };
     }
+    // Terminates the reasoning cell of a reply: _reasoning_: has no end
+    // marker, so the handoff renderer would otherwise fold the answer that
+    // follows into the collapsed thinking box. Mirrored in HANDOFF_THINK_END.
+    const HANDOFF_THINK_END = "<!-- /reasoning -->";
     function splitHandoffBody(bodyLines) {
         const segs = [];
-        for (const raw of bodyLines) {
+        let thinkClosed = false;
+        for (let i = 0; i < bodyLines.length; i++) {
+            const raw = bodyLines[i];
             if (raw.trim() === "" && !(segs.length && segs[segs.length - 1].type === "out")) continue;
+            const activeThink = segs[segs.length - 1];
+            if (raw.trim() === HANDOFF_THINK_END && activeThink && activeThink.type === "think" && !thinkClosed) {
+                if (bodyLines[i + 1] === raw) { activeThink.lines.push(raw); i++; }
+                else thinkClosed = true;
+                continue;
+            }
             const tool = parseToolLine(raw);
             if (tool) { segs.push({ type: "tool", kind: tool.kind, name: tool.name, cid: tool.cid, lines: [tool.text] }); continue; }
             if (raw.indexOf("_reasoning_: ") === 0) {
                 const lastT = segs[segs.length - 1];
-                if (!lastT || lastT.type !== "think") segs.push({ type: "think", lines: [] });
+                if (!lastT || lastT.type !== "think" || thinkClosed) segs.push({ type: "think", lines: [] });
                 segs[segs.length - 1].lines.push(raw.slice("_reasoning_: ".length));
+                thinkClosed = false;
                 continue;
             }
             const last = segs[segs.length - 1];
-            if (last && (last.type === "out" || last.type === "think")) last.lines.push(raw);
+            if (last && (last.type === "out" || (last.type === "think" && !thinkClosed))) last.lines.push(raw);
             else segs.push({ type: "out", lines: [raw] });
         }
         return segs;
@@ -1702,20 +2238,333 @@ export const WEB_CLIENT = `(function () {
         return html.join("");
     }
     window.bili_renderHandoffMd = renderHandoffMd;
+    // #3917: compression-structure tree — nested by parentBlockId (an active
+    // block's children are the blocks it folded); roots are blocks whose parent
+    // is no longer folded. Nodes carry the kernel's own accounting:
+    // compressedTokens (what the block absorbed), summaryTokens (what replaced
+    // it), summaryBytes (the rendered artifact) and the mNNNNN span it covers.
+    function blockTreeStats(blocks) {
+        const tiers = {};
+        let active = 0;
+        let coverTokens = 0;
+        let summaryTokens = 0;
+        blocks.forEach(function (b) {
+            const tier = Number(b.tier) || 1;
+            tiers[tier] = (tiers[tier] || 0) + 1;
+            if (b.active) active += 1;
+            coverTokens += Number(b.compressedTokens) || 0;
+            summaryTokens += Number(b.summaryTokens) || 0;
+        });
+        return { tiers: tiers, active: active, coverTokens: coverTokens, summaryTokens: summaryTokens };
+    }
+    function blockTreeShape(blocks) {
+        const byId = {};
+        blocks.forEach(function (b) { byId[b.blockId] = b; });
+        const children = {};
+        const roots = [];
+        blocks.forEach(function (b) {
+            const pid = b.parentBlockId;
+            if (pid && byId[pid] && pid !== b.blockId) (children[pid] = children[pid] || []).push(b);
+            else roots.push(b);
+        });
+        return { children: children, roots: roots };
+    }
+    // #4608: geometry for the collapsible-tree reading of the blocks pane.
+    // (The flame-chart reading was cut at owner request — the pane keeps
+    // the tree plus the classic folded-block list instead.)
+    const TREE_W = 200;          // collapsible-tree node box
+    const TREE_H = 44;
+    const TREE_GAP_X = 22;       // column spacing (depth axis)
+    const TREE_GAP_Y = 10;
+    // Collapsible depth-column tree: roots always show, a branch appears only
+    // while its parent carries the expand mark; the "+N" chip counts the whole
+    // hidden subtree so a deep collapse still says how much hides behind it.
+    function collapSubtreeSize(blocks) {
+        const byId = {};
+        blocks.forEach(function (b) { byId[b.blockId] = true; });
+        const childIds = {};
+        blocks.forEach(function (b) {
+            const pid = b.parentBlockId;
+            if (pid && pid !== b.blockId && byId[pid]) (childIds[pid] = childIds[pid] || []).push(b.blockId);
+        });
+        const memo = {};
+        const size = function (id, trail) {
+            if (memo[id] != null) return memo[id];
+            if (trail.indexOf(id) >= 0) return 1;
+            trail.push(id);
+            const total = 1 + (childIds[id] || []).reduce(function (acc, k) { return acc + size(k, trail); }, 0);
+            trail.pop();
+            memo[id] = total;
+            return total;
+        };
+        blocks.forEach(function (b) { size(b.blockId, []); });
+        return memo;
+    }
+    function collapTreeLayout(blocks, expanded) {
+        const shape = blockTreeShape(blocks);
+        const sizes = collapSubtreeSize(blocks);
+        const nodes = [], links = [];
+        let cursor = 0, maxDepth = 0;
+        const place = function (b, depth) {
+            if (depth > 40) return null;
+            const node = { b: b, x: depth, y: 0 };
+            const ys = [];
+            if (expanded && expanded[b.blockId])
+                (shape.children[b.blockId] || []).forEach(function (k) {
+                    const kn = place(k, depth + 1);
+                    if (kn) { ys.push(kn.y); links.push([node, kn]); }
+                });
+            if (ys.length) node.y = (ys[0] + ys[ys.length - 1]) / 2;
+            else { node.y = cursor; cursor += TREE_H + TREE_GAP_Y; }
+            nodes.push(node);
+            if (depth > maxDepth) maxDepth = depth;
+            return node;
+        };
+        (shape.roots.length ? shape.roots : blocks).forEach(function (r) { place(r, 0); });
+        if (!nodes.length) return { nodes: nodes, links: links, cols: 1, height: 0, sizes: sizes };
+        return { nodes: nodes, links: links, cols: maxDepth + 1, height: cursor - TREE_GAP_Y + TREE_H, sizes: sizes };
+    }
+    function renderCollapSvg(blocks, expanded, selectedBid) {
+        const lay = collapTreeLayout(blocks, expanded || {});
+        if (!lay.nodes.length) return { html: "" };
+        const colW = TREE_W + TREE_GAP_X;
+        const W = 12 + lay.cols * colW + 4;
+        const H = lay.height + 12;
+        const sel = selectedBid || "";
+        const p = [];
+        p.push('<svg class="g-svg g-svg-v" viewBox="0 0 ' + W + " " + H + '" width="' + W + '" height="' + H + '" preserveAspectRatio="xMinYMin meet" role="img">');
+        lay.links.forEach(function (l) {
+            const x1 = l[0].x * colW + 12 + TREE_W, y1 = l[0].y + 6 + TREE_H / 2;
+            const x2 = l[1].x * colW + 12, y2 = l[1].y + 6 + TREE_H / 2;
+            const mx = (x1 + x2) / 2;
+            p.push('<path class="g-edge" fill="none" d="M' + x1.toFixed(1) + " " + y1.toFixed(1) + " C" + mx.toFixed(1) + " " + y1.toFixed(1) + " " + mx.toFixed(1) + " " + y2.toFixed(1) + " " + x2.toFixed(1) + " " + y2.toFixed(1) + '"></path>');
+        });
+        lay.nodes.forEach(function (n) {
+            const b = n.b;
+            const tierNum = Number(b.tier) || 1;
+            const hidden = (lay.sizes[b.blockId] || 1) - 1;
+            const isOpen = !!(expanded && expanded[b.blockId]);
+            const cls = "g-node tier-" + (tierNum > 3 ? "n" : String(tierNum)) + (b.active ? "" : " inactive") + (sel === b.blockId ? " fsel" : "");
+            let topic = blockTopic(b);
+            const maxCh = Math.floor((TREE_W - 52) / 7);
+            if (topic.length > maxCh) topic = topic.slice(0, Math.max(1, maxCh - 1)) + "...";
+            const rr = refRangeOf(b);
+            p.push('<g class="' + cls + '" data-bid="' + escapeHtml(b.blockId) + '" transform="translate(' + (n.x * colW + 12).toFixed(1) + "," + (n.y + 6).toFixed(1) + ')">');
+            p.push('<rect width="' + TREE_W + '" height="' + TREE_H + '" rx="9"><title>' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "") + " \u00b7 " + blockTopic(b)) + "</title></rect>");
+            p.push('<text class="g-id" x="10" y="17">' + escapeHtml(b.blockId + " \u00b7 T" + tierNum + (rr ? " \u00b7 " + rr : "")) + "</text>");
+            p.push('<text class="g-topic" x="10" y="34">' + escapeHtml(topic) + "</text>");
+            if (hidden > 0)
+                p.push('<g class="tchip" data-toggle="' + escapeHtml(b.blockId) + '" transform="translate(' + (TREE_W - 34) + ',13)">' + '<rect width="28" height="18" rx="9"></rect><text x="14" y="13">' + (isOpen ? "−" : "+" + hidden) + '</text></g>');
+            p.push("</g>");
+        });
+        p.push("</svg>");
+        return { html: p.join("") };
+    }
+    function refRangeOf(b) {
+        if (!b.startRef) return "";
+        return b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : String(b.startRef);
+    }
+    // #4608: one pre-rendered detail panel per fold block — hidden until its
+    // bar/node is selected, so the drawings stay light while the summary, the
+    // kernel's own accounting and the lazy raw-content endpoints all live next
+    // to the thing you clicked.
+    function sidePanelHtml(b, idx) {
+        const tierNum = Number(b.tier) || 1;
+        const badge = b.active
+            ? '<span class="badge ok">' + t("det.block_active") + "</span>"
+            : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
+        const extBadge = b.external ? '<span class="badge ext">' + t("det.block_external") + "</span>" : "";
+        const meta = ["T" + tierNum, fmtW(b.compressedTokens) + " \u2192 " + fmtW(b.summaryTokens)];
+        if (b.compressedTokens > 0 && b.summaryTokens > 0) meta.push((100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%");
+        meta.push(fmtB(b.summaryBytes));
+        if (b.effectiveMessageCount) meta.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
+        const rr = refRangeOf(b);
+        if (rr) meta.push(rr);
+        meta.push(timeAgo(b.createdAt));
+        // Same contract as the old list row: long summaries open as five
+        // clamped lines behind a show-all button; the clamp only survives
+        // measurement if it actually cut anything.
+        const sumLong = String(b.summary || "").trim().length > 64;
+        let bodyInner = renderBlockMd(b.summary || "");
+        if (sumLong) {
+            bodyInner = '<div class="blk-sum clamp">' + bodyInner + "</div>"
+                + '<button type="button" class="btn sm blk-sum-toggle">' + t("det.tree_sum_more") + "</button>";
+        }
+        const bid = escapeHtml(b.blockId);
+        let html = '<div class="bd-panel" data-bid="' + bid + '" hidden><div class="bd-head"><span class="mono">' + bid + "</span>" + badge + extBadge
+            + '<button class="btn sm blk-copy" data-bi="' + idx + '">' + t("common.copy") + "</button></div>"
+            + '<div class="topic">' + escapeHtml(blockTopic(b)) + "</div>"
+            + '<div class="meta mono">' + escapeHtml(meta.join(" \u00b7 ")) + "</div>"
+            + '<div class="body md">' + bodyInner + "</div>"
+            + '<div class="blk-content-bar">'
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="one">' + t("det.tree_orig_one") + "</button>"
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="full">' + t("det.tree_orig_full") + "</button>"
+            + '<span class="dim small">' + escapeHtml(t("det.tree_direct", { n: Number(b.directMessageCount) || 0 })) + "</span>"
+            + "</div>"
+            + '<div class="blk-content" data-blkbox hidden></div>';
+        // The messages this block folded — preview only, bytes arrive lazily
+        // (#3917) through the very same endpoint the old list rows used.
+        const msgs = b.directMessages || [];
+        if (msgs.length) {
+            html += '<ul class="blk-msgs">';
+            msgs.forEach(function (m) {
+                if (m.missing) {
+                    html += '<li><div class="msg-row missing"><span class="mref mono">' + escapeHtml(m.ref) + '</span><span class="mprev">' + t("det.tree_msg_gone") + "</span></div></li>";
+                    return;
+                }
+                const tags = m.toolName ? '<span class="badge">' + escapeHtml(m.toolName) + "</span>" : "";
+                html += '<li><button class="msg-row" data-ref="' + escapeHtml(m.ref) + '">'
+                    + '<span class="mref mono">' + escapeHtml(m.ref) + "</span>"
+                    + '<span class="badge">' + escapeHtml(m.role || "") + "</span>" + tags
+                    + '<span class="mprev">' + escapeHtml(m.preview || "") + "</span></button>"
+                    + '<div class="msg-body" hidden></div></li>';
+            });
+            html += "</ul>";
+        } else if (Number(b.directMessageCount) > 0) {
+            html += '<div class="dim small" style="margin:2px 0 8px">' + t("det.tree_msgs_unavailable") + "</div>";
+        }
+        return html + "</div>";
+    }    function blockNodeHtml(b, shape, idx, depth) {
+        const kids = shape.children[b.blockId] || [];
+        const tierNum = Number(b.tier) || 1;
+        // #4173 review: rows start COLLAPSED — a 200-block session must not
+        // open as a wall of expanded cards. The tree-map click opens the
+        // target row for you; <summary> expands any row on demand.
+        const openAttr = "";
+        const badge = b.active
+            ? '<span class="badge ok">' + t("det.block_active") + "</span>"
+            : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
+        const extBadge = b.external ? '<span class="badge ext">' + t("det.block_external") + "</span>" : "";
+        const refRange = refRangeOf(b);
+        const meta = ["T" + tierNum, fmtW(b.compressedTokens) + " → " + fmtW(b.summaryTokens)];
+        if (b.compressedTokens > 0 && b.summaryTokens > 0) meta.push((100 * b.summaryTokens / b.compressedTokens).toFixed(1) + "%");
+        meta.push(fmtB(b.summaryBytes));
+        if (b.effectiveMessageCount) meta.push(t("det.tree_msgs", { n: b.effectiveMessageCount }));
+        if (refRange) meta.push(refRange);
+        meta.push(timeAgo(b.createdAt));
+        // #4173 review: long summaries open as five clamped lines + a show-all
+        // button. Closed <details> rows have no layout, so whether the clamp
+        // actually cut anything is measured once on first expand (below).
+        const sumLong = String(b.summary || "").trim().length > 64;
+        let bodyInner = renderBlockMd(b.summary || "");
+        if (sumLong) {
+            bodyInner = '<div class="blk-sum clamp">' + bodyInner + '</div>'
+                + '<button type="button" class="btn sm blk-sum-toggle">' + t("det.tree_sum_more") + "</button>";
+        }
+        const bid = escapeHtml(b.blockId);
+        let html = '<details class="block-item block-node tier-' + (tierNum > 3 ? "n" : String(tierNum)) + '" data-bid="' + bid + '"' + openAttr + ">"
+            + '<summary><span class="bid">' + bid + "</span>" + badge + extBadge
+            + '<span class="topic">' + escapeHtml(blockTopic(b)) + "</span>"
+            + '<span class="meta">' + escapeHtml(meta.join(" · ")) + "</span>"
+            + '<button class="btn sm blk-copy" data-bi="' + idx + '">' + t("common.copy") + "</button>"
+            + "</summary>"
+            + '<div class="body md">' + bodyInner + "</div>"
+            + '<div class="blk-content-bar">'
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="one">' + t("det.tree_orig_one") + "</button>"
+            + '<button class="btn sm blk-content-btn" data-bid="' + bid + '" data-view="full">' + t("det.tree_orig_full") + "</button>"
+            + '<span class="dim small">' + escapeHtml(t("det.tree_direct", { n: Number(b.directMessageCount) || 0 })) + "</span>"
+            + "</div>"
+            + '<div class="blk-content" data-blkbox hidden></div>';
+        // #3917: the messages this block folded, one leaf per mNNNNN ref. The
+        // preview is all the tree needs; the bytes arrive on the first click
+        // (the lazy endpoint), so a wide session never ships its transcript.
+        const msgs = b.directMessages || [];
+        if (msgs.length) {
+            html += '<ul class="blk-msgs">';
+            msgs.forEach(function (m) {
+                if (m.missing) {
+                    html += '<li><div class="msg-row missing"><span class="mref mono">' + escapeHtml(m.ref) + '</span><span class="mprev">' + t("det.tree_msg_gone") + "</span></div></li>";
+                    return;
+                }
+                const tags = m.toolName ? '<span class="badge">' + escapeHtml(m.toolName) + "</span>" : "";
+                html += '<li><button class="msg-row" data-ref="' + escapeHtml(m.ref) + '">'
+                    + '<span class="mref mono">' + escapeHtml(m.ref) + "</span>"
+                    + '<span class="badge">' + escapeHtml(m.role || "") + "</span>" + tags
+                    + '<span class="mprev">' + escapeHtml(m.preview || "") + "</span></button>"
+                    + '<div class="msg-body" hidden></div></li>';
+            });
+            html += "</ul>";
+        } else if (Number(b.directMessageCount) > 0) {
+            html += '<div class="dim small" style="margin:2px 0 8px 24px">' + t("det.tree_msgs_unavailable") + "</div>";
+        }
+        if (depth < 32) kids.forEach(function (k) { html += blockNodeHtml(k, shape, idx, depth + 1); });
+        return html + "</details>";
+    }
+
+
+    function buildTreePane(blocks) {
+        const parts = [];
+        parts.push('<div class="card"><div class="card-h"><span>' + t("det.blocks_title") + '</span><span class="hint">' + t("det.blocks_count", { total: blocks.length, active: blocks.filter(function (b) { return b.active; }).length }) + '</span></div><div class="card-b">');
+        if (!blocks.length) {
+            parts.push('<div class="dim small" style="padding:8px 0">' + t("det.blocks_empty") + "</div></div></div>");
+            return parts.join("");
+        }
+        window.__biliDetailBlocks = blocks; // consumed by bindTreeModeActions() after insertion
+        const stats = blockTreeStats(blocks);
+        const tierBits = Object.keys(stats.tiers).sort(function (a, b) { return Number(a) - Number(b); }).map(function (k) { return "T" + k + " ×" + stats.tiers[k]; });
+        parts.push('<div class="tree-stats mono small">'
+            + "<span>" + escapeHtml(t("det.tree_total", { n: blocks.length })) + "</span>"
+            + "<span>" + escapeHtml(t("det.tree_active", { n: stats.active })) + "</span>"
+            + "<span>" + escapeHtml(t("det.tree_split", { x: fmtW(stats.coverTokens), y: fmtW(stats.summaryTokens), p: stats.coverTokens > 0 ? (100 * stats.summaryTokens / stats.coverTokens).toFixed(1) + "%" : t("common.none") })) + "</span>"
+            + (tierBits.length ? "<span>" + escapeHtml(tierBits.join(" · ")) + "</span>" : "")
+            + "</div>");
+        parts.push('<div class="tree-actions"><button id="blocks-copy" class="btn sm">' + t("det.blocks_copy_md") + '</button><button id="blocks-dl" class="btn sm">' + t("det.blocks_download") + "</button></div>");
+        parts.push('<div class="tree-modes">'
+            + '<button class="btn sm tree-mode active" data-mode="tree">' + t("det.tree_view_graph") + "</button>"
+            + '<button class="btn sm tree-mode" data-mode="list">' + t("det.tree_view_list") + "</button>"
+            + '<button id="tm-expand-all" class="btn sm" hidden>' + t("det.tree_expand_all") + "</button>"
+            + '<button id="tm-collapse-all" class="btn sm" hidden>' + t("det.tree_collapse_all") + "</button>"
+            + '<span class="hint" id="tree-hint">' + t("det.tree_interact") + "</span>"
+            + "</div>");
+        // Left: the two interchangeable readings inside one scrollable frame
+        // (the collapsible tree by default, the classic folded-block list on
+        // demand); right: the selected block, sticky beside the tree.
+        const shape = blockTreeShape(blocks);
+        const idxOf = {};
+        blocks.forEach(function (b, i) { if (idxOf[b.blockId] === undefined) idxOf[b.blockId] = i; });
+        parts.push('<div class="fd-grid"><div class="fd-left">');
+        parts.push('<div class="tm-view" id="tree-graph"><div class="tm-inner"></div></div>');
+        parts.push('<div class="tree-list" id="tree-list" hidden><div class="block-tree">');
+        const rootBlocks = shape.roots.length ? shape.roots : blocks;
+        rootBlocks.forEach(function (b) { parts.push(blockNodeHtml(b, shape, idxOf[b.blockId] || 0, 0)); });
+        parts.push("</div></div>");
+        parts.push('</div><aside class="fd-side"><div class="card bd-card"><div class="card-h"><span>' + t("det.block_detail_title") + '</span></div><div class="card-b">');
+        parts.push('<div class="dim small" id="bd-empty">' + t("det.block_side_hint") + "</div>");
+        parts.push('<div id="bd-panels">');
+        blocks.forEach(function (b) { parts.push(sidePanelHtml(b, idxOf[b.blockId])); });
+        parts.push("</div></div></div></aside></div>");
+        parts.push("</div></div>");
+        return parts.join("");
+    }
     function buildDetailHtml(d) {
         const parts = [];
+        // Hoisted above the page head so the tab count badge can share the same
+        // array (originally declared further down, inside the tree pane).
+        const blocks = d.blockDetails || [];
         parts.push('<a class="btn sm" href="#/sessions">' + t("common.back") + "</a>");
         parts.push('<div class="page-head"><div><h1 title="' + escapeHtml(d.title || d.label || d.id) + '">' + escapeHtml(d.title || d.label || d.id.slice(0, 16)) + '</h1><div class="sub mono">' + escapeHtml(d.id) + "</div></div><div>" + detailBadges(d) + "</div></div>");
         parts.push('<div style="display:flex;align-items:center;gap:8px;margin-top:12px;flex-wrap:wrap"><span class="dim small">' + t("det.report_note") + '</span><button id="sessrpt-md" class="btn sm">' + t("det.report_md") + '</button><button id="sessrpt-png" class="btn sm">' + t("det.report_png") + '</button></div>');
+        // #3917: the detail page splits into panes — overview (identity, usage,
+        // cache economics), the compression tree, and the handoff document. The
+        // blocks card moved out of the overview into its own tier-tree pane.
+        parts.push('<div class="det-tabs" id="det-tabs">'
+            + '<button class="det-tab active" data-pane="overview">' + t("det.tab_overview") + "</button>"
+            + '<button class="det-tab" data-pane="blocks">' + t("det.tab_blocks") + (blocks.length ? ' <span class="hint">' + blocks.length + "</span>" : "") + "</button>"
+            + '<button class="det-tab" data-pane="handoff">' + t("det.tab_handoff") + "</button>"
+            + "</div>");
+        parts.push('<div class="det-pane" data-pane="overview">');
         parts.push('<div class="card"><div class="card-h"><span>' + t("det.identity") + '</span></div><div class="card-b"><dl class="kv">');
         // Full title wraps in place, is hoverable (title attr) and carries a copy button.
         parts.push('<div class="k">' + t("common.title") + '</div><div class="v" title="' + escapeHtml(d.title || "") + '">' + (d.title ? escapeHtml(d.title) + ' <button id="title-copy" class="btn sm">' + t("common.copy") + "</button>" : '<span class="faint">' + t("common.none") + "</span>") + "</div>");
         if (d.label && d.label !== d.id) kv(parts, t("common.label"), d.label);
         kv(parts, t("common.protocol"), d.protocol || null, true);
         kv(parts, t("det.client_hint"), d.clientHint || null, true);
+        // #4571: engine lane — in-process (inline) vs standalone proxy process.
+        kv(parts, t("det.engine_lane"), d.engineLane === "inline" ? t("det.engine_lane_inline") : d.engineLane === "server" ? t("det.engine_lane_server") : null, true);
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
         // #2740: session-level notice — auto-mode verdicts here are bili-local, not model judgments.
         if (d.autoModeForge) kv(parts, t("det.auto_mode_forge"), t("det.auto_mode_forge_local") + " · " + d.autoModeForge.count + "×" + (d.autoModeForge.lastVariant || "?") + " · " + timeAgo(d.autoModeForge.lastAt), true);
+if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + (d.keepalive.cadenceMs >= 60_000 ? Math.round(d.keepalive.cadenceMs / 60_000) + "min" : Math.round(d.keepalive.cadenceMs / 1000) + "s") + " · " + t("det.keepalive_pings") + " " + d.keepalive.pingCount + (d.keepalive.lastHitAt ? " · " + t("det.keepalive_last_hit") + " " + timeAgo(new Date(d.keepalive.lastHitAt).toISOString()) : ""), true);
         kv(parts, t("common.upstream"), hostOf(d.upstreamOrigin) || null, true);
         kv(parts, t("det.version"), d.biliVersion || null, true);
         // #2671: absent stamp = no db copy (legacy/blocked/pre-feature) — render
@@ -1793,6 +2642,7 @@ export const WEB_CLIENT = `(function () {
             parts.push('<div class="dim small" style="margin-top:10px">' + t("common.context") + ctxMark + ": " + fmtW(ctxVal) + "</div>");
         }
         if ((d.retrieveCalls || 0) > 0) parts.push('<div class="dim small" style="margin-top:10px">' + t("det.ccr") + ' · <span class="mono">' + t("det.ccr_detail", { calls: d.retrieveCalls, hits: d.retrieveHits || 0, misses: d.retrieveMisses || 0 }) + "</span></div>");
+        if ((d.wholeBlockRestores || 0) > 0 || (d.rangeRestores || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.decompress") + ' · <span class="mono">' + t("det.decompress_detail", { blocks: d.wholeBlockRestores || 0, precise: d.wholeBlockRestoresPreciseAvailable || 0, ranges: d.rangeRestores || 0 }) + "</span></div>");
         if ((d.storedBytes || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.store") + ' · <span class="mono">' + fmtB(d.storedBytes) + ((d.storeBytesSaved || 0) > 0 ? " / " + fmtB(d.storeBytesSaved) + " " + t("common.saved") : "") + "</span></div>");
         parts.push("</div></div>");
         const ledger = d.ledger || {};
@@ -1806,7 +2656,7 @@ export const WEB_CLIENT = `(function () {
             parts.push('<div class="chart-empty">' + t("det.trajectory_empty") + "</div>");
         } else {
             parts.push('<div class="chart-status" id="traj-status" hidden></div>');
-            // #2489: the wrap starts empty — bindTrajectoryBrush() → trajRender() fills it,
+            // #2489: the wrap starts empty — bindTrajectoryBrush() fills it on bind,
             // so every chart state (full and zoomed) comes from the single render path.
             parts.push('<div class="chart-wrap" id="traj-chart"></div>');
             parts.push('<div class="chart-legend">');
@@ -1842,10 +2692,33 @@ export const WEB_CLIENT = `(function () {
             if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
         }
         parts.push("</div></div>");
+        // #3484: hit-rate trend — same data as the trajectory chart above, plotted as
+        // per-request hit % so dips (and their causes) read at a glance.
+        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.hitrate") + '</span><span class="hint">' + t("det.hitrate_sub") + '</span></div><div class="card-b">');
+        if (!lines.length) {
+            parts.push('<div class="chart-empty">' + t("det.hitrate_empty") + "</div>");
+        } else {
+            parts.push('<div class="chart-status" id="hit-status" hidden></div>');
+            parts.push('<div class="chart-wrap" id="hit-chart"></div>');
+            const hrCauses = classifyLineCauses(lines, ledger.folds || []);
+            const present = {};
+            hrCauses.forEach((c) => { if (c !== "new") present[c] = true; });
+            parts.push('<div class="chart-legend">');
+            parts.push(legendItem("background:var(--accent)", t("det.legend_hitline")));
+            ["comp", "cold", "seam", "pt", "ps", "rw", "ci", "rest"].forEach((c) => {
+                if (present[c]) parts.push(legendItem("background:" + CAUSE_COLOR[c], t(CAUSE_KEY[c])));
+            });
+            if ((ledger.folds || []).length > 0) parts.push(legendItem("#cf222e", t("det.legend_fold"), true));
+            if (seamActive && seam.events.length > 0) parts.push(legendItem("#cf222e", t("det.legend_seam")));
+            parts.push("</div>");
+            parts.push('<div class="dim small" style="margin-top:4px">' + t("det.traj_zoom_hint") + "</div>");
+            if ((ledger.linesOmitted || 0) > 0) parts.push('<div class="dim small" style="margin-top:6px">' + t("det.omitted", { n: ledger.linesOmitted }) + "</div>");
+        }
+        parts.push("</div></div>");
         if (seamActive && seam.events.length > 0) {
             const evHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + '</th><th>' + t("det.seam_col_div") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.seam_events_tip")) + '"><b>' + t("det.seam_events", { n: seam.events.length }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + evHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + evHead + "</thead><tbody>");
             seam.events.forEach((ev) => {
                 const cli = ev.client ? ' · <span style="color:#0969da">' + t("det.attr_client") + " @" + ev.client.idx + " (" + ev.client.role + "/" + ev.client.cls + ", " + fmtB(ev.client.len || 0) + ")</span>" : "";
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + fmtB(ev.lcpBytes || 0) + " @ " + t("det.seam_msg", { i: ev.msgIndex != null ? ev.msgIndex : "?", prev: ev.prevMsgs != null ? ev.prevMsgs : "?", cur: ev.curMsgs != null ? ev.curMsgs : "?" }) + cli + "</td></tr>");
@@ -1858,7 +2731,7 @@ export const WEB_CLIENT = `(function () {
         if (keySw && keySw.count > 0 && keySw.events && keySw.events.length > 0) {
             const kHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.key_fp") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.key_events_tip")) + '"><b>' + t("det.key_events", { n: keySw.count }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + kHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + kHead + "</thead><tbody>");
             keySw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
@@ -1870,7 +2743,7 @@ export const WEB_CLIENT = `(function () {
         if (promptSw && promptSw.count > 0 && promptSw.events && promptSw.events.length > 0) {
             const pHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.prompt_fp") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.prompt_events_tip")) + '"><b>' + t("det.prompt_events", { n: promptSw.count }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + pHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + pHead + "</thead><tbody>");
             promptSw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
@@ -1881,7 +2754,7 @@ export const WEB_CLIENT = `(function () {
         if (projSw && projSw.count > 0 && projSw.events && projSw.events.length > 0) {
             const jHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.seam_col_hit") + '</th><th class="num">' + t("det.seam_col_input") + "</th><th>" + t("det.proj_fp") + "</th></tr>";
             parts.push('<details open class="seam-ev"><summary title="' + escapeHtml(t("det.proj_events_tip")) + '"><b>' + t("det.proj_events", { n: projSw.count }) + "</b></summary>"
-                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data"><thead>' + jHead + "</thead><tbody>");
+                + '<div class="fold-scroll" style="max-height:320px;border:none;border-radius:0;padding:2px 8px 8px"><table class="data event-table"><thead>' + jHead + "</thead><tbody>");
             projSw.events.forEach((ev) => {
                 parts.push('<tr><td class="num">' + ev.seq + '</td><td class="num">' + (ev.at ? fmtDT(ev.at) : t("common.none")) + '</td><td class="num">' + (typeof ev.hitPct === "number" ? ev.hitPct.toFixed(1) + "%" : t("common.none")) + '</td><td class="num">' + fmtW(ev.input || 0) + '</td><td class="mono small">' + (ev.from || "?") + " → " + (ev.to || "?") + "</td></tr>");
             });
@@ -1971,35 +2844,14 @@ export const WEB_CLIENT = `(function () {
             // numeric headers align with their columns; long lists just scroll.
             const foldHead = '<tr><th class="num">#</th><th>' + t("det.fold_time") + '</th><th class="num">' + t("det.fold_s") + '</th><th class="num">' + t("det.fold_sigma") + '</th><th class="num">' + t("det.fold_h") + '</th><th class="num">' + t("det.fold_t") + "</th></tr>";
             const foldRow = (f, i) => '<tr><td class="num">' + (f.seq != null ? f.seq : i + 1) + '</td><td class="num">' + (f.at ? fmtDT(f.at) : t("common.none")) + '</td><td class="num">' + fmtW(f.S) + '</td><td class="num">' + fmtW(f.sigma) + '</td><td class="num">' + (f.hPct == null ? t("common.none") : f.hPct.toFixed(1) + "%") + '</td><td class="num">' + fmtW(f.T) + "</td></tr>";
-            parts.push('<div class="fold-scroll"><table class="data"><thead>' + foldHead + '</thead><tbody>');
+            parts.push('<div class="fold-scroll"><table class="data fold-table"><thead>' + foldHead + '</thead><tbody>');
             folds.forEach((f, i) => parts.push(foldRow(f, i)));
             parts.push("</tbody></table></div>");
         }
         parts.push("</div></div>");
-        const blocks = d.blockDetails || [];
         // #2904: no-ceiling output-budget pin — surface at the top of the detail
         // so GUI users see WHY long turns truncate (the /acp twin).
         if (d.outputBudgetDegraded) parts.push('<div class="banner warn show" style="margin-bottom:12px">' + escapeHtml(t("det.obudget_degraded", { model: d.outputBudgetDegraded.model, value: d.outputBudgetDegraded.value })) + "</div>");
-        const activeBlocks = blocks.filter((b) => b.active).length;
-        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.blocks_title") + '</span><span class="hint">' + t("det.blocks_count", { total: blocks.length, active: activeBlocks }) + '</span></div><div class="card-b blocks-list">');
-        if (!blocks.length) {
-            parts.push('<div class="dim small" style="padding:8px 0">' + t("det.blocks_empty") + "</div>");
-        } else {
-            // #1426: copy-all / download blocks-markdown actions
-            parts.push('<div style="display:flex;gap:8px;margin-bottom:10px"><button id="blocks-copy" class="btn sm">' + t("det.blocks_copy_md") + '</button><button id="blocks-dl" class="btn sm">' + t("det.blocks_download") + "</button></div>");
-            blocks.forEach((b, i) => {
-                // #1426: expose the compressed conversation span (mNNNNN refs) when the kernel tagged it
-                const refRange = b.startRef ? (b.endRef && b.endRef !== b.startRef ? b.startRef + "–" + b.endRef : b.startRef) : null;
-                // Active = still inside the current context window; inactive = archived history.
-                const badge = b.active
-                    ? '<span class="badge ok">' + t("det.block_active") + "</span>"
-                    : '<span class="badge disk">' + t("det.block_inactive") + "</span>";
-                // External summary chain wrote the summary — mirrors /acp's "⚡ext" marker.
-                const extBadge = b.external ? '<span class="badge ext">' + t("det.block_external") + "</span>" : "";
-                parts.push('<details class="block-item"><summary><span class="bid">' + escapeHtml(b.blockId) + '</span>' + badge + extBadge + '<span class="topic">' + escapeHtml(blockTopic(b)) + '</span><span class="meta">T' + String(b.tier) + " · " + fmtW(b.compressedTokens) + " · " + timeAgo(b.createdAt) + (refRange ? " · " + escapeHtml(refRange) : "") + '</span><button class="btn sm blk-copy" data-bi="' + i + '" style="margin-left:auto">' + t("common.copy") + '</button></summary><div class="body md">' + renderBlockMd(b.summary || "") + "</div></details>");
-            });
-        }
-        parts.push("</div></div>");
         if (Array.isArray(d.conflicts) && d.conflicts.length > 0) {
             // #2102: per-session evidence rows — the banner aggregates across sessions,
             // so this page is where its detail pointer lands.
@@ -2014,7 +2866,10 @@ export const WEB_CLIENT = `(function () {
             parts.push('<div style="margin-top:10px"><button id="session-conflicts-clear" class="btn sm">' + t("det.conflicts_clear") + "</button></div>");
             parts.push("</div></div>");
         }
-        parts.push('<div class="card" style="margin-top:16px"><div class="card-h"><span>' + t("det.handoff") + '</span><span class="hint">' + t("det.handoff_hint") + '</span></div><div class="card-b">');
+        parts.push("</div>");
+        parts.push('<div class="det-pane" data-pane="blocks" hidden>' + buildTreePane(blocks) + "</div>");
+        parts.push('<div class="det-pane" data-pane="handoff" hidden>');
+        parts.push('<div class="card"><div class="card-h"><span>' + t("det.handoff") + '</span><span class="hint">' + t("det.handoff_hint") + '</span></div><div class="card-b">');
         // #1426: copy / download actions over the rendered handoff document
         parts.push('<div style="display:flex;gap:8px;margin-bottom:12px;flex-wrap:wrap"><button id="handoff-copy-md" class="btn sm">' + t("det.handoff_copy_md") + '</button><button id="handoff-dl" class="btn sm">' + t("det.handoff_download") + "</button></div>");
         if (d.handoffTruncated) parts.push('<div class="banner warn show" style="margin:0 0 10px">' + t("det.handoff_truncated") + "</div>");
@@ -2022,6 +2877,7 @@ export const WEB_CLIENT = `(function () {
         else if (d.handoffHtml) parts.push('<div class="handoff">' + d.handoffHtml + "</div>");
         else parts.push('<div class="dim small">' + t("common.empty") + "</div>");
         parts.push("</div></div>");
+        parts.push("</div>");
         return parts.join("");
     }
     async function loadDetail(id) {
@@ -2040,9 +2896,13 @@ export const WEB_CLIENT = `(function () {
             host.innerHTML = buildDetailHtml(d);
             bindHandoffActions(d);
             bindBlocksActions(d);
+            bindBlockContentActions(d);
+            bindTreeModeActions();
+            bindDetTabs();
             bindCacheReportActions(d);
             bindSessionReportActions(d);
             bindTrajectoryBrush(d);
+            bindHitRateChart(d);
             const cc = $("session-conflicts-clear");
             if (cc) {
                 cc.addEventListener("click", async () => {
@@ -2227,7 +3087,234 @@ export const WEB_CLIENT = `(function () {
             btn.addEventListener("click", (ev) => { ev.preventDefault(); ev.stopPropagation(); copyText(buildBlockMd(b), btn); });
         });
     }
-    function bindCacheReportActions(d) {
+    // #3917: pane switcher for the detail page — the last-used pane survives a
+    // reload so a user who lives on the tree does not re-click every visit.
+    function bindDetTabs() {
+        const tabs = $("det-tabs");
+        if (!tabs) return;
+        const panes = document.querySelectorAll("#session-detail-view .det-pane");
+        const show = (want) => {
+            tabs.querySelectorAll(".det-tab").forEach((b) => b.classList.toggle("active", b.getAttribute("data-pane") === want));
+            panes.forEach((p) => { p.hidden = p.getAttribute("data-pane") !== want; });
+        };
+        tabs.querySelectorAll(".det-tab").forEach((btn) => {
+            btn.addEventListener("click", () => {
+                const want = btn.getAttribute("data-pane") || "overview";
+                show(want);
+                try { sessionStorage.setItem("bili-det-pane", want); } catch (e) {}
+            });
+        });
+        let saved = "overview";
+        try { saved = sessionStorage.getItem("bili-det-pane") || "overview"; } catch (e) {}
+        show(saved === "blocks" || saved === "handoff" ? saved : "overview");
+    }
+    // #3917: lazy raw-content loader per block — the tree ships summary + numbers
+    // only; the conversation bytes behind a block come on demand. "one" is what
+    // decompress(block) hands back, "full" is the whole covered span.
+    // A summary clamp can only be measured once its card has layout —
+    // side panels get checked on selection, classic list rows on first
+    // expand. If the five-line clamp cut nothing, it is removed outright.
+    function fixSumClamp(pn) {
+        const body = pn.querySelector(":scope > .body.md");
+        if (!body || body.__sumChk) return;
+        body.__sumChk = 1;
+        let sum = null, btn = null;
+        for (let i = 0; i < body.children.length; i++) {
+            const c = body.children[i];
+            if (c.classList.contains("blk-sum")) sum = c;
+            if (c.classList.contains("blk-sum-toggle")) btn = c;
+        }
+        if (!sum || !btn) return;
+        if (sum.scrollHeight <= sum.clientHeight + 2) { sum.classList.remove("clamp"); btn.remove(); return; }
+        btn.addEventListener("click", function () {
+            const clamped = sum.classList.toggle("clamp");
+            btn.textContent = clamped ? t("det.tree_sum_more") : t("det.tree_sum_less");
+        });
+    }
+    function bindBlockContentActions(d) {
+        document.querySelectorAll(".blk-content-btn").forEach((btn) => {
+            btn.addEventListener("click", async (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                const bid = btn.getAttribute("data-bid") || "";
+                const view = btn.getAttribute("data-view") === "full" ? "full" : "one";
+                // #4608: classic list rows and the side panels share the
+                // .blk-content class, so resolve the target box inside the
+                // button's own card — getElementById would grab whichever
+                // card happens to come first.
+                const hostEl = btn.closest(".bd-panel") || btn.closest(".block-item");
+                const box = hostEl ? hostEl.querySelector(":scope > .blk-content") : null;
+                if (!box) return;
+                // #4173 review: pressing the same button again collapses the
+                // raw view (it used to be one-way, so users were stuck).
+                if (!box.hidden && box.getAttribute("data-view") === view) { box.hidden = true; return; }
+                if (box.getAttribute("data-state") === "ok" && box.getAttribute("data-view") === view) { box.hidden = false; return; }
+                box.hidden = false;
+                box.setAttribute("data-state", "loading");
+                box.innerHTML = '<div class="empty small"><span class="spin"></span> ' + t("common.loading") + "</div>";
+                busy(btn, true);
+                try {
+                    const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(d.id) + "/block-content?blockId=" + encodeURIComponent(bid) + "&view=" + view);
+                    box.setAttribute("data-state", "ok");
+                    box.setAttribute("data-view", view);
+                    const head = '<div class="blk-content-meta mono small">' + escapeHtml(t("det.tree_orig_meta", { n: r.count, b: fmtB(r.totalBytes) })) + (r.truncated ? ' <span class="warn-text">' + escapeHtml(t("det.tree_orig_truncated", { b: fmtB(r.bytes) })) + "</span>" : "") + "</div>";
+                    box.innerHTML = head + '<pre class="blk-content-pre mono small">' + escapeHtml(r.text) + "</pre>";
+                } catch (e) {
+                    box.setAttribute("data-state", "err");
+                    const msg = String(e && e.message ? e.message : e);
+                    box.innerHTML = '<div class="dim small">' + escapeHtml(msg.indexOf("no-content-snapshot") >= 0 ? t("det.tree_orig_missing") : msg) + "</div>";
+                } finally {
+                    busy(btn, false);
+                }
+            });
+        });
+        // #3917: message leaves — first click fetches that one message's text.
+        document.querySelectorAll(".msg-row").forEach((btn) => {
+            btn.addEventListener("click", async (ev) => {
+                ev.preventDefault();
+                ev.stopPropagation();
+                const row = btn.closest("li");
+                const box = row ? row.querySelector(".msg-body") : null;
+                if (!box) return;
+                if (!box.hidden) { box.hidden = true; return; }
+                if (box.getAttribute("data-state") === "ok") { box.hidden = false; return; }
+                box.hidden = false;
+                box.setAttribute("data-state", "loading");
+                box.innerHTML = '<div class="empty small"><span class="spin"></span> ' + t("common.loading") + "</div>";
+                try {
+                    const ref = btn.getAttribute("data-ref") || "";
+                    const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(d.id) + "/message?ref=" + encodeURIComponent(ref));
+                    box.setAttribute("data-state", "ok");
+                    const meta = '<div class="blk-content-meta mono small">' + (r.toolName ? escapeHtml(r.toolName) + " · " : "") + escapeHtml(fmtB(r.totalBytes)) + (r.truncated ? ' <span class="warn-text">' + escapeHtml(t("det.tree_orig_truncated", { b: fmtB(r.bytes) })) + "</span>" : "") + "</div>";
+                    box.innerHTML = meta + '<pre class="blk-content-pre mono small">' + escapeHtml(r.text) + "</pre>";
+                } catch (e) {
+                    box.setAttribute("data-state", "err");
+                    const msg = String(e && e.message ? e.message : e);
+                    box.innerHTML = '<div class="dim small">' + escapeHtml(msg.indexOf("unknown-message") >= 0 ? t("det.tree_msg_gone") : msg) + "</div>";
+                }
+            });
+        });
+        // #4173 review: classic list rows start collapsed — measure each
+        // row's clamp once on first expand (panels get the same treatment
+        // on selection).
+        document.querySelectorAll("#tree-list .block-node").forEach((row) => {
+            row.addEventListener("toggle", () => { if (row.open) fixSumClamp(row); });
+        });
+    }
+    // #4608: master-detail pane binder — the left frame shows the
+    // collapsible tree (default) or the classic folded-block list; in tree
+    // mode the right side is the selected block's panel. Click selects;
+    // chips (+N/−) expand or collapse a branch; Esc collapses back to the
+    // roots. All hits are point-tested because the poller may have swapped
+    // innerHTML under a pressed finger (same trick as the #4173 live map).
+    let treeViewState = null;
+    let treeViewRender = null;
+    function bindTreeModeActions() {
+        const graphView = $("tree-graph");
+        const listView = $("tree-list");
+        if (!graphView || !listView) return;
+        const blocks = window.__biliDetailBlocks || [];
+        const btns = Array.prototype.slice.call(document.querySelectorAll(".tree-mode"));
+        const expBtn = $("tm-expand-all");
+        const colBtn = $("tm-collapse-all");
+        const gridEl = graphView.closest(".fd-grid");
+        const sideEl = gridEl ? gridEl.querySelector(".fd-side") : null;
+        const hintEl = $("tree-hint");
+        let mode = "tree";
+        try { mode = sessionStorage.getItem("bili-tree-mode") === "list" ? "list" : "tree"; } catch (e) {}
+        const st = { mode: mode, selected: "", expanded: {} };
+        treeViewState = st;
+        function renderTree() {
+            const inner = graphView.querySelector(".tm-inner");
+            if (inner) inner.innerHTML = renderCollapSvg(blocks, st.expanded, st.selected).html;
+        }
+        treeViewRender = renderTree;
+        function select(bid) {
+            st.selected = bid;
+            document.querySelectorAll("#tree-graph [data-bid]").forEach(function (el) {
+                el.classList.toggle("fsel", el.getAttribute("data-bid") === bid);
+            });
+            let found = null;
+            document.querySelectorAll("#bd-panels .bd-panel").forEach(function (pn) {
+                const on = pn.getAttribute("data-bid") === bid;
+                pn.hidden = !on;
+                if (on) found = pn;
+            });
+            const empty = $("bd-empty");
+            if (empty) {
+                empty.style.display = found ? "none" : "";
+                if (!found) empty.textContent = bid ? t("det.block_side_live") : t("det.block_side_hint");
+            }
+            if (found) fixSumClamp(found);
+        }
+        function hitEl(e) {
+            let el = e.target;
+            try { el = document.elementFromPoint(e.clientX, e.clientY) || el; } catch (err) {}
+            return el;
+        }
+        function setMode(m) {
+            st.mode = m;
+            try { sessionStorage.setItem("bili-tree-mode", m); } catch (e) {}
+            graphView.hidden = m !== "tree";
+            listView.hidden = m !== "list";
+            if (expBtn) expBtn.hidden = m !== "tree";
+            if (colBtn) colBtn.hidden = m !== "tree";
+            if (gridEl) gridEl.classList.toggle("list-mode", m === "list");
+            if (sideEl) sideEl.hidden = m !== "tree";
+            if (hintEl) hintEl.textContent = m === "tree" ? t("det.tree_interact") : t("det.tree_list_hint");
+            btns.forEach(function (b) { b.classList.toggle("active", b.getAttribute("data-mode") === m); });
+        }
+        btns.forEach(function (b) {
+            b.addEventListener("click", function (ev) { ev.preventDefault(); setMode(b.getAttribute("data-mode") === "list" ? "list" : "tree"); });
+        });
+        if (expBtn) expBtn.addEventListener("click", function () {
+            blocks.forEach(function (b) { st.expanded[b.blockId] = true; });
+            renderTree();
+        });
+        if (colBtn) colBtn.addEventListener("click", function () { st.expanded = {}; renderTree(); });
+        const pressAt = { on: false, x: 0, y: 0 };
+        function down(e) { if (e.button !== 0) return; pressAt.on = true; pressAt.x = e.clientX; pressAt.y = e.clientY; }
+        function up(e) {
+            if (!pressAt.on) return null;
+            const moved = Math.abs(e.clientX - pressAt.x) > 3 || Math.abs(e.clientY - pressAt.y) > 3;
+            pressAt.on = false;
+            if (moved || e.button !== 0) return null;
+            return hitEl(e);
+        }
+        graphView.addEventListener("pointerdown", down);
+        graphView.addEventListener("pointercancel", function () { pressAt.on = false; });
+        graphView.addEventListener("pointerup", function (e) {
+            const el = up(e);
+            if (!el) return;
+            const chip = el.closest ? el.closest("[data-toggle]") : null;
+            if (chip) {
+                const bid = chip.getAttribute("data-toggle");
+                if (st.expanded[bid]) delete st.expanded[bid]; else st.expanded[bid] = true;
+                renderTree();
+                return;
+            }
+            const n = el.closest ? el.closest("[data-bid]") : null;
+            if (n) select(n.getAttribute("data-bid"));
+        });
+        // One global Esc listener per page life: collapse the tree back to
+        // its roots (only while the tree is the visible reading). The view
+        // and renderer resolve at keypress time, so a re-rendered detail
+        // pane (hash navigation) stays reachable instead of closing over
+        // the first pane's detached nodes.
+        if (!window.__biliTreeEscBound) {
+            window.__biliTreeEscBound = true;
+            window.addEventListener("keydown", function (e) {
+                const gv = $("tree-graph");
+                if (e.key !== "Escape" || !treeViewState || !gv || gv.hidden) return;
+                treeViewState.expanded = {};
+                if (treeViewRender) treeViewRender();
+            });
+        }
+        renderTree();
+        setMode(mode);
+    }
+
+        function bindCacheReportActions(d) {
         const copyB = $("cacherpt-copy");
         const dlB = $("cacherpt-dl");
         if (!copyB || !dlB) return;
@@ -2519,6 +3606,9 @@ export const WEB_CLIENT = `(function () {
             neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
             const m = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
             mitmInp.value = (m && Array.isArray(m.domains)) ? m.domains.filter((x) => typeof x === "string").join(", ") : "";
+            const ds = (draft.dsh && typeof draft.dsh === "object" && !Array.isArray(draft.dsh)) ? draft.dsh : null;
+            dshCtxRow.inp.checked = ds ? ds.contextTab !== false : true;
+            dshLblInp.value = (ds && typeof ds.contextTabLabel === "string") ? ds.contextTabLabel : "";
         }
         function commit(mutate) {
             const fresh = freshDraft();
@@ -2580,6 +3670,25 @@ export const WEB_CLIENT = `(function () {
         imgHint.className = "dim small";
         imgHint.textContent = t("cfg.q_imgrescale_hint");
         imgRow.ctl.appendChild(imgHint);
+        const dshCtxRow = row("quick-dsh-ctxtab", t("cfg.q_dsh_ctxtab"));
+        qCtrls.push(dshCtxRow.inp);
+        dshCtxRow.inp.addEventListener("change", () => commit((d) => {
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (dshCtxRow.inp.checked) delete ds.contextTab; else ds.contextTab = false;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
+        const dshCtxHint = document.createElement("span");
+        dshCtxHint.className = "dim small";
+        dshCtxHint.textContent = t("cfg.q_dsh_ctxtab_hint");
+        dshCtxRow.ctl.appendChild(dshCtxHint);
+        const dshLblInp = textRow("quick-dsh-ctxtab-label", t("cfg.q_dsh_ctxtab_label"));
+        qCtrls.push(dshLblInp);
+        dshLblInp.addEventListener("change", () => commit((d) => {
+            const v = dshLblInp.value.trim();
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (v.length > 0) ds.contextTabLabel = v; else delete ds.contextTabLabel;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
         const abRow = row("quick-absorb", t("cfg.q_absorb"));
         qCtrls.push(abRow.inp);
         abRow.inp.addEventListener("change", () => commit((d) => {
@@ -3033,15 +4142,19 @@ export const WEB_CLIENT = `(function () {
         const hq = qi < 0 ? "" : hash.slice(qi + 1);
         let name = "overview";
         let detailId = null;
-        const top = hbase.match(new RegExp("^#/(overview|config|connect|logs)$"));
+        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs|blog)$"));
         if (top) {
             name = top[1];
             if (name === "logs" && hq) applyLogFilter(hq);
         } else {
             const ses = hash.match(new RegExp("^#/sessions(?:/(.+))?$")) || hash.match(new RegExp("^#/session/(.+)$"));
+            const blg = hash.match(new RegExp("^#/blog/([A-Za-z0-9_-]+)$"));
             if (ses) {
                 name = "sessions";
                 if (ses[1]) detailId = decodeURIComponent(ses[1]);
+            } else if (blg) {
+                name = "blog";
+                detailId = decodeURIComponent(blg[1]);
             }
         }
         PAGES.forEach((p) => {
@@ -3053,11 +4166,13 @@ export const WEB_CLIENT = `(function () {
         if (name === "overview") loadOverview();
         else if (name === "sessions") loadSessions(detailId);
         else if (name === "config") loadConfig();
+        else if (name === "updates") loadUpdates();
+        else if (name === "blog") loadBlog(detailId);
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);
     // #2489: Esc resets a zoomed trajectory view from anywhere on the page.
-    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape" && trajRange) trajSetRange(null); });
+    document.addEventListener("keydown", (ev) => { if (ev.key === "Escape") chartZooms.forEach((z) => { if (z.range) z.setRange(null); }); });
 
     function initStaticHandlers() {
         const tog = $("language-toggle");
@@ -3091,6 +4206,16 @@ export const WEB_CLIENT = `(function () {
         if (prev) prev.addEventListener("click", () => goToSessionPage(sesPage - 1));
         const next = $("ses-next");
         if (next) next.addEventListener("click", () => goToSessionPage(sesPage + 1));
+        // #3719 phase 2: 更新/Updates tab actions — check now / upgrade now /
+        // install selected. One shared in-flight flag (see upSetButtons).
+        const uchk = $("up-check");
+        if (uchk) uchk.addEventListener("click", () => upCheckNow());
+        const unow = $("up-upgrade-now");
+        if (unow) unow.addEventListener("click", () => upUpgradeNow());
+        const usel = $("up-select");
+        const unins = $("up-install");
+        if (usel) usel.addEventListener("change", () => { if (unins) unins.disabled = upBusyAction || !usel.value; focusChangelogRelease(usel.value); });
+        if (unins) unins.addEventListener("click", () => upInstallSelected());
         let logTimer = null;
         const lsearch = $("log-search");
         if (lsearch) lsearch.addEventListener("input", () => { clearTimeout(logTimer); logTimer = setTimeout(loadLogs, 400); });
@@ -3230,8 +4355,44 @@ export const WEB_CLIENT = `(function () {
         });
     }
 
+    // #4173: keep the in-pane tree panorama live while a session detail is open.
+    // Decorative lane: failures keep the last good frame and never touch the
+    // error strip or the #1937 backoff ladder (always resolves true). Re-renders
+    // only when the block population actually changed; the viewer's zoom
+    // (view.__vm) is restored on top of each rebuild.
+    let mapBusy = false;
+    let lastMapSig = "";
+    async function refreshTreeMap() {
+        if (mapBusy) return true;
+        const view = $("tree-graph");
+        if (!view || view.hidden) return true; // list mode: nothing live to repaint
+        const m = location.hash.match(new RegExp("^#/session/(.+)$"));
+        if (!m) return true;
+        mapBusy = true;
+        try {
+            const r = await json(API_ROOT + "/sessions/" + encodeURIComponent(m[1]) + "/tree");
+            if (r && Array.isArray(r.blocks)) {
+                const sig = r.blocks.map(function (b) { return b.blockId + String(b.tier) + (b.active ? "a" : "") + ":" + (b.directBlockIds || []).join(","); }).join("|");
+                if (sig !== lastMapSig) {
+                    lastMapSig = sig;
+                    // #4608: repaint only the tree drawing — expansion and
+                    // selection survive the tick (the list is static DOM).
+                    const inner = view.querySelector(".tm-inner");
+                    const stv = treeViewState || { expanded: {}, selected: "" };
+                    if (inner) inner.innerHTML = renderCollapSvg(r.blocks, stv.expanded, stv.selected).html;
+                }
+            }
+        } catch (e) {
+            /* decorative lane — keep the stale frame */
+        } finally {
+            mapBusy = false;
+        }
+        return true;
+    }
+
     hydrate();
     initStaticHandlers();
+    loadChangelog();
     route();
     // #1937: failures back off exponentially (5s → 10s → … cap 60s) with a
     // persistent error strip instead of silent toast-spam retries, and a slow
@@ -3248,6 +4409,8 @@ export const WEB_CLIENT = `(function () {
             // A paged-down or searched list must not be clobbered by the background refresh.
             if (current === "sessions" && $("session-detail-view").hidden && sesPage === 1 && !hasActiveFilters()) ok = (await refreshSessions(false, 1)) && ok;
             else if (current === "logs") ok = (await loadLogs()) && ok;
+            // #4173: session DETAIL view → keep the in-pane tree panorama live.
+            else if (current === "sessions") ok = (await refreshTreeMap()) && ok;
             if (ok) { pollFailures = 0; nextPollAt = 0; hideDataError(); }
             else {
                 pollFailures += 1;

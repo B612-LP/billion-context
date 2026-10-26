@@ -12,6 +12,7 @@
 // No-cheat rules (#3848): entry functions are the real kernel exports; the
 // property is general (byte-stability), never asserted at bug lines; the
 // counterexample witness must replay on the real code.
+import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
 import { translateFunction } from "../verif/symbolic.ts";
@@ -32,6 +33,8 @@ const mkMsgs = (T: string): { id: string; role: "tool" | "user"; contentType: "t
 ];
 
 test("bug3691: solver finds a clip-triggering witness on the real truncation code", { timeout: 240_000 }, async (t) => {
+  const solver = await (async () => { try { return await solveSmt2("(set-logic ALL)(check-sat)", []); } catch { return null; } })();
+  if (!solver) return t.skip("no SMT solver available (set VERIF_SOLVER_CMD / VERIF_PYTHON)");
   const ctx = newCtx();
   const T = ctx.String.const("T");
   const tok1 = ctx.Real.const("tok1");
@@ -60,7 +63,7 @@ test("bug3691: solver finds a clip-triggering witness on the real truncation cod
     sv.kind === "str" ? { kind: "num" as const, t: ctx.ToReal((sv.t as import("../verif/terms.js").Seq).length()).div(ctx.Real.val(4)).add(ctx.Real.val(1)) } : { kind: "any" as const };
 
   const { exec } = translateFunction({
-    file: new URL("../kernel/src/truncate-tools.ts", import.meta.url).pathname,
+    file: fileURLToPath(new URL("../kernel/src/truncate-tools.ts", import.meta.url)),
     function: "truncateLargeToolOutputs",
     params: { messages: msgs, tokenCount: { kind: "num", t: tok1 }, config, countTokens: { kind: "any" }, options: { kind: "obj", fields: new Map([["includeTextMessages", { kind: "bool", t: ctx.Bool.val(true) }]]) } },
     ctx,

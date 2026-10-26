@@ -43,7 +43,7 @@ function makeIdPort(ctx: Ctx) {
   return (...args: Array<{ kind: string }>): SymStr => {
     const key = args.map((a) => (a.kind === "str" ? String((a as { t?: { c?: string } }).t?.c ?? "?") : a.kind)).join("|");
     let v = memo.get(key);
-    if (!v) { v = { kind: "str", t: strc(ctx, `id${n++}`) } as never; memo.set(key, v); }
+    if (!v) { v = strc(ctx, `id${n++}`); memo.set(key, v); }
     return v;
   };
 }
@@ -56,11 +56,11 @@ function makeCounterPorts(ctx: Ctx) {
   return {
     ClusterCounter: () => marker,
     __method_next: (recv: SymObj, base: SymStr): SymStr => {
-      if (recv !== marker) return { kind: "str", t: strc(ctx, "?") } as never;
+      if (recv !== marker) return strc(ctx, "?");
       const c = (counts.get(marker) ?? 0) + 1;
       counts.set(marker, c);
       const b = String(base?.t?.c ?? "?");
-      return { kind: "str", t: strc(ctx, c === 1 ? b : `${b}_${c - 1}`) } as never;
+      return strc(ctx, c === 1 ? b : `${b}_${c - 1}`);
     },
   };
 }
@@ -101,7 +101,9 @@ function partType(content: SymArr, i: number): Seq<"main"> {
   return t.t;
 }
 
-test("bug3676: solver finds the [file,text]→[text,file] part-order reversal on the real wire codec", { timeout: 240_000 }, async () => {
+test("bug3676: solver finds the [file,text]→[text,file] part-order reversal on the real wire codec", { timeout: 240_000 }, async (t) => {
+  const solver = await (async () => { try { return await solveSmt2("(set-logic ALL)(check-sat)", []); } catch { return null; } })();
+  if (!solver) return t.skip("no SMT solver available (set VERIF_SOLVER_CMD / VERIF_PYTHON)");
   const ctx = newCtx();
   const ports = { ...makeCounterPorts(ctx), deriveCanonicalMessageId: makeIdPort(ctx) };
 

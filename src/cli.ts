@@ -14,6 +14,8 @@
  *   bili export [id] [--full]     export a persisted session as a handoff doc
  *                                  (--jsonl: deterministic JSONL dump #2671)
  *   bili acp-cache diff <dir>     attribute cache breaks from ACP_DUMP_BODY dumps
+ *   bili sessions ls|rm|archive|restore [id]   manage persisted sessions
+ *   bili storage gc [--days N]    run the storage sweep now (--dry-run plans only)
  *   bili test pi                  non-polluting pi smoke test
  *   bili --version
  *   bili --help
@@ -30,6 +32,7 @@ import { configFile as defaultConfigFile } from "./paths.js";
 import { log as loggerLog } from "./logger.js";
 import { createAutoRestartHandler } from "./restart.js";
 import { checkForUpdate, startAutoUpdate } from "./update.js";
+import { registerUpdateActions } from "./server/update-actions.js";
 import { startAdvisoryWatcher, getAdvisoryState, advisoryDeferring, advisoryBlocksVersion, advisoryAwaitingFirstCheck } from "./advisory.js";
 import { startReleaseNotesWatcher } from "./update-notes.js";
 import { resolveProxy } from "./upstream-proxy.js";
@@ -37,6 +40,7 @@ import { runMcpStdio } from "./mcp.js";
 import { PLUGIN_AGENTS, isPluginAgent, pluginInstall, pluginRemove, pluginStatusAll, pluginUpdate, renderPluginList, warnActivePluginSessions, type PluginAgent } from "./plugin-install.js";
 import { runLaunch, runTestPi, isLaunchClient, type ClientName } from "./launcher.js";
 import { exportSession } from "./export.js";
+import { runSessionsCommand, runStorageGcCommand } from "./storage-maintenance.js";
 import { renderJson, renderText, runDiff } from "./acp-cache-diff.js";
 import { fixDshLedgers, renderDoctorReport, renderLedgerFixReport, runDoctor } from "./doctor.js";
 import { VERSION, PACKAGE_NAME, BUILD_COMMIT } from "./version.js";
@@ -47,6 +51,8 @@ Usage:
   bili [start] [options]           start the proxy (default: reads ${defaultConfigFile()})
   bili pi [opts --] [args]         start a proxy + launch pi against it (cert-MITM)
   bili pi-test [opts --] [args]    like bili pi but injects --no-extensions (clean test)
+  bili pi-inline [opts --] [args]  launch pi on the in-process engine — no proxy at all (BILI_PI_INLINE)
+  bili opencode-inline [opts --] [args]  launch opencode on the in-process engine — no proxy at all (BILI_OPENCODE_INLINE)
   bili codex [opts --] [args]      start a proxy + launch codex against it (cert-MITM)
   bili claude [opts --] [args]     start a proxy + launch claude against it (cert-MITM)
   bili omp [opts --] [args]        start a proxy + launch omp against it (cert-MITM)
@@ -74,6 +80,19 @@ Usage:
                                     (--full includes original messages; --output FILE;
                                     --jsonl renders a deterministic JSONL dump from the
                                     unified tables, falling back to the legacy tail)
+  bili sessions ls                  list persisted sessions: id, label, size (decoded
+                                    bytes), last-updated, storage status (active/archived)
+  bili sessions rm <id>             delete one session outright — files + index.db rows,
+                                    shared-content refs released; VACUUMs afterwards
+                                    (--no-vacuum skips the shrink)
+  bili sessions archive <id>        move one session out of index.db into the single
+                                    append-only archive log (rows swept, restorable)
+  bili sessions restore <id>        bring an archived session back into index.db
+  bili storage gc                   run the storage sweep now (#3911): archive sessions
+                                    older than storage.archiveAfterDays (default 365),
+                                    release unreferenced content, shrink index.db
+                                    (--days N overrides the age; --vacuum full|incremental;
+                                    prints the sweep plan first, --dry-run stops there)
   bili acp-cache diff <dir>        offline prefix-diff attribution over ACP_DUMP_BODY
                                    dumps: pairs adjacent requests per session and classifies
                                    each (pure-append / mid-stream-rewrite / prefix-stable-miss);
@@ -115,6 +134,8 @@ Launcher (bili pi / bili codex / bili claude / bili omp / bili opencode / bili h
     bili pi                               # launch pi through the proxy
     bili pi -- print "hi"                 # args after the client are passed through
     bili pi-test                          # pi through the proxy with extensions off (proxy owns compression)
+    bili pi-inline                        # pi with the in-process engine — no proxy, no MITM certs
+    bili opencode-inline                  # opencode with the in-process engine — no proxy, no MITM certs
     bili codex                            # launch codex through the proxy
     bili claude                           # launch claude through the proxy
     bili omp                              # launch omp through the proxy (pi-based; /bili/ rewrite)
@@ -161,7 +182,7 @@ Docs: https://github.com/ranxianglei/billion-context
 `;
 
 type Parsed = {
-    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache";
+    command: "start" | "update" | "doctor" | "help" | "version" | "launch" | "test" | "export" | "plugin-register" | "mcp" | "plugin" | "acp-cache" | "sessions" | "storage";
     client?: ClientName;
     clientArgs: string[];
     mitmDomains: string[];
@@ -178,6 +199,12 @@ type Parsed = {
     acpCacheLog?: string;
     acpCacheNoLog?: boolean;
     acpCacheSession?: string;
+    sessionsSub?: "ls" | "rm" | "archive" | "restore";
+    sessionsTarget?: string;
+    sessionsNoVacuum?: boolean;
+    storageDays?: number;
+    storageVacuum?: "full" | "incremental";
+    storageDryRun?: boolean;
     jsonOutput?: boolean;
     doctorJson?: boolean;
     doctorFix?: boolean;
@@ -202,6 +229,12 @@ export function parseArgs(argv: string[]): Parsed {
     let acpCacheLog: string | undefined;
     let acpCacheNoLog = false;
     let acpCacheSession: string | undefined;
+    let sessionsSub: Parsed["sessionsSub"];
+    let sessionsTarget: string | undefined;
+    let sessionsNoVacuum = false;
+    let storageDays: number | undefined;
+    let storageVacuum: Parsed["storageVacuum"];
+    let storageDryRun = false;
     let jsonOutput = false;
     let doctorJson = false;
     let doctorFix = false;
@@ -275,6 +308,39 @@ export function parseArgs(argv: string[]): Parsed {
             case "--fix":
                 doctorFix = true;
                 break;
+            case "--no-vacuum":
+                sessionsNoVacuum = true;
+                break;
+            case "--dry-run":
+                storageDryRun = true;
+                break;
+            case "--days": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                const n = Number(val);
+                if (!Number.isInteger(n) || n < 0) {
+                    console.error(`bili: --days expects a non-negative integer (got "${val}")`);
+                    process.exit(2);
+                }
+                storageDays = n;
+                break;
+            }
+            case "--vacuum": {
+                const val = argv[++i];
+                if (val === undefined) {
+                    console.error(`bili: ${a} requires a value`);
+                    process.exit(2);
+                }
+                if (val !== "full" && val !== "incremental") {
+                    console.error(`bili: --vacuum expects full or incremental (got "${val}")`);
+                    process.exit(2);
+                }
+                storageVacuum = val as "full" | "incremental";
+                break;
+            }
             case "--no-log":
                 acpCacheNoLog = true;
                 break;
@@ -395,17 +461,37 @@ export function parseArgs(argv: string[]): Parsed {
                 console.error("bili acp-cache diff: dump-dir is required");
                 process.exit(2);
             }
+        } else if (cmd === "sessions") {
+            command = "sessions";
+            const sub = positional[1];
+            if (sub === "ls" || sub === "rm" || sub === "archive" || sub === "restore") {
+                sessionsSub = sub;
+                sessionsTarget = positional[2];
+                if (sub !== "ls" && sessionsTarget === undefined) {
+                    console.error(`bili sessions ${sub}: <id> is required (try "bili sessions ${sub} <session-id>")`);
+                    process.exit(2);
+                }
+            } else {
+                console.error(`bili sessions: unknown action "${sub ?? ""}" (try "bili sessions ls|rm|archive|restore")`);
+                process.exit(2);
+            }
+        } else if (cmd === "storage") {
+            command = "storage";
+            if (positional[1] !== "gc") {
+                console.error(`bili storage: unknown action "${positional[1] ?? ""}" (try "bili storage gc")`);
+                process.exit(2);
+            }
         } else {
             console.error(`bili: unknown command "${cmd}" (try "bili --help")`);
             process.exit(2);
         }
     }
 
-    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson, doctorFix };
+    return { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix };
 }
 
 export async function main(): Promise<void> {
-    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, jsonOutput, doctorJson, doctorFix } = parseArgs(process.argv.slice(2));
+    const { command, client, clientArgs, mitmDomains, overrides, exportSelector, exportOutput, exportFull, exportJsonl, registerConversationId, pluginAction, pluginAgent, pluginWithMcp, acpCacheDir, acpCacheLog, acpCacheNoLog, acpCacheSession, sessionsSub, sessionsTarget, sessionsNoVacuum, storageDays, storageVacuum, storageDryRun, jsonOutput, doctorJson, doctorFix } = parseArgs(process.argv.slice(2));
     if (command === "help") {
         process.stdout.write(HELP);
         return;
@@ -528,6 +614,22 @@ export async function main(): Promise<void> {
         }
         return;
     }
+    if (command === "sessions" || command === "storage") {
+        // Storage maintenance (#3928): standalone, no proxy needed — same
+        // shape as export/doctor. The module owns all store access; failures
+        // carry their own exit codes (1 = operation failed, 2 = usage).
+        try {
+            const r = command === "sessions"
+                ? await runSessionsCommand({ sub: sessionsSub!, target: sessionsTarget, json: jsonOutput, noVacuum: sessionsNoVacuum })
+                : await runStorageGcCommand({ days: storageDays, vacuum: storageVacuum, dryRun: storageDryRun, json: jsonOutput });
+            process.stdout.write(r.text);
+            if (r.code !== 0) process.exit(r.code);
+        } catch (error) {
+            console.error(`bili ${command}: ${error instanceof Error ? error.message : String(error)}`);
+            process.exit(1);
+        }
+        return;
+    }
     if (command === "doctor") {
         // Read-only lane audit (#1235). Same egress/channel wiring as `bili
         // update` so the registry freshness check honors -F and updateTag.
@@ -630,14 +732,16 @@ export async function main(): Promise<void> {
 
     // Start background auto-update after the server is listening so a slow
     // registry check never delays startup or races the listen socket.
-    if (opts.autoUpdate) {
-        // Resolver reads opts fields per call, so web-UI hot-reload of proxy
-        // settings (server.ts mutates opts in place) is picked up live (#609).
-        startAutoUpdate({
+    // Resolver reads opts fields per call, so web-UI hot-reload of proxy
+    // settings (server.ts mutates opts in place) is picked up live (#609).
+    // #3719: one shared options object — the background loop and the web
+    // 更新/Updates tab's manual actions run on identical throttle/lock/
+    // proxy/advisory gates.
+    const updateOpts = {
             packageName: PACKAGE_NAME,
             currentVersion: VERSION,
             autoUpdate: true,
-            resolveProxy: (url) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
+            resolveProxy: (url: string) => resolveProxy(opts.routes, opts.proxy, url, opts.proxyFallback),
             updateTag: opts.updateTag,
             // F2 (review): an advisory whose target cannot be resolved on the
             // registry must not stall the normal self-update loop forever —
@@ -664,8 +768,13 @@ export async function main(): Promise<void> {
                 log: loggerLog,
                 destroyLingeringSockets: restartForceCloseOf(server),
             }),
-        });
+        };
+    // The manual channel is independent of the auto channel: installs whose
+    // auto-update is off still need the panel's 立即检查/升级 buttons to work.
+    if (opts.autoUpdate) {
+        startAutoUpdate(updateOpts);
     }
+    registerUpdateActions(updateOpts);
     // #1481: the advisory watcher runs independently of autoUpdate — its whole
     // point is to reach installs whose auto-update is off.
     if (opts.advisoryCheck) {

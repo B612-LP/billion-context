@@ -1,6 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { createLiveOriginResolver, installNativeFetchIntercept, isModelApiUrl, liveStateSlotEffect, noteRoutedOrigin, observeRoutedOrigin, _resetForTest, _setRespawnCooldownForTest, type NativeInterceptState } from "../src/agent/native-intercept.ts";
 import { makeRecordingFetch, runHotReplace, type RecordedCall } from "./helpers/hot-replace.ts";
 
 test("isModelApiUrl: matches model-API endpoint shapes", () => {
@@ -20,6 +23,23 @@ test("isModelApiUrl: matches Google native wire shapes (#2493)", () => {
     assert.equal(isModelApiUrl("https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent"), true);
     assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1beta/models/gemini-2.5-flash:countTokens"), true);
     assert.equal(isModelApiUrl("https://gw.example.com/api/v1beta/models/my-model@v2:generateContent"), true);
+});
+
+test("isModelApiUrl: matches Google Cloud Code v1internal wire shapes (#4256)", () => {
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent"), true);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:streamGenerateContent?alt=sse"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1internal:generateContent"), true);
+    assert.equal(isModelApiUrl("http://127.0.0.1:8317/v1internal:countTokens"), true);
+});
+
+test("isModelApiUrl: rejects v1internal control-plane endpoints (#3129)", () => {
+    // Only the three model methods route; Antigravity's non-model control-plane
+    // POSTs keep going direct (mirrors isV1InternalControlPlanePath's lookahead).
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchUserInfo"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:loadCodeAssist"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal:"), false);
+    assert.equal(isModelApiUrl("https://daily-cloudcode-pa.googleapis.com/v1internal"), false);
 });
 
 test("isModelApiUrl: rejects non-model URLs, proxy paths, non-HTTP", () => {
@@ -569,13 +589,25 @@ test("install: failed respawn degrades to a direct send and fires onGiveUp", asy
         assert.equal(state.origin, undefined);
         assert.equal(respawns, 1);
         assert.equal(giveUps, 1);
-        // The degrade is permanent for the session: later model requests go
-        // direct without re-entering the respawn path.
+        // #4516: the degrade is NO LONGER permanent — a later model request
+        // re-enters the owner's bootstrap as a cooldown-gated self-heal retry
+        // (one attempt per window until the proxy comes back). Allow an
+        // immediate retry and pin the positive direction of that gate.
+        _setRespawnCooldownForTest(0);
         const res2 = await globalThis.fetch("http://127.0.0.1:8199/v1/messages");
         assert.equal(res2.status, 200);
         assert.equal(calls[2], "http://127.0.0.1:8199/v1/messages");
         assert.deepEqual(dispatches, ["rewrite", "direct", "direct"]);
-        assert.equal(respawns, 1);
+        assert.equal(respawns, 2);
+        assert.equal(giveUps, 1);
+        // Negative direction (#3617): inside the cooldown window the
+        // self-heal must NOT stack another respawn attempt.
+        _setRespawnCooldownForTest(1_000_000);
+        const res3 = await globalThis.fetch("http://127.0.0.1:8199/v1/messages");
+        assert.equal(res3.status, 200);
+        assert.equal(calls[3], "http://127.0.0.1:8199/v1/messages");
+        assert.deepEqual(dispatches, ["rewrite", "direct", "direct", "direct"]);
+        assert.equal(respawns, 2);
         assert.equal(giveUps, 1);
     } finally {
         globalThis.fetch = saved;
@@ -1138,6 +1170,42 @@ test("#1365 noteRoutedOrigin: records origin, sticky per origin, hook fires on t
     noteRoutedOrigin(state, "not a url");
     assert.equal(state.routedOrigin, "http://127.0.0.1:9999", "malformed input ignored");
     assert.equal(seen.length, 2);
+});
+
+// #3923: spawn-mode lanes (no owner hook) used to absorb routed-channel
+// evidence SILENTLY — a `/bili/` URL baked against a foreign origin kept
+// passing through to its baked instance while raw URLs followed state.origin,
+// splitting one conversation across two live instances with zero signal until
+// someone manually diffed [v=…] tags in the shared log. Now: one error line
+// per foreign origin into bili.log. Warn-only — spawn mode has no recovery
+// policy, so it never rebinds; attach lanes are untouched (their owner hook
+// handles rebinds and the fallback only fires when no hook is armed).
+
+test("#3923 noteRoutedOrigin spawn-mode fallback: foreign origin warns once per origin, never rebinds", () => {
+    const saved = process.env.XDG_STATE_HOME;
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3923-routed-"));
+    process.env.XDG_STATE_HOME = root;
+    // XDG_STATE_HOME override replaces the base dir entirely — no .local/state
+    const logFile = path.join(root, "billion-context", "bili.log");
+    try {
+        const state: NativeInterceptState = { origin: "http://127.0.0.1:18802", ready: Promise.resolve("http://127.0.0.1:18802") };
+        noteRoutedOrigin(state, "http://127.0.0.1:18991/bili/https://api.anthropic.com/v1/messages");
+        noteRoutedOrigin(state, "http://127.0.0.1:18991/bili/http://127.0.0.1:8199/v1/chat/completions");
+        assert.equal(state.routedOrigin, "http://127.0.0.1:18991");
+        assert.equal(state.origin, "http://127.0.0.1:18802", "warn-only: spawn mode never rebinds");
+        let lines = fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("(#3923)"));
+        assert.equal(lines.length, 1, "one line per foreign origin, not per request");
+        assert.match(lines[0], /\[error\]/);
+        assert.ok(lines[0].includes("http://127.0.0.1:18991") && lines[0].includes("http://127.0.0.1:18802"), "names both sides");
+
+        const slashState: NativeInterceptState = { origin: "http://127.0.0.1:18993/", ready: Promise.resolve("http://127.0.0.1:18993/") };
+        noteRoutedOrigin(slashState, "http://127.0.0.1:18993/bili/http://127.0.0.1:8199/v1/messages");
+        lines = fs.readFileSync(logFile, "utf8").split("\n").filter((l) => l.includes("(#3923)"));
+        assert.equal(lines.length, 1, "same origin modulo trailing slash is not a mismatch");
+    } finally {
+        if (saved === undefined) delete process.env.XDG_STATE_HOME; else process.env.XDG_STATE_HOME = saved;
+        fs.rmSync(root, { recursive: true, force: true });
+    }
 });
 
 test("#1365 pre-gate proof: first routed request records evidence while toolsReady is still pending", async () => {
