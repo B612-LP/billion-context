@@ -479,7 +479,7 @@ export const WEB_CLIENT = `(function () {
         if (tog) tog.textContent = locale === "zh-CN" ? "English" : "中文";
     }
 
-    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs"];
+    const PAGES = ["overview", "sessions", "config", "updates", "connect", "logs", "blog"];
     let current = "overview";
     let sessionsCache = [];
     // #1682: last overview alert payload — lets a dismiss re-render without refetching.
@@ -629,9 +629,14 @@ export const WEB_CLIENT = `(function () {
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td>' + protoBadge(s.protocol) + '</span></td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td>' + savedTd(s) + '<td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         } else {
             const clientHint = s.clientHint ? String(s.clientHint) : "";
+            // #4571: inline sessions carry a lane chip beside the client hint so
+            // "did this run in-process?" is visible in the list, not just detail.
+            const laneChip = s.engineLane === "inline"
+                ? ' <span class="badge proto" title="' + escapeHtml(t("det.engine_lane_inline")) + '">inline</span>'
+                : s.engineLane === "server" ? ' <span class="badge proto dim" title="' + escapeHtml(t("det.engine_lane_server")) + '">srv</span>' : "";
             const clientCell = clientHint
-                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>"
-                : '<span class="dim">' + t("common.none") + "</span>";
+                ? '<span class="mono small clip w-client" title="' + escapeHtml(clientHint) + '">' + escapeHtml(clientHint) + "</span>" + laneChip
+                : '<span class="dim">' + t("common.none") + "</span>" + laneChip;
             tr.innerHTML = "<td>" + sessionTitleCell(s) + '</td><td class="client-cell">' + clientCell + '</td><td>' + protoBadge(s.protocol) + '</td><td><span class="mono dim small clip w-up">' + escapeHtml(hostOf(s.upstreamOrigin)) + '</td><td class="num">' + (s.requests ? s.requests : t("common.none")) + '</td><td class="num">' + fmtW(s.contextBest ? s.contextBest.tokens : s.contextTokens) + '</td><td class="num">' + (s.inputTokens ? fmtW(s.inputTokens) : '<span class="dim">' + t("common.none") + "</span>") + "</td>" + savedTd(s) + hitTd(s) + switchTd(s) + '<td class="num">' + (s.foldCount || 0) + '</td><td class="num">' + (s.blocks || 0) + '</td><td class="dim">' + timeAgo(s.lastSeen) + "</td>";
         }
         let navTimer = null;
@@ -865,6 +870,64 @@ function changelogCatOf(rawLine) {
         // the snapshot — keep the buttons held down until it settles.
         if (st.checking || st.installing) upSetButtons(true);
     }
+    // #4587: panel-embedded blog & articles — the server renders the bundled
+    // markdown with web/markdown.ts (escaped by construction), so this side only
+    // lays out cards and expands bodies. Language rides the page-level locale;
+    // switching languages reloads the page, so no incremental re-render hook.
+    let blogCache = null;
+    async function loadBlog(sub) {
+        const host = $("bl-list");
+        if (!host) return;
+        let data = blogCache;
+        if (!data) {
+            try {
+                data = blogCache = await json(API_ROOT + "/blog");
+            } catch (e) {
+                host.innerHTML = "";
+                toast(t("toast.failed", { msg: e.message }), "err");
+                return;
+            }
+        }
+        const items = (data && Array.isArray(data.items)) ? data.items : [];
+        const zhOn = locale === "zh-CN";
+        if (sub) {
+            const item = items.find((x) => String(x.id) === String(sub)) || null;
+            if (!item) {
+                host.innerHTML = '<div class="card"><div class="card-b"><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a> " + escapeHtml(t("bl.nf")) + "</div></div>";
+                return;
+            }
+            const kindLabel = item.kind === "post" ? t("bl.kind_post") : t("bl.kind_article");
+            const title = zhOn && item.titleZh ? item.titleZh : (item.title || "");
+            const html = zhOn ? (item.htmlZh || item.html || "") : (item.html || "");
+            host.innerHTML = '<div class="card"><div class="card-b"><span class="mono bl-date">' + escapeHtml(item.date || "\u2014") + '</span><span class="badge">' + escapeHtml(kindLabel) + '</span><a href="#/blog" class="bl-back">' + escapeHtml(t("bl.back")) + "</a></div>"
+                + '<h3 class="bl-h">' + escapeHtml(title) + "</h3>"
+                + '<div class="card-b post-body">' + html + "</div></div>";
+            return;
+        }
+        if (!items.length) {
+            const wrap = document.createElement("div");
+            wrap.className = "card";
+            const box = document.createElement("div");
+            box.className = "card-b";
+            box.textContent = t("bl.empty");
+            wrap.appendChild(box);
+            host.innerHTML = "";
+            host.appendChild(wrap);
+            return;
+        }
+        host.innerHTML = '<div class="card">' + items.map((it) => {
+            const title = zhOn && it.titleZh ? it.titleZh : (it.title || "");
+            const alt = zhOn ? (it.title || "") : (it.titleZh || "");
+            let kindLabel;
+            if (it.kind === "post") kindLabel = t("bl.kind_post");
+            else kindLabel = t("bl.kind_article");
+            return '<a class="bl-row" href="#/blog/' + encodeURIComponent(String(it.id)) + '">'
+                + '<span class="mono bl-date">' + escapeHtml(it.date || "\u2014") + '</span>'
+                + '<span class="badge">' + escapeHtml(kindLabel) + '</span>'
+                + '<span class="bl-title">' + escapeHtml(title) + (alt ? ' <span class="bl-title-alt">' + escapeHtml(alt) + "</span>" : "") + "</span>"
+                + '<span class="bl-arrow">&#8594;</span></a>';
+        }).join("") + "</div>";
+    }
     async function loadUpdates() {
         try {
             const [st, cl] = await Promise.all([json(API_ROOT + "/update/state"), json(API_ROOT + "/changelog")]);
@@ -956,6 +1019,7 @@ function changelogCatOf(rawLine) {
                 pb.appendChild(tr);
             });
             $("sys-version").textContent = d.version ? (d.commit ? d.version + " (" + d.commit + ")" : d.version) : "?";
+            $("sys-lane").textContent = d.origin || t("common.none");
             $("sys-disk-version").textContent = d.diskVersion || t("common.none");
             $("sys-inflight").textContent = String(d.inFlight || 0);
             const bt = d.blindTunnels || {};
@@ -1132,11 +1196,60 @@ function changelogCatOf(rawLine) {
             if (sp && typeof sp.pid === "number") {
                 spb.hidden = false;
                 spb.classList.add("show");
-                spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
+                // #3923/#3959: a known bili instance of a DIFFERENT lane sharing
+                // the machine-global sessions dir is the supported topology —
+                // informational styling, not a corruption alarm.
+                if (sp.benign === true) {
+                    spb.classList.remove("warn");
+                    spb.classList.add("info");
+                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_cross_lane_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_cross_lane", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
+                } else {
+                    spb.classList.remove("info");
+                    spb.classList.add("warn");
+                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process", { pid: String(sp.pid) }));
+                }
             } else {
                 spb.hidden = true;
                 spb.classList.remove("show");
                 spb.innerHTML = "";
+            }
+        }
+        const sbb = $("split-brain-banner");
+        if (sbb) {
+            // #3923/#3959: a REAL contest — session id + title + both sides'
+            // pid/lane, with a dismiss action that clears the surfaced entry.
+            const sb = d.storage && typeof d.storage === "object" ? d.storage.splitBrain : null;
+            if (sb && typeof sb.sessionId === "string" && sb.self && typeof sb.self.pid === "number" && sb.peer && typeof sb.peer.pid === "number") {
+                sbb.hidden = false;
+                sbb.classList.add("show");
+                const laneOf = (x) => (x && typeof x.lane === "string" && x.lane ? x.lane : t("sys.split_brain_lane_undeclared"));
+                sbb.innerHTML = "<strong>" + escapeHtml(t("sys.split_brain_title")) + "</strong> "
+                    + escapeHtml(t("sys.split_brain", {
+                        title: typeof sb.title === "string" && sb.title ? sb.title : sb.sessionId.slice(0, 8),
+                        sid: sb.sessionId.slice(0, 8),
+                        selfPid: String(sb.self.pid),
+                        selfLane: laneOf(sb.self),
+                        peerPid: String(sb.peer.pid),
+                        peerLane: laneOf(sb.peer),
+                    }))
+                    + '<div style="margin-top:8px"><button id="split-brain-ack-btn" class="btn sm">' + escapeHtml(t("sys.split_brain_ack_btn")) + "</button></div>";
+                const ackBtn = $("split-brain-ack-btn");
+                if (ackBtn) ackBtn.addEventListener("click", async () => {
+                    busy(ackBtn, true);
+                    try {
+                        await json(API_ROOT + "/storage/split-brain/ack", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ sessionId: sb.sessionId }) });
+                        toast(t("sys.split_brain_acked"), "ok");
+                        await loadOverview(true);
+                    } catch (e) {
+                        toast(e instanceof Error ? e.message : String(e), "err");
+                    } finally {
+                        busy(ackBtn, false);
+                    }
+                });
+            } else {
+                sbb.hidden = true;
+                sbb.classList.remove("show");
+                sbb.innerHTML = "";
             }
         }
         const pt = $("passthrough-banner");
@@ -1807,7 +1920,7 @@ function changelogCatOf(rawLine) {
     }
     const chartZooms = [];   // live instances — Esc resets any zoomed chart (#2489 behavior)
     function makeChartZoom(cfg) {
-        // cfg: { elId, statusId, resetId, render(lines, folds, seams) -> svg }
+        // cfg: { elId, statusId, resetId, render(lines, folds, seams) -> svg, link?: { members } }
         const z = { range: null, drag: null, state: null, cfg };
         z.visible = function visible() {
             if (!z.state) return null;
@@ -1855,8 +1968,15 @@ function changelogCatOf(rawLine) {
             updateStatus(v);
         };
         z.setRange = function setRange(r) {
-            z.range = r && r[1] > r[0] ? [r[0], r[1]] : null;
+            const nr = r && r[1] > r[0] ? [r[0], r[1]] : null;
+            const same = (nr === null && z.range === null) || (nr !== null && z.range !== null && nr[0] === z.range[0] && nr[1] === z.range[1]);
+            if (same) return;
+            z.range = nr;
             z.render();
+            // #4317: linked charts share ONE brush window — a selection or reset on either
+            // re-renders its peers over the same sample indices. The length guard keeps a
+            // stale peer bound to another session's ledger out of the propagation.
+            if (cfg.link && z.state) cfg.link.members.forEach((m) => { if (m !== z && m.state && m.state.lines.length === z.state.lines.length) m.setRange(nr); });
         };
         function localX(wrap, ev) {
             const r = wrap.getBoundingClientRect ? wrap.getBoundingClientRect() : null;
@@ -1922,11 +2042,15 @@ function changelogCatOf(rawLine) {
             z.render();
         };
         chartZooms.push(z);
+        if (cfg.link) cfg.link.members.push(z);
         return z;
     }
     const trajAux = { win: 0, baseIn: 0 };
-    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
-    const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
+    // #4317: both detail charts plot the SAME request timeline in two projections —
+    // one shared brush window keeps them in lockstep (select on either, both follow).
+    const detailChartLink = { members: [] };
+    const trajZoom = makeChartZoom({ elId: "traj-chart", statusId: "traj-status", resetId: "traj-reset", link: detailChartLink, render: (lines, folds, seams) => trajectorySvg(lines, folds, trajAux.win, trajAux.baseIn, seams) });
+    const hitZoom = makeChartZoom({ elId: "hit-chart", statusId: "hit-status", resetId: "hit-reset", link: detailChartLink, render: (lines, folds, seams) => hitRateSvg(lines, folds, seams) });
     function bindTrajectoryBrush(d) {
         const ledger = d.ledger || {};
         const lines = (ledger.lines || []).filter((l) => Boolean(l));
@@ -1945,6 +2069,7 @@ function changelogCatOf(rawLine) {
     window.bili_hitSvg = hitRateSvg;
     window.bili_causes = classifyLineCauses;
     window.bili_trajZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => trajZoom.visible(), range: () => trajZoom.range };
+    window.bili_hitZoom = { minSamples: TRAJ_MIN_SAMPLES, idxFromX: chartIdxFromX, visible: () => hitZoom.visible(), range: () => hitZoom.range };
     function blockTopic(b) {
         // #1426: untitled blocks fall back to the lead line of their summary
         if (b.topic && String(b.topic).trim()) return String(b.topic).trim();
@@ -2455,6 +2580,8 @@ function changelogCatOf(rawLine) {
         if (d.label && d.label !== d.id) kv(parts, t("common.label"), d.label);
         kv(parts, t("common.protocol"), d.protocol || null, true);
         kv(parts, t("det.client_hint"), d.clientHint || null, true);
+        // #4571: engine lane — in-process (inline) vs standalone proxy process.
+        kv(parts, t("det.engine_lane"), d.engineLane === "inline" ? t("det.engine_lane_inline") : d.engineLane === "server" ? t("det.engine_lane_server") : null, true);
         if (d.selfHeal) kv(parts, t("det.self_heal"), (d.selfHeal.action === "degrade-to-proxy" ? t("det.self_heal_degrade_to_proxy") : t("det.self_heal_suppress_nudge")) + " · " + d.selfHeal.detected + " · " + timeAgo(d.selfHeal.since), true);
         // #2740: session-level notice — auto-mode verdicts here are bili-local, not model judgments.
         if (d.autoModeForge) kv(parts, t("det.auto_mode_forge"), t("det.auto_mode_forge_local") + " · " + d.autoModeForge.count + "×" + (d.autoModeForge.lastVariant || "?") + " · " + timeAgo(d.autoModeForge.lastAt), true);
@@ -2536,6 +2663,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             parts.push('<div class="dim small" style="margin-top:10px">' + t("common.context") + ctxMark + ": " + fmtW(ctxVal) + "</div>");
         }
         if ((d.retrieveCalls || 0) > 0) parts.push('<div class="dim small" style="margin-top:10px">' + t("det.ccr") + ' · <span class="mono">' + t("det.ccr_detail", { calls: d.retrieveCalls, hits: d.retrieveHits || 0, misses: d.retrieveMisses || 0 }) + "</span></div>");
+        if ((d.wholeBlockRestores || 0) > 0 || (d.rangeRestores || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.decompress") + ' · <span class="mono">' + t("det.decompress_detail", { blocks: d.wholeBlockRestores || 0, precise: d.wholeBlockRestoresPreciseAvailable || 0, ranges: d.rangeRestores || 0 }) + "</span></div>");
         if ((d.storedBytes || 0) > 0) parts.push('<div class="dim small" style="margin-top:4px">' + t("det.store") + ' · <span class="mono">' + fmtB(d.storedBytes) + ((d.storeBytesSaved || 0) > 0 ? " / " + fmtB(d.storeBytesSaved) + " " + t("common.saved") : "") + "</span></div>");
         parts.push("</div></div>");
         const ledger = d.ledger || {};
@@ -3471,6 +3599,9 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             neInp.value = nv ? nv.filter((x) => typeof x === "string").join(", ") : "";
             const m = (draft.mitm && typeof draft.mitm === "object" && !Array.isArray(draft.mitm)) ? draft.mitm : null;
             mitmInp.value = (m && Array.isArray(m.domains)) ? m.domains.filter((x) => typeof x === "string").join(", ") : "";
+            const ds = (draft.dsh && typeof draft.dsh === "object" && !Array.isArray(draft.dsh)) ? draft.dsh : null;
+            dshCtxRow.inp.checked = ds ? ds.contextTab !== false : true;
+            dshLblInp.value = (ds && typeof ds.contextTabLabel === "string") ? ds.contextTabLabel : "";
         }
         function commit(mutate) {
             const fresh = freshDraft();
@@ -3532,6 +3663,25 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         imgHint.className = "dim small";
         imgHint.textContent = t("cfg.q_imgrescale_hint");
         imgRow.ctl.appendChild(imgHint);
+        const dshCtxRow = row("quick-dsh-ctxtab", t("cfg.q_dsh_ctxtab"));
+        qCtrls.push(dshCtxRow.inp);
+        dshCtxRow.inp.addEventListener("change", () => commit((d) => {
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (dshCtxRow.inp.checked) delete ds.contextTab; else ds.contextTab = false;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
+        const dshCtxHint = document.createElement("span");
+        dshCtxHint.className = "dim small";
+        dshCtxHint.textContent = t("cfg.q_dsh_ctxtab_hint");
+        dshCtxRow.ctl.appendChild(dshCtxHint);
+        const dshLblInp = textRow("quick-dsh-ctxtab-label", t("cfg.q_dsh_ctxtab_label"));
+        qCtrls.push(dshLblInp);
+        dshLblInp.addEventListener("change", () => commit((d) => {
+            const v = dshLblInp.value.trim();
+            const ds = (d.dsh && typeof d.dsh === "object" && !Array.isArray(d.dsh)) ? d.dsh : {};
+            if (v.length > 0) ds.contextTabLabel = v; else delete ds.contextTabLabel;
+            if (Object.keys(ds).length === 0) delete d.dsh; else d.dsh = ds;
+        }));
         const abRow = row("quick-absorb", t("cfg.q_absorb"));
         qCtrls.push(abRow.inp);
         abRow.inp.addEventListener("change", () => commit((d) => {
@@ -3985,15 +4135,19 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         const hq = qi < 0 ? "" : hash.slice(qi + 1);
         let name = "overview";
         let detailId = null;
-        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs)$"));
+        const top = hbase.match(new RegExp("^#/(overview|config|updates|connect|logs|blog)$"));
         if (top) {
             name = top[1];
             if (name === "logs" && hq) applyLogFilter(hq);
         } else {
             const ses = hash.match(new RegExp("^#/sessions(?:/(.+))?$")) || hash.match(new RegExp("^#/session/(.+)$"));
+            const blg = hash.match(new RegExp("^#/blog/([A-Za-z0-9_-]+)$"));
             if (ses) {
                 name = "sessions";
                 if (ses[1]) detailId = decodeURIComponent(ses[1]);
+            } else if (blg) {
+                name = "blog";
+                detailId = decodeURIComponent(blg[1]);
             }
         }
         PAGES.forEach((p) => {
@@ -4006,6 +4160,7 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
         else if (name === "sessions") loadSessions(detailId);
         else if (name === "config") loadConfig();
         else if (name === "updates") loadUpdates();
+        else if (name === "blog") loadBlog(detailId);
         else if (name === "logs") loadLogs();
     }
     window.addEventListener("hashchange", route);
