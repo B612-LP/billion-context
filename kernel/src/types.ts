@@ -30,11 +30,28 @@ export interface CoreMessage {
    *  inactive/unknown block folds normally. Reserved-prefix ids
    *  (`acp_summary_*`) stay kernel-internal and never need this marker. */
   summaryOfBlockId?: string;
+  /** #4316 layer 3 — server-ledger numbering. Set by store-served views
+   *  (snapshot-render prefix rows, incremental canonical rows): the unified
+   *  transcript's (session, seq) for this message, assigned once at ingest
+   *  and never re-minted. When present, assignRefs issues the ref as the
+   *  direct display of this number, so client-side byte churn (model-switch
+   *  re-stamps, image re-encodes) cannot renumber the model's citations.
+   *  Callers must guarantee per-session uniqueness; a collision falls back
+   *  to the counter path for the loser. Not serialized into wire payloads —
+   *  it rides CoreMessage sidecars and the persisted store rows verbatim. */
+  ledgerSeq?: number;
 }
 
 export type CompressionTier = 1 | 2 | 3;
 
 export type BlockGeneration = "young" | "old";
+
+/** One #3939 ③ emergency-truncation latch entry: the post-clip text of a
+ *  message (keyed by its padded ref). See CompressionState.emergencyTruncateLatch. */
+export interface EmergencyTruncateLatchEntry {
+  ref: string;
+  text: string;
+}
 
 export interface CompressionBlock {
   blockId: string;
@@ -68,6 +85,16 @@ export interface CompressionBlock {
   compressCallId?: string;
   startRef?: string;
   endRef?: string;
+  /** #4316 layer 3: the block's coverage as a unified-ledger seq interval
+   *  [startSeq, endSeq] (inclusive, 1-based display space — same space as
+   *  CoreMessage.ledgerSeq). Recorded ONLY when the fold can prove the claim
+   *  exact: every direct folded message carried a ledgerSeq stamp, every
+   *  consumed block carried its own bounds, and the union of those segments
+   *  is one contiguous span (a hole means min/max would swallow uncovered
+   *  messages, so no bounds are recorded — the id path stays authoritative).
+   *  Undefined = unstamped traffic or provably-loose coverage; never guessed. */
+  startSeq?: number;
+  endSeq?: number;
 }
 
 /** A compression block's current ref span, pre-resolved for display. */
@@ -101,16 +128,16 @@ export interface CompressionStats {
   compressionCount: number;
   /** Cumulative tokens reclaimed by absorb (instant tool-result hiding). Optional for pre-absorb persisted states. */
   absorbedTokens?: number;
-  /** Cumulative images downscaled at arrival (image pre-compression, #353). Optional for pre-feature persisted states. */
-  imagesShrunk?: number;
-  /** Cumulative decoded-byte savings from image downsampling. */
-  imageBytesSaved?: number;
-  /** Cumulative estimated-token savings from image downsampling. */
-  imageTokensSaved?: number;
   /** Cumulative messages stored in the CCR content store. Optional for pre-CCR persisted states. */
   storedCount?: number;
   /** Cumulative successful acp_retrieve calls. Optional for pre-CCR persisted states. */
   retrievalCount?: number;
+}
+
+/** View-latch entry shape (#3939 ⑤) — see CompressionState.viewLatches. */
+export interface ViewLatchEntry {
+  text: string | null;
+  hidden?: boolean;
 }
 
 /** One instant tool-result absorption: the original tool-call + tool-result
@@ -136,6 +163,8 @@ export interface AbsorbConfig {
   contextThresholdPct: number;
   /** Tool-name patterns (glob suffix allowed) never absorbable, independent of protectedTools. */
   excludeTools: string[];
+  /** #3402: when true, only image-bearing tool results are candidates, and they bypass minToolTokens. */
+  mediaOnly?: boolean;
 }
 
 /** Emitted when the session's irreducible floor (system prompt + block
@@ -193,41 +222,6 @@ export interface CrushConfig {
   strategies?: Record<string, CrushStrategyOverride>;
 }
 
-export type ImageFormat = "webp" | "jpeg" | "png";
-
-/** How upstream bills this image's payload: pixel-tile model (Anthropic / OpenAI high-detail) or raw byte counting (some relays). */
-export type ImageBillingMode = "pixels" | "bytes";
-
-/** Image pre-compression routing/downsample + image_full restore (#353). Hosts perform the three-level (global → provider → model) sub-field merge exactly like absorb. Default off: disabled ⇒ byte-identical pass-through. */
-export interface ImageCompressionConfig {
-  enabled: boolean;
-  /** Only route images whose token estimate >= this. Default 512. */
-  minTokens?: number;
-  /** Longest side (px) of the downsample recipe. Default 1280. */
-  maxDimension?: number;
-  /** Lossy encode quality (1-100) of the downsample recipe. Default 80. */
-  quality?: number;
-  /** Encode format of the downsample recipe. Default "webp". */
-  format?: ImageFormat;
-}
-
-/** One arrival-time image downsample, reported by the host after executing the kernel's recipe. Drives image_full validation and session stats. */
-export interface ImageShrinkRecord {
-  ref: string;
-  rawMessageId: string;
-  mediaType: string;
-  format: ImageFormat;
-  /** Decoded byte length of the original payload. */
-  originalBytes: number;
-  /** Decoded byte length after encoding. */
-  shrunkBytes: number;
-  /** Kernel token estimate of the original payload. */
-  tokensBefore: number;
-  /** Kernel token estimate of the shrunk payload. */
-  tokensAfter: number;
-  createdAt: number;
-}
-
 export interface CcrConfig {
   enabled: boolean;
   /** Model-facing retrieve tool name (adapters may rename, e.g. acp_retrieve). */
@@ -271,10 +265,6 @@ export interface CompressionState {
    *  issued id is never re-issued with different content. Optional: defaults
    *  to 1 when absent on older persisted states. */
   nextRuleId?: number;
-  /** image_full sticky-restore: refs whose images were restored to full resolution for the rest of the session. MUST be cleared on compaction reset (resetImageFullState) — refs are re-issued after state reset, so stale entries would misattribute. Optional: pre-feature persisted states lack it. */
-  imageFullRestored?: string[];
-  /** Arrival-time downsample records (#353). Optional: pre-feature persisted states lack it. */
-  imageShrinks?: ImageShrinkRecord[];
   /** Padded refs (mNNNNN) of HIDDEN orphan compress call/result messages — the
    *  orphans beyond the keep-last-N window that hide-consumed removed from the
    *  visible view this turn. Written every processTurn by the hide-compress-calls
@@ -284,6 +274,77 @@ export interface CompressionState {
    *  this set and keeps the clear "cannot be anchored" error. Optional for
    *  pre-feature persisted states. */
   hiddenOrphanRefs?: string[];
+  /** Persistent, MONOTONIC set of orphan compress-call ids permanently swept
+   *  (#3769). An orphan (a failed compress call/result with no matching block)
+   *  is only removed from the visible view when a REAL fold gives a cache-safe
+   *  place to do it: the hide node sweeps orphans at/after the fold's earliest
+   *  start ref onto this set, and they stay hidden forever — across the next
+   *  turn, repeated processTurn calls, restarts and upgrades. Monotonic (never
+   *  shrinks) so a previously-hidden record can never reappear once the client
+   *  resends full history. Replaces the old keep-last-two rotation, which hid
+   *  the oldest failure on EVERY quiet turn and moved the cached prefix
+   *  breakpoint forward for no new fold. Optional: pre-feature persisted states
+   *  lack it (nothing was permanently hidden under the old per-pass rule). */
+  sweptOrphanCallIds?: string[];
+  /** Numeric part (mNNNNN -> NNNNN) of the EARLIEST start ref of the most
+   *  recent fold that has not yet been consumed by an orphan sweep (#3769).
+   *  Written by applyCompression when it creates >=1 block (min over the newly
+   *  created blocks' startRef); consumed + cleared by the hide-compress-calls
+   *  node on the next processTurn, which then sweeps orphans with ref >= this
+   *  value (orphans before it sit in the still-cached prefix and stay visible).
+   *  Carries the position so the sweep is cache-neutral: it only removes records
+   *  the fold already invalidated. Optional: absent until the first post-fix fold. */
+  pendingOrphanSweepMinRef?: number;
+  /** Emergency-truncation latch (#3939 ③/#3691): the clipped texts (post-clip
+   *  bytes, keyed by padded ref) of messages clipped by the emergency-truncate
+   *  node. The watermark decision is made ONCE — replaying these clips on every
+   *  later turn keeps the outbound bytes stable when the token estimate
+   *  fluctuates across the threshold (the #3691 full↔clipped oscillation was a
+   *  mid-history rewrite on every request). Entries retire when their message
+   * leaves the resent view (folded/edited-away) and the whole latch resets on
+   *  the next successful fold (applyCompression) — after a fold the watermark
+   *  re-evaluates from scratch. Optional: pre-feature states have none (the
+   *  pre-latch node clipped from scratch each turn). */
+  /** #3939 ③: emergency truncation latch entries (see above). Optional:
+     pre-existing persisted states lack it. */
+  emergencyTruncateLatch?: EmergencyTruncateLatchEntry[];
+  /** #4316 layer 3 PR3/3: refs have been aligned onto the unified ledger
+     (ref = store row seq + 1) exactly once. Set by restampRefsToLedger;
+     assignRefs' stamp path keeps new arrivals aligned from then on. */
+  refLedgerAligned?: boolean;
+  /** Ref-migration render deferral (#3939 ②/#3805): padded refs minted by the
+   *  BLOCKED→numeric migration (assignRefs, #2607). The number exists (citable
+   *  via decompress({ imageRef }) bookkeeping) but the carrier message keeps
+   *  its pre-migration, UNTAGGED bytes until the next successful fold —
+   *  stamping the <acp> tag on the migration turn would rewrite an old
+   *  message mid-history on an otherwise quiet turn (a prefix-cache breaker:
+   *  #3805 durable carriers flipping bytes with no fold in sight). Cleared by
+   *  applyCompression on fold success; entries are inert once their message
+   *  leaves the view (ids are never re-issued). Optional: absent until the
+   *  first migration. */
+  renderDeferredRefs?: string[];
+  /** Fold-gated view latch (#3939 ⑤): post-transform view bytes per padded
+   *  ref, replayed VERBATIM on quiet turns. The opt-in mid-history rewriters
+   *  (absorb-hide, crush, filter keepLastOnly) re-derive their output every
+   *  pass from state/context (absorb records growing, crush responding to
+   *  token pressure, keep-last-only demotions as new occurrences arrive) —
+   *  without a latch each change flips OLD message bytes on an otherwise
+   *  quiet turn (the #3805 prefix-cache breaker class). Structural, not
+   *  per-feature: every transform output is latched at first application and
+   *  replays until the next successful fold (applyCompression resets the
+   *  whole map — the refresh rides the fold's own history rewrite); new or
+   *  edited messages (new ref) latch fresh at their arrival boundary. ccr
+   *  needs no latch (replace-once-at-arrival, byte-stable by design #1460).
+   *  Entry: text=null = passthrough (source bytes stand); text=string =
+   *  transformed bytes; hidden=true = dropped from the view. Optional:
+   *  absent until the first latched transform. */
+  viewLatches?: Record<string, ViewLatchEntry>;
+  /** #3939 ⑤: digest of the transform-relevant config slices (absorb/crush/
+   *  message-filters). A config edit is a user action boundary — matching
+   *  ①'s fold/refold/user-action rule, the latch releases when the digest
+   *  changes so enabling a transform applies on the next turn (one rewrite
+   *  riding the config change), never on a quiet turn. */
+  viewLatchConfigDigest?: string;
   /** Padded refs (mNNNNN) proven UNREACHABLE (#2362): known in messageRefs but
    *  backing no visible or folded message — the client rewrote or dropped those
    *  messages (an edit reissues a new ref; a host-native compaction or bulk
@@ -388,6 +449,15 @@ export interface Config {
   compress: CompressValidationConfig;
   protectedTools: string[];
   isToolProtected?: (toolName: string, toolInputText?: string) => boolean;
+  /** Host-declared set of tool NAMES that count as a `compress` call for the
+   *  consumed-call lifecycle pass (hideConsumedCompressCalls). The kernel
+   *  hardcodes only the canonical bare name ("compress"); hosts that expose
+   *  compression under a dialect name (e.g. MCP's "mcp__bili__compress")
+   *  inject a predicate recognizing both so those calls get the SAME inactive
+   *  cleanup + live-range arg reduction as the bare form instead of bypassing
+   *  it (billion-context#2970). Unset = bare-name only (byte-identical to
+   *  before). Must be pure and cheap: runs once per message per pass. */
+  isCompressTool?: (toolName: string) => boolean;
   /** Host-declared message-level hard protection (billion-context#2419):
    *  when set, ANY message for which the predicate returns true is excluded
    *  from compression exactly like a protectedTools hit — BLOCKED ref in
@@ -450,8 +520,6 @@ export interface Config {
   rules?: RulesConfig;
   /** Deterministic tool-result compression, tier 1 of the absorb gate (see crush.ts). Requires absorb enabled. */
   crush?: CrushConfig;
-  /** Image pre-compression routing/downsample + image_full restore (see image-compress.ts). Absent/disabled = feature off. */
-  imageCompression?: ImageCompressionConfig;
   /** Lossless content-cached retrieval for oversized tool results (see ccr.ts). Absent/disabled = feature off. */
   ccr?: CcrConfig;
   messageFilters?: import("./filter/types.js").MessageFiltersConfig;
@@ -505,6 +573,11 @@ export interface CompressibleRange {
   startIndex?: number;
   /** Messages-array index of this range's last message. */
   endIndex?: number;
+  /** #3192/#3205: buildCompressibleRanges sets this when the range opens right
+   *  after a dead-ref hole. A dropped message leaves NO array slot, so the hole
+   *  has no index gap and the index check alone would let mergeRangesToThreshold
+   *  bridge back into one doomed span bracketing the dead ref. */
+  noMergeBefore?: boolean;
 }
 
 export interface ProtectedRange {
@@ -517,6 +590,10 @@ export interface ProtectedRange {
   startIndex?: number;
   /** Messages-array index of last message. */
   endIndex?: number;
+  /** #3192/#3205: see CompressibleRange.noMergeBefore — set when this protected
+   *  range opens right after a dead-ref hole, so formatRanges does not bridge a
+   *  preceding compressible range across the hole into one doomed span. */
+  noMergeBefore?: boolean;
 }
 
 export interface ContextRanges {

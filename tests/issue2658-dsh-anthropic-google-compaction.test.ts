@@ -2,7 +2,7 @@
 // (#2432) and responses (#2451) lanes — yet the server-side REFUSAL gate has
 // had an anthropic branch all along (dshCompactionRefusal("anthropic")), so
 // any checkpoint that LANDS on the anthropic wire (direct-bypass without ALS
-// attribution, allowDshCompaction, future gate mismatch) left the ACP state
+// attribution, future gate mismatch) left the ACP state
 // permanently unrebased: cannot-be-anchored death spiral + persistent
 // prefix-cache loss (#2596 main complaint). prepare-anthropic.ts now runs the
 // same dual-signal detector (dsh-bound session + checkpoint framing in resent
@@ -124,8 +124,10 @@ async function startAnthropicRig(): Promise<Rig> {
         bodies,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };
@@ -159,8 +161,10 @@ async function startGoogleRig(): Promise<Rig> {
         bodies,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };

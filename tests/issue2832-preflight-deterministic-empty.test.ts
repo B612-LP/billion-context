@@ -7,7 +7,6 @@ process.env.NODE_ENV = "test";
 process.env.BILI_REPLAY_RETRY_MAX = "1";
 // Zero backoff so any retry legs run instantly.
 process.env.BILI_REPLAY_RETRY_BASE_MS = "0";
-process.env.BILI_PREFLIGHT_DEAD_END_COOLDOWN_MS = "400";
 
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -269,7 +268,7 @@ test("#2832 systemic deterministic empties: bounded strikes, sticky verdict, one
         assert.equal(st!.dead, true, "verdict armed");
         assert.ok(st!.key.includes("muse-spark-1.3-contributor"), "verdict key carries the model");
 
-        // Past the dead-end cooldown: the NEXT turn spends EXACTLY ONE canary
+        // Next turn (no cooldown anymore, #4079): a carried verdict spends EXACTLY ONE canary
         // probe (old behavior re-burned the full retry budget per span).
         await sleep(500);
         const r2 = await driveChat(proxyPort, upstreamPort, "s2832-dead", "muse-spark-1.3-contributor", input);
@@ -282,7 +281,9 @@ test("#2832 systemic deterministic empties: bounded strikes, sticky verdict, one
         assert.equal(probeStateOf("s2832-dead")?.dead, true, "a failed canary keeps the verdict armed");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });
@@ -315,7 +316,9 @@ test("#2832 self-healed relay: the canary clears the verdict and folding resumes
         assert.ok(okSummaries >= 1, "at least the canary summary succeeded");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         upstream.close();
+        upstream.closeIdleConnections?.();
         await new Promise<void>((resolve, reject) => {
             void Promise.allSettled([once(proxy, "close"), once(upstream, "close")]).then(() => resolve(), reject);
         });

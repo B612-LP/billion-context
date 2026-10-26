@@ -104,8 +104,10 @@ async function startRig(compress: { injectTool: boolean; injectNudge?: boolean }
         bodies,
         close: async () => {
             proxy.close();
+            proxy.closeIdleConnections?.();
             await once(proxy, "close");
             upstream.close();
+            upstream.closeIdleConnections?.();
             await once(upstream, "close");
         },
     };
@@ -174,9 +176,10 @@ test("unit: carriesDshLocalCompactionSummary matches framing only on a user/text
     // skipped, so these exercise the carrier gate alone.)
     assert.equal(carriesDshLocalCompactionSummary([]), false, "empty history");
     assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: "plain prose" }]), false);
-    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: `intro\n\n${DSH_CHECKPOINT_OPEN_TAG}\n## section` }]), true, "open tag mid-message");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: `${DSH_CHECKPOINT_OPEN_TAG}\n## section` }]), true, "open tag at message start (preamble-dropped drift)");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: `intro\n\n${DSH_CHECKPOINT_OPEN_TAG}\n## section` }]), false, "#4438: framing embedded MID-message is a quote, not a landing");
     assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: DSH_CHECKPOINT_PREAMBLE_PREFIX + " of the conversation…" }]), true, "preamble at message start");
-    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", content: `see ${DSH_CHECKPOINT_OPEN_TAG} below` }]), true, "raw wire content fallback (user text)");
+    assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", content: `see ${DSH_CHECKPOINT_OPEN_TAG} below` }]), false, "#4438: mid-text quote via raw wire content is not a landing");
     assert.equal(carriesDshLocalCompactionSummary([{ role: "user", contentType: "text", text: "compacted summary mentioned without tags" }]), false, "the WORD 'compacted' alone is not framing");
 });
 
@@ -426,8 +429,11 @@ test("#2432: per-turn nudge injection goes quiet while the compress breaker is a
     // third request sees the big report against the small baseline.
     const small = Array.from({ length: 8 }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: `warm-${i}-` + "z".repeat(1000) }));
     const grown = [...small, ...Array.from({ length: 48 }, (_, i) => ({ role: i % 2 === 0 ? "user" : "assistant", content: `grow-${i}-` + "z".repeat(1000) }))];
+    // #3177: DSH's ACP tools are host-scope (the preset agent can't reach them), so bili no
+    // longer nudges DSH at all — the breaker has nothing to silence there. Exercise it on a
+    // tool-visible plugin lane (omp) so the #2432 breaker-quenches-nudge coverage stays live.
     const post = (conv: string, messages: { role: string; content: string }[]) =>
-        fetch(chatUrl(rig), { method: "POST", headers: dshHeaders(conv), body: JSON.stringify({ model: MODEL, messages }) });
+        fetch(chatUrl(rig), { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "omp", "x-bili-plugin-conversation": conv }, body: JSON.stringify({ model: MODEL, messages }) });
     try {
         // Control: healthy session through the growth shape → nudge on turn 3.
         for (const [i, m] of [small, grown, grown].entries()) {

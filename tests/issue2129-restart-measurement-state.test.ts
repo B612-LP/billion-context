@@ -7,6 +7,9 @@ import { mkdtempSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 process.env.NODE_ENV = "test";
+// #4004/#4242: envelope-corruption rejection is the legacy-layer guard; pin
+// it so the unified index cannot mask the tampered envelope.
+process.env.BILI_STORAGE_UNIFIED = "legacy";
 
 import { createInitialState, defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
@@ -348,8 +351,10 @@ test("e2e: restart restores k̂ + usage anchor — the over-raw resend forwards 
         assert.equal(calls.filter((c) => c.stream).length, 4, "all four requests were forwarded as-is");
     } finally {
         proxy.close();
+        proxy.closeIdleConnections?.();
         await once(proxy, "close");
         upstream.close();
+        upstream.closeIdleConnections?.();
         await once(upstream, "close");
         store.cancelAll();
         store2?.cancelAll();

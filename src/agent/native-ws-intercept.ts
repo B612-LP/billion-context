@@ -41,7 +41,7 @@
 // matching the fetch lane's give-up semantics. Explicit `sse` remains the
 // documented escape hatch either way.
 
-import { noteRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
+import { ACTIVE_STATE, ACTIVE_STATE_SEQ, bindLiveStateSlot, noteRoutedOrigin, readyOrigin, type NativeInterceptState } from "./native-intercept.js";
 import { logHostEvent } from "./host-log.js";
 
 // @types/node exposes Event/EventTarget globally but keeps the web-platform
@@ -108,6 +108,25 @@ export function codexResponsesWsTarget(url: string | URL): string | undefined {
     if (segments[0] === "bili") return undefined;
     if (!/(^|\/)responses\/?$/.test(parsed.pathname)) return undefined;
     return httpUrl;
+}
+
+/** Bound a pending inline wsOrigin like readyOrigin bounds a bootstrap: a
+ *  wedged bridge boot settles undefined (→ DIRECT degrade) instead of
+ *  pinning a DeferredWebSocket in CONNECTING forever. */
+function raceWsOriginBound(pending: Promise<string | undefined>): Promise<string | undefined> {
+    return new Promise(resolve => {
+        const timer = setTimeout(() => resolve(undefined), 20_000);
+        pending.then(
+            value => {
+                clearTimeout(timer);
+                resolve(value);
+            },
+            () => {
+                clearTimeout(timer);
+                resolve(undefined);
+            },
+        );
+    });
 }
 
 /** `<origin>` + `/bili/` + the normalized http(s) upstream — the proxy-connect
@@ -327,9 +346,25 @@ let ourGet: (() => unknown) | undefined;
  *  lifecycle-bound to the same guard as installNativeFetchIntercept: off mode
  *  patches nothing. Third-party replacements are ADOPTED as the downstream
  *  constructor (authority is kept, like the fetch lane) instead of silently
- *  evicting routing; non-constructor values are refused with a warning. */
-export function installNativeWebSocketIntercept(state: NativeInterceptState): boolean {
-    if (nativeWebSocketInterceptInstalled()) return false;
+ *  evicting routing; non-constructor values are refused with a warning. Every
+ *  activation rebinds the SHARED live-state slot (#3558), so the wrapper's
+ *  per-connection read follows the newest applied module instance across a hot
+ *  reimport — mirroring the fetch lane exactly. */
+export function installNativeWebSocketIntercept(initialState: NativeInterceptState): boolean {
+    // #3558: rebind the shared live-state slot on EVERY activation (the same
+    // slot the fetch chain reads), then resolve it per connection below — so a
+    // hot-reimport that swaps in a fresh state takes over WS routing without a
+    // restart, instead of the once-per-process wrapper staying closed over the
+    // first instance's dead state.
+    const hadChain = nativeWebSocketInterceptInstalled();
+    const firstBind = bindLiveStateSlot(initialState);
+    if (hadChain) {
+        // A wrapper from an EARLIER build already wraps globalThis.WebSocket and
+        // cannot be rewritten to read this slot — until the host restarts, Codex
+        // Responses traffic routes through that old closure. Say so once.
+        if (firstBind) logHostEvent("warn", "[native-client]", "native WebSocket chain predates live-state routing; restart the host once for Codex Responses traffic to follow this plugin instance (#3558)");
+        return false;
+    }
     const initial = (globalThis as GlobalRecord).WebSocket;
     if (typeof initial !== "function") return false;
 
@@ -368,7 +403,12 @@ export function installNativeWebSocketIntercept(state: NativeInterceptState): bo
         function routed(this: unknown, url: string | URL, ...rest: unknown[]): unknown {
             const urlStr = typeof url === "string" ? url : url instanceof URL ? url.href : String(url);
             const target = codexResponsesWsTarget(urlStr);
-            if (target === undefined) return new RoutedWebSocket(url, ...rest);
+            // #3558: resolve the ACTIVE state per connection (mirrors the fetch
+            // lane's per-request read, #3394) instead of the install-time closure —
+            // a hot-reimport swapped in a fresh instance. Empty slot = no active
+            // plugin → pass through direct, never hit a disposed context.
+            const state = (globalThis as GlobalRecord)[ACTIVE_STATE] as NativeInterceptState | undefined;
+            if (target === undefined || state === undefined) return new RoutedWebSocket(url, ...rest);
             if (state.takeoverGate !== undefined && state.takeoverGate(target) === false) {
                 state.onDispatch?.(target, "refused");
                 return new RoutedWebSocket(url, ...rest);
@@ -382,15 +422,21 @@ export function installNativeWebSocketIntercept(state: NativeInterceptState): bo
                 state.onDispatch?.(rewritten, "rewrite");
                 return new RoutedWebSocket(rewritten, ...rest);
             };
-            const origin = state.origin;
-            if (origin !== undefined) return rewrite(origin);
+            const origin = state.wsOrigin ?? state.origin;
+            if (typeof origin === "string") return rewrite(origin);
             // Origin still settling → defer the real connection (bounded by
-            // readyOrigin's timeout, same hold the fetch lane applies).
+            // readyOrigin's timeout, same hold the fetch lane applies). A
+            // pending wsOrigin (inline bridge booting) rides the same shell:
+            // settle undefined → DIRECT degrade below.
             return new DeferredWebSocket(
                 urlStr,
                 rest,
                 async () => {
-                    const settled = await readyOrigin(state);
+                    // A pending wsOrigin is the inline bridge booting; bound it
+                    // like readyOrigin bounds a bootstrap (20s) so a wedged
+                    // cold start cannot hold the construction in CONNECTING
+                    // forever — it degrades DIRECT below instead.
+                    const settled = state.wsOrigin instanceof Promise ? await raceWsOriginBound(state.wsOrigin) : await readyOrigin(state);
                     if (settled === undefined) {
                         if (!warnedDirect) {
                             warnedDirect = true;
@@ -457,7 +503,9 @@ export function installNativeWebSocketIntercept(state: NativeInterceptState): bo
 }
 
 /** Test hook: restore the pre-install globalThis.WebSocket (identity-compared
- *  accessor, mirroring the fetch lane's #1410 discipline) and clear the flag. */
+ *  accessor, mirroring the fetch lane's #1410 discipline), clear the flag, and
+ *  drop the shared live-state slot (#3558) so a suite that installed only the WS
+ *  wrapper leaves no stale active state for a later suite. */
 export function _resetForTest(): void {
     if (preInstallDesc !== undefined && ourGet !== undefined) {
         const d = preInstallDesc;
@@ -470,4 +518,6 @@ export function _resetForTest(): void {
         }
     }
     delete (globalThis as GlobalRecord)[WS_INTERCEPT_FLAG];
+    delete (globalThis as GlobalRecord)[ACTIVE_STATE];
+    delete (globalThis as GlobalRecord)[ACTIVE_STATE_SEQ];
 }
