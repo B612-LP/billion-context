@@ -43,7 +43,7 @@ import type { ProxyOptions } from "../src/config.ts";
 import { startServer } from "../src/server.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { loadLegacyView, toLegacyLike } from "../src/storage/ingest.ts";
-import { canonicalize, sha256 } from "./golden-canonical.ts";
+import { canonicalize, sha256, sortObjectKeys } from "./golden-canonical.ts";
 
 // ---------------------------------------------------------------------------
 // Shared with the parent test files (moved verbatim, single definition).
@@ -79,6 +79,73 @@ export function viewStateDigest(view: ReturnType<typeof loadLegacyView>): string
         pluginSnapshot: view.pluginSnapshot,
         contentStore: view.contentStore,
     })));
+}
+
+/** #4316 layer 3 PR3/3 (380ef4dac): a unified full-mode cold load performs a
+ *  ONE-TIME ledger alignment — citation numbers are re-homed onto ledger
+ *  sequence (kernel restampRefsToLedger) and state.refLedgerAligned is stamped.
+ *  Cross-mode / cross-read-path "identical state" proofs must therefore compare
+ *  the state modulo that one-time renumbering: this strips the alignment stamp
+ *  and re-homes every ref number to a canonical order (k-th smallest raw id ->
+ *  m0000k), so two views differing ONLY in which numbering scheme produced
+ *  their refs hash identically under viewDigest/viewStateDigest. Object key
+ *  order is normalized too: different hydration paths build identical content
+ *  under different insertion orders, and canonicalize preserves them. Pure
+ *  function — returns a new object, input untouched. */
+export function stripOneTimeAlignment<T>(view: T): T {
+    const v = view as { state?: unknown; blockContents?: unknown };
+    if (!v.state || typeof v.state !== "object") return view;
+    const byRaw = (v.state as { messageRefs?: { byRaw?: Record<string, string> } }).messageRefs?.byRaw;
+    const remap = new Map<string, string>();
+    if (byRaw) {
+        for (const [raw, ref] of Object.entries(byRaw).sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
+            remap.set(ref, `m${String(remap.size + 1).padStart(5, "0")}`);
+        }
+    }
+    // The JSON pass below flattens Maps — pull blockContents out while it is
+    // still a Map, renumber its keys afterwards, rebuild it. Everything else
+    // in these views is JSON-native.
+    const bcIsMap = v.blockContents instanceof Map;
+    let bcEntries: Array<[string, string]> | null = null;
+    let source: unknown = view;
+    if (bcIsMap) {
+        bcEntries = [...(v.blockContents as Map<string, string>).entries()];
+        source = { ...(v as Record<string, unknown>), blockContents: undefined };
+    }
+    let json = JSON.stringify(canonicalize(source));
+    if (remap.size > 0) {
+        // Single-pass alternation: sequential per-token replacement would chain
+        // (a target that is also another source gets re-mapped on the next pass).
+        const re = new RegExp(`\\b(${[...remap.keys()].join("|")})\\b`, "g");
+        json = json.replace(re, (tok) => remap.get(tok)!);
+    }
+    const out = JSON.parse(json) as (T & { state?: Record<string, unknown>; blockContents?: unknown }) & Record<string, unknown>;
+    if (out.state && "refLedgerAligned" in out.state) delete out.state["refLedgerAligned"];
+    // cacheLedger line `bd` digests hash the RAW outbound bodies — bodies whose
+    // only cross-leg delta is this same citation renumbering. The bodies are
+    // compared directly (per-turn shaCiteNorm), so masking the derived digests
+    // hides nothing; keeping them would fail every aligned comparison.
+    const ledger = (out.metadata as { cacheLedger?: { lines?: Array<Record<string, unknown>> } } | undefined)?.cacheLedger;
+    // Segment bookkeeping, not content, in the aligned view (#4599): a restart
+    // appends a fresh open tail line and re-anchors the closed-segment byte
+    // boundaries (be/bl/bs), so no-restart and restart legs legitimately differ
+    // there. Keep the closed segments' content; drop the unfinalized tail and
+    // the bookkeeping trio everywhere.
+    if (Array.isArray(ledger?.lines)) {
+      while (ledger.lines.length > 0 && ledger.lines[ledger.lines.length - 1]?.bl === undefined) ledger.lines.pop();
+      for (const line of ledger.lines) { delete line["bd"]; delete line["be"]; delete line["bl"]; delete line["bs"]; delete line["prov"]; delete line["seam"]; }
+    }
+    // agg is the same experience telemetry summed: a restart re-partitions the
+    // provider-cache misses into seam buckets (seamMissed/seamSuspects vs
+    // providerSideMissed), so legs legitimately disagree. Per-line content
+    // fields stay; only the derived aggregate goes.
+    if (ledger) delete (ledger as { agg?: unknown }).agg;
+    // snapshotShadow is the shadow-copier's OWN health telemetry — it reports
+    // the ingest pipeline's experience of building this view (errors, watermark
+    // drops), which is inherently load-path-dependent, not conversation state.
+    if (out.metadata && "snapshotShadow" in (out.metadata as Record<string, unknown>)) delete (out.metadata as Record<string, unknown>)["snapshotShadow"];
+    if (bcEntries) out.blockContents = new Map(bcEntries.map(([k, val]) => [remap.get(k) ?? k, val]));
+    return sortObjectKeys(out) as T;
 }
 
 export interface StorageWire {
@@ -125,16 +192,17 @@ export function makeOpts(upstreamPort: number): ProxyOptions {
 // sides reference these constants, so the coverage list cannot drift.
 // ---------------------------------------------------------------------------
 
-export const ENGPROOF_CHECK_NAMES = {
+const ENGPROOF_CHECK_NAMES = {
     fallbackRead: "legacy fallback returned a session over the corrupt index",
     midFlowGuard: "no live handle after the corrupt-index read (#2781 rename guard)",
     stateDigest: "corrupt-index fallback state digest matches the clean full-mode read",
     writeNow: "writeNow keeps working over the legacy path after the corrupt-index degrade",
     postCloseGuard: "no live handle after the final close (post-close rename guard)",
+    fdGuard: "no open fd into the corrupt index dir after close (/proc/self/fd, Linux)",
 } as const;
 export const ENGPROOF_CHECKS: readonly string[] = Object.values(ENGPROOF_CHECK_NAMES);
 
-export const BANNER_CHECK_NAMES = {
+const BANNER_CHECK_NAMES = {
     overviewAnswers: "/__bili/overview answers 200 with JSON",
     requestedFull: "storage.requested is full",
     effectiveLegacy: "storage.effective is legacy",
@@ -145,12 +213,12 @@ export const BANNER_CHECK_NAMES = {
 } as const;
 export const BANNER_CHECKS: readonly string[] = Object.values(BANNER_CHECK_NAMES);
 
-export interface CorruptIndexCheck {
+interface CorruptIndexCheck {
     name: string;
     ok: boolean;
     detail?: string;
 }
-export interface CorruptIndexVerdict {
+interface CorruptIndexVerdict {
     ok: boolean;
     failure: string | null;
     checks: CorruptIndexCheck[];
@@ -227,6 +295,30 @@ async function runGuard(run: CheckRun, name: string, dir: string, suffix: string
     });
 }
 
+/** #4357: the rename guard above is a POSIX no-op — a leaked sqlite handle is
+ *  invisible to it on Linux. Scan our own fd table directly so an in-process
+ *  leak (the quick_check throw path) trips by name there too, not only as an
+ *  EBUSY unlink on Windows. No-op pass elsewhere: Windows is covered
+ *  end-to-end by the parent's teardown rmrf no longer hitting EBUSY. */
+async function runFdGuard(run: CheckRun, name: string, dir: string): Promise<void> {
+    await run.run(name, () => {
+        if (process.platform !== "linux") return;
+        const held: string[] = [];
+        for (const entry of fs.readdirSync("/proc/self/fd")) {
+            let target = "";
+            try {
+                target = fs.readlinkSync(path.join("/proc/self/fd", entry));
+            } catch {
+                continue; // fd dropped between readdir and readlink
+            }
+            if (target === dir || target.startsWith(`${dir}${path.sep}`)) {
+                held.push(`${entry}→${target}`);
+            }
+        }
+        assert.equal(held.length, 0, `open handle(s) into the corrupt index dir after close: ${held.join(", ")}`);
+    });
+}
+
 /** tests/storage-engine-proofs.test.ts #2771 scenario: argv = [dir,
  *  expectedStateDigest] — the parent seeded dir (corpus + full-mode write +
  *  clean full-mode read) and hands in the clean read's state digest. */
@@ -252,8 +344,12 @@ async function engproofScenario(argv: string[], run: CheckRun): Promise<void> {
         // Regression (#2781): the failed open must have CLOSED its handle.
         await runGuard(run, ENGPROOF_CHECK_NAMES.midFlowGuard, dir, "-moved");
 
+        // #4316 PR3/3: the clean full-mode read carried the one-time ledger
+        // alignment; the legacy fallback over the corrupt index did not. The
+        // parent passes its digest already modulo that alignment (single
+        // definition), so strip it here too before comparing.
         await run.run(ENGPROOF_CHECK_NAMES.stateDigest, () =>
-            assert.equal(viewStateDigest(toLegacyLike(reloaded)), expectedStateDigest,
+            assert.equal(viewStateDigest(stripOneTimeAlignment(toLegacyLike(reloaded))), expectedStateDigest,
                 "corrupt-index fallback state digest drift vs clean full-mode read"));
 
         // Writes must keep working (legacy path) — no throw, file refreshed.
@@ -269,6 +365,10 @@ async function engproofScenario(argv: string[], run: CheckRun): Promise<void> {
     // handle-leak drift trips here — named, deterministic, at the right
     // place — instead of as a 10-second EBUSY in teardown.
     await runGuard(run, ENGPROOF_CHECK_NAMES.postCloseGuard, dir, "-postclose");
+
+    // #4357: POSIX rename cannot see open files — scan our own fd table so the
+    // quick_check throw-path leak trips by name on Linux as well.
+    await runFdGuard(run, ENGPROOF_CHECK_NAMES.fdGuard, dir);
 }
 
 function close(server: http.Server): Promise<void> {

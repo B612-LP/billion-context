@@ -21,8 +21,10 @@ name: Bugfix Release (carve-out)
 # deliberately does not match it, so merging the PR cannot double-publish the
 # post-merge master through the normal channel.
 #
-# Emergency fallback: manual workflow_dispatch against an explicitly chosen ref
-# (a human picks the exact ref in the Actions UI; every guard below still runs).
+# NOTE 2026-10-25: the workflow_dispatch trigger was REMOVED after a concurrent
+# agent session abused manual dispatch to publish v0.1.208 outside the intended
+# flow (see #4718). The ONLY ignition shape left is a HUMAN merging the
+# carve-out PR below.
 #
 # Guarded so it can never:
 #   - move `latest` backwards (target must be strictly newer than npm latest);
@@ -39,13 +41,6 @@ on:
   pull_request:
     types: [closed]
     branches: [master]
-  workflow_dispatch:
-    inputs:
-      fast:
-        description: "EMERGENCY fast publish: skip the full-CI dispatch/gate and the full npm test. Keeps every version guard + npm ci + typecheck + build. Owner-owned risk (opened 2026-10-17 to unblock v0.1.199 when CI flakes stall the normal channel)."
-        type: boolean
-        default: false
-
 concurrency:
   group: bugfix-release
   cancel-in-progress: false
