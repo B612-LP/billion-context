@@ -1289,7 +1289,7 @@ export function splitSessionWarnings(sessions: Session[], now: number = Date.now
 // sessions carry no client-provided identity, and how many were born as a fork
 // (diverged shared prefix) or truncated replay (compaction/resume dropped the head)
 // of another anonymous session's history.
-export interface AnonymousIdentitySummary {
+interface AnonymousIdentitySummary {
     total: number;
     forkBorn: number;
     truncatedBorn: number;
