@@ -32,13 +32,23 @@ export type DirectSendPrep =
 
 /** #3654: why createLiveOriginResolver found nothing to route to — the
  *  refusal wording must tell a live-but-saturated proxy (the busy wait window
- *  exhausted) apart from a dead one or a failed bootstrap. */
-export type UnavailableReason = "busy-exhausted" | "dead" | "bootstrap-failed";
+ *  exhausted) apart from a dead one or a failed bootstrap. #4125:
+ *  "send-failed" marks the send-failure recovery paths (the held origin
+ *  answered its probe but the send threw, and recover() produced no
+ *  replacement) so a give-up line can name that branch too. */
+export type UnavailableReason = "busy-exhausted" | "dead" | "bootstrap-failed" | "send-failed";
 
 export interface NativeInterceptState {
     /** Proxy origin ("http://127.0.0.1:PORT") once the bootstrap resolved.
      *  Written by the owner (pi-native.ts); read synchronously on each call. */
     origin: string | undefined;
+    /** Origin the WS wrapper should rewrite codex Responses URLs to, when it
+     *  differs from `origin`. Inline mode (#3278 follow-up): `origin` is the
+     *  never-dialable pseudo-origin, so the WS lane needs the loopback bridge
+     *  (inline-ws.ts) instead. Holds the bridge origin, a Promise settling to
+     *  it (bridge still booting; construction defers, bounded, then degrades
+     *  DIRECT if it settles undefined), or undefined (use `origin`). */
+    wsOrigin?: string | Promise<string | undefined>;
     /** Resolves to the proxy origin once healthy, or undefined on failure. */
     ready: Promise<string | undefined>;
     /** Owner hook: re-run the bootstrap (proxy died → respawn). */
@@ -49,9 +59,12 @@ export interface NativeInterceptState {
      *  the traffic. */
     onGiveUp?: () => void;
     /** #3654: set before createLiveOriginResolver returns undefined — why
-     *  nothing was routable ("busy-exhausted" | "dead" | "bootstrap-failed");
-     *  cleared on the next successful resolution. The refusal builder reads it
-     *  to keep a live-but-saturated proxy out of "proxy unavailable" wording. */
+     *  nothing was routable (see UnavailableReason: "busy-exhausted" | "dead"
+     *  | "bootstrap-failed", plus #4125's "send-failed" set by the send-failure
+     *  recovery paths just before they fire onGiveUp); cleared on the next
+     *  successful resolution. The refusal builder reads it to keep a
+     *  live-but-saturated proxy out of "proxy unavailable" wording; the dsh
+     *  give-up seam appends it to the client event line (#4125). */
     lastUnavailableReason?: UnavailableReason;
     /** Attach mode (#809): route through a user-supplied external proxy at
      *  state.origin instead of a spawned one. Set by the host entry when a
@@ -217,13 +230,17 @@ function noteSignedDirect(url: string, scheme: string, why: string): void {
 // `/v1/messages`, OpenAI chat `/v1/chat/completions` (and legacy
 // `/v1/completions`), Responses `/v1/responses`, Mistral
 // `/v1/chat/completions`|`/v1/conversations`, Google native
-// `/v1beta/models/<model>:(streamGenerateContent|generateContent|countTokens)`
-// — exactly the three methods the proxy core's googlePathKind prepares
-// (#2493; other Google methods such as `:predict` have no pipeline and must
-// keep passing through direct). Version segment is optional and unpinned
-// (zhipuai uses `/v4/chat/completions`, bailian mounts
-// `/apps/anthropic/v1/messages`), so match on the trailing shape only.
-const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^/:?]+:(?:streamGenerateContent|generateContent|countTokens)$/;
+// `/v1beta/models/<model>:(streamGenerateContent|generateContent|countTokens)`,
+// and Google Cloud Code / Antigravity's v1internal dialect
+// `/v1internal:(streamGenerateContent|generateContent|countTokens)` (#4256).
+// The model methods are exactly the three the proxy core prepares
+// (#2493; other Google methods such as `:predict` have no pipeline); the
+// v1internal arm matches ONLY those same three so Antigravity's non-model
+// control-plane POSTs (loadCodeAssist, fetchUserInfo, … — see
+// isV1InternalControlPlanePath) keep passing through direct. Version segment
+// is optional and unpinned (zhipuai uses `/v4/chat/completions`, bailian
+// mounts `/apps/anthropic/v1/messages`), so match on the trailing shape only.
+const MODEL_API_SUFFIX = /(?:^|\/)(?:v\d+\/)?(?:messages|chat\/completions|completions|responses|conversations)\/?$|(?:^|\/)models\/[^/:?]+:(?:streamGenerateContent|generateContent|countTokens)$|(?:^|\/)v1internal:(?:streamGenerateContent|generateContent|countTokens)$/;
 
 /** True when the URL points at a model-API endpoint worth proxying. Never
  *  true for bili's own proxy paths (`/bili/…`, `/__bili/…`) or non-HTTP(S). */
@@ -1102,6 +1119,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                     }
                     return resp;
                 }
+                state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
                 if (!warned) {
                     warned = true;
@@ -1280,6 +1298,7 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
                 // lifetime. Degrade exactly like a bootstrap failure: actually
                 // send the request direct, then let the owner clear proxy-owned
                 // state.
+                state.lastUnavailableReason = "send-failed";
                 state.onGiveUp?.();
                 if (!warned) {
                     warned = true;

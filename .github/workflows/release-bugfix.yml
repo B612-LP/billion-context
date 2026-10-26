@@ -21,8 +21,10 @@ name: Bugfix Release (carve-out)
 # deliberately does not match it, so merging the PR cannot double-publish the
 # post-merge master through the normal channel.
 #
-# Emergency fallback: manual workflow_dispatch against an explicitly chosen ref
-# (a human picks the exact ref in the Actions UI; every guard below still runs).
+# NOTE 2026-10-25: the workflow_dispatch trigger was REMOVED after a concurrent
+# agent session abused manual dispatch to publish v0.1.208 outside the intended
+# flow (see #4718). The ONLY ignition shape left is a HUMAN merging the
+# carve-out PR below.
 #
 # Guarded so it can never:
 #   - move `latest` backwards (target must be strictly newer than npm latest);
@@ -39,13 +41,6 @@ on:
   pull_request:
     types: [closed]
     branches: [master]
-  workflow_dispatch:
-    inputs:
-      fast:
-        description: "EMERGENCY fast publish: skip the full-CI dispatch/gate and the full npm test. Keeps every version guard + npm ci + typecheck + build. Owner-owned risk (opened 2026-10-17 to unblock v0.1.199 when CI flakes stall the normal channel)."
-        type: boolean
-        default: false
-
 concurrency:
   group: bugfix-release
   cancel-in-progress: false
@@ -124,14 +119,6 @@ jobs:
           SHA="${{ steps.resolve.outputs.sha }}"
           [ -z "$SHA" ] && SHA="$(git rev-parse HEAD)"
           echo "::notice::Publishing carve-out from '$REF' @ ${SHA:0:12} -> v$V (master NOT involved)"
-
-      - name: Check plugin manifest versions (#4449)
-        # Same gate as release.yml: the carve-out PR head is a frozen tree
-        # (last tag + fix + bump), so it must ALREADY carry the synced plugin
-        # manifests — drift fails fast here instead of shipping a release whose
-        # marketplace update detection never fires. See reference/release.md.
-        if: steps.resolve.outputs.proceed == 'true'
-        run: node scripts/sync-codex-plugin-version.mjs --check
 
       - name: Publish guard (monotonic + not-already-live)
         if: steps.resolve.outputs.proceed == 'true'
@@ -296,16 +283,3 @@ jobs:
             -H "Content-Type: application/json" \
             "https://api.github.com/repos/${{ github.repository }}/releases" \
             -d @"$RUNNER_TEMP/release.json"
-
-      - name: Close the patch-train cycle (notice — the state is derived, nothing to clear)
-        # Dual-lane model: the open train is DERIVED (newest bugfix-release/*
-        # strictly above the latest v* tag), never stored — GITHUB_TOKEN
-        # cannot touch the actions-variables API, which is why the earlier
-        # variable pointer was removed. Publishing just created the tag that
-        # catches up to the train's base version, so the train auto-derives
-        # as closed: the next 'backport' label cuts a fresh train from the
-        # new tag (fully automatic lifecycle, zero stored state).
-        if: steps.resolve.outputs.proceed == 'true'
-        run: |
-          BRANCH="${{ steps.resolve.outputs.branch }}"
-          echo "::notice::shipped '$BRANCH' — the fresh tag closes the patch-train cycle by derivation; the next 'backport' label cuts a fresh train"

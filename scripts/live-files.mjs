@@ -15,6 +15,7 @@ export const LIVE_FILES = [
     "tests/build-info.test.ts",
     "tests/cache-theorem.test.ts",
     "tests/claude-native.test.ts",
+    "tests/codex-concurrent-launch.test.ts",
     "tests/e2e-plugin-tool-routing.test.ts",
     "tests/graceful-close.test.ts",
     "tests/hermes-native.test.ts",
@@ -23,6 +24,7 @@ export const LIVE_FILES = [
     "tests/index-entry-guard.test.ts",
     "tests/issue1958-routed-warn.test.ts",
     "tests/issue2752-forward-partial-outcome.test.ts",
+    "tests/issue3472-mcp-structured-text.test.ts",
     "tests/issue4341-early-twin-adoption.test.ts",
     "tests/issue760-percall-conversation.test.ts",
     "tests/issue927-opencode-install.test.ts",
@@ -59,6 +61,9 @@ export const LIVE_FILES = [
     // #4434 (split-brain surface): spawns bili CLI children against a throwaway
     // origin; own probe server is listen(0) so only the zone band matters
     "tests/issue-split-brain-surface.test.ts",
+    // #3890: spawns the drain fixture; that fixture is listen(0) and reports
+    // READY <port>, so no zone band is needed — the entry is for the tripwire
+    "tests/issue3890-parent-gone-confirm-drain.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
