@@ -7,7 +7,7 @@ import http from "node:http";
 import { pathToFileURL } from "node:url";
 import { apply, planNativeDsh, shouldBootstrapNativeDsh, persistClientEvent, mediaBytesOfWireBody, bodyProvablyOverWindow, _attributionHealthForTest, _resetAttributionHealthForTest, _registerStateForTest, _resetRegisterForTest, _setModelInfoForTest, _setSpawnForTest, _setThrewRetryForTest, _settleNativeForTest, _stateHeadersForTest, _stateRespawnForTest, _stateTakeoverGateForTest, _stateToolsReadyForTest, _stateBeforeSendForTest, _stateOnResponseForTest, _noteRoutedForTest, _resetRoutedForTest, _resetWebProfileWarningForTest, _resetNonWebTraceForTest, _resetTitlesForTest, type PluginContext } from "../src/agent/dsh-native.ts";
 import { __resetIncrementalClientForTests } from "../src/agent/incremental-client.ts";
-import { BILI_COMPACTION_DISABLE_SERVICE } from "../src/agent/dsh-compaction-disable.ts";
+import { isDshCompactionActive, _resetDshCompactionVerdictForTest } from "../src/agent/dsh-compaction-disable.ts";
 import { once } from "node:events";
 import { startServer } from "../src/server.ts";
 import { defaultConfig } from "acp-kernel";
@@ -87,6 +87,54 @@ test("#3370: dsh incremental conversion is atomic (marker + body on the same ini
     }
 });
 
+// #3433: OpenAI wire shapes (assistant.tool_calls / role:"tool") must NOT be
+// converted onto the incremental lane — the lane ingests with anthropicToCore
+// and would silently drop the tool calls. They stay on full resend, exactly
+// like omp/opencode do behind wireMessagesLookAnthropic.
+test("#3433: dsh OpenAI tool shapes ride full resend; anthropic shapes still convert", async () => {
+    const proxy = await startMockProxy([], undefined, undefined, undefined, true);
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-inc3433-"));
+    const stateHome = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-inc3433-state-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin, XDG_STATE_HOME: stateHome, BILI_PROVIDER_REWRITES: undefined, BILI_NATIVE_DSH: undefined, BILLION_CONTEXT_PLUGIN: undefined }, async () => {
+            _resetRegisterForTest(proxy.origin);
+            __resetIncrementalClientForTests();
+            const ctx = mockCtx();
+            ctx.setInitiator({ session: { id: "dsh-inc-3433" } });
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "manifest tool registration");
+            await _stateToolsReadyForTest();
+            const beforeSend = _stateBeforeSendForTest();
+            assert.ok(beforeSend, "conversion seam armed");
+            const url = `${proxy.origin}/v1/chat/completions`;
+
+            // OpenAI chat-completions shape: assistant.tool_calls + role:"tool"
+            const openaiMsgs = [
+                { role: "user", content: "list the files" },
+                { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "ls", arguments: "{}" } }] },
+                { role: "tool", tool_call_id: "call_1", content: "a.txt b.txt" },
+                { role: "user", content: "now read a.txt" },
+            ];
+            const original = JSON.stringify({ model: "gpt-test", max_tokens: 64, messages: openaiMsgs });
+            const init: RequestInit = { method: "POST", body: original };
+            await beforeSend(url, init);
+            assert.equal(init.body, original, "OpenAI tool shape rides full resend (body untouched)");
+            assert.equal(new Headers(init.headers ?? {}).get("x-bili-plugin-turn"), null, "no marker on the untouched body");
+
+            // control: the anthropic wire shape still converts (guard does not over-block)
+            const init2: RequestInit = { method: "POST", body: JSON.stringify({ model: "claude-test", max_tokens: 64, messages: [{ role: "user", content: [{ type: "text", text: "hello" }] }] }) };
+            await beforeSend(url, init2);
+            const body2 = JSON.parse(init2.body as string) as { conversationId?: string };
+            assert.equal(body2.conversationId, "dsh-inc-3433", "anthropic shape still converts to a lane turn");
+            assert.equal(new Headers(init2.headers).get("x-bili-plugin-turn"), "1", "marker stamped on the anthropic turn");
+        });
+    } finally {
+        proxy.close();
+        rmrf(home);
+        rmrf(stateHome);
+    }
+});
+
 import { rmrf } from "./tmp-rm.ts";
 
 // #1797: drain ALL in-flight attach/recovery chains after each test — defense-in-depth
@@ -99,6 +147,13 @@ afterEach(() => { void _settleNativeForTest(); });
 // grace tiny so the POLL_DEADLINE_MS cap dominates timing. Pinned-path tests
 // override per-test.
 process.env.BILI_ATTACH_EVIDENCE_GRACE_MS = "30";
+
+// #1365: a dev shell that runs DSH itself exports a live attach target; every
+// suite below must start from a clean slate or it silently binds to the real
+// proxy instead of the mock it set up. withEnv() only restores the keys it was
+// given, so the host values have to go here.
+delete process.env.BILLION_CONTEXT_ATTACH;
+delete process.env.BILLION_CONTEXT_PROXY;
 
 import { dshNativeInstalled, isNpmInstallForm, pluginInstall, pluginRemove, pluginStatusAll, selfPackageRoot } from "../src/plugin-install.ts";
 import { DSH_PATCH_BEGIN, DSH_PATCH_END, dshBundleInstalled, dshProfileDirs, planDshSpawn, stripDshManagedPatch, stripLegacyManagedBlock, _setDshRunnersForTest, type DshPlan } from "../src/dsh-channel.ts";
@@ -587,11 +642,10 @@ function mockCtx() {
     type HostCtx = Parameters<typeof apply>[0];
     type HostListener = Parameters<NonNullable<PluginContext["on"]>>[1];
     const listeners: Record<string, HostListener[]> = {};
-    // #3354: capture the load-time compaction-disable overlay — event order,
-    // provided services, and the internal/config middleware for simulation.
+    // #3354/#3662: capture registration event order + provided services
+    // (the overlay itself now lives in the always-on gate entry).
     const order: string[] = [];
     const providedServices: Array<{ name: string; value: unknown }> = [];
-    let compactionMiddleware: ((raw: unknown, next: () => unknown) => unknown) | undefined;
     // Stable service identities (like real cordis services: one facade per
     // process whose state mutates underneath); getters gate exposure on the
     // backing fakes so T4's no-services degradation still reads absent.
@@ -617,7 +671,6 @@ function mockCtx() {
         registeredCommands: commands,
         on: (event: string, listener: HostListener, _options?: { global?: boolean }) => {
             order.push(`on:${event}`);
-            if (event === "internal/config") compactionMiddleware = listener as (raw: unknown, next: () => unknown) => unknown;
             (listeners[event] ??= []).push(listener);
         },
         emit: (event: string, ...args: unknown[]) => { for (const l of listeners[event] ?? []) (l as (...a: unknown[]) => void)(...args); },
@@ -651,7 +704,6 @@ function mockCtx() {
         reflect: { provide: (name: string, value: unknown) => { order.push(`provide:${name}`); providedServices.push({ name, value }); } },
         providedServices,
         registrationOrder: () => [...order],
-        compactionMiddleware: () => compactionMiddleware,
     };
 }
 
@@ -1065,19 +1117,23 @@ test("apply() inactive-context registration failure is silent and terminal (dsh 
 test("apply() is a no-op under the kill switches", async () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-off-"));
     try {
+        _resetDshCompactionVerdictForTest();
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PLUGIN: "0" }, () => {
             _resetRegisterForTest(undefined);
             const ctx = mockCtx();
             apply(ctx);
             assert.equal(ctx.registeredTools.length, 0);
             assert.equal(ctx.registeredCommands.length, 0);
-            // #3354: a kill-switched bili must not register the load-time
-            // overlay either — the lane goes back to stock dsh behavior.
+            // #3354/#3662: a kill-switched bili must neither register the
+            // overlay nor declare the lane owned — the gate entry then leaves
+            // every preset row stock while its service keeps them bootable.
             assert.ok(!ctx.registrationOrder().some((e) => e.startsWith("on:internal/config")));
             assert.equal(ctx.providedServices.length, 0);
+            assert.ok(!isDshCompactionActive(), "kill switch must not declare the lane owned");
         });
     } finally {
         rmrf(home);
+        _resetDshCompactionVerdictForTest();
     }
 });
 
@@ -1222,54 +1278,29 @@ test("#3806 apply(): a degraded web profile alarms loudly instead of the silent 
     }
 });
 
-test("#3354 apply(): registers the load-time compaction-disable overlay and publishes its gate", async () => {
+test("#3354/#3662 apply(): declares lane ownership instead of registering the overlay", async () => {
     const proxy = await startMockProxy([]);
     const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-cd-"));
     try {
+        _resetDshCompactionVerdictForTest();
         await withEnv({ DSH_HOME: home, BILLION_CONTEXT_PROXY: proxy.origin }, async () => {
             _resetRegisterForTest(proxy.origin);
             const ctx = mockCtx();
             apply(ctx);
-            // the gate service publishes AFTER the middleware registers — the
-            // preset inject latch can never be satisfied before the transform
-            // is live
-            const iOn = ctx.registrationOrder().indexOf("on:internal/config");
-            const iProvide = ctx.registrationOrder().indexOf(`provide:${BILI_COMPACTION_DISABLE_SERVICE}`);
-            assert.ok(iOn >= 0, "internal/config middleware must be registered");
-            assert.ok(iProvide > iOn, "gate service must publish after the middleware registers");
-            assert.deepEqual(ctx.providedServices.map((s) => s.name), [BILI_COMPACTION_DISABLE_SERVICE]);
-
-            const mw = ctx.compactionMiddleware();
-            assert.equal(typeof mw, "function");
-            const run = (self: unknown, cfg: Record<string, unknown>) =>
-                (mw as (raw: unknown, next: () => unknown) => unknown).call(self, null, () => cfg);
-            // agent-preset entry: both compaction rows disabled, everything else untouched
-            const plugins: Array<Record<string, unknown>> = [
-                { name: "@deepseek-ai/dsh-compaction-basic", config: { auto: true } },
-                { name: "@deepseek-ai/dsh-command-compact" },
-                { name: "@deepseek-ai/dsh-other" },
-            ];
-            const presetCfg: Record<string, unknown> = { plugins, x: 1 };
-            const out = run({ entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } }, presetCfg) as { plugins?: Array<Record<string, unknown>>; x?: number };
-            assert.equal(out.x, 1);
-            assert.deepEqual(out.plugins?.[0]?.config, { auto: true });
-            assert.equal(out.plugins?.[0]?.disabled, true);
-            assert.equal(out.plugins?.[1]?.disabled, true);
-            assert.equal(out.plugins?.[2]?.disabled, undefined);
-            // the original input is not mutated — detached copies only
-            assert.equal(plugins[0].disabled, undefined);
-            // non-preset entries pass through verbatim
-            const otherCfg: Record<string, unknown> = { plugins };
-            assert.equal(run({ entry: { options: { name: "something-else" } } }, otherCfg), otherCfg);
-            // a preset config without a plugins key passes through verbatim
-            const emptyCfg: Record<string, unknown> = {};
-            assert.equal(run({ entry: { options: { name: "@deepseek-ai/dsh-agent-preset" } } }, emptyCfg), emptyCfg);
+            // #3662: the overlay + gate service moved to the always-on
+            // bili-compaction-gate entry; bili-native only declares the verdict
+            // that transform honors (tests/issue3662-dsh-gate-fallback.test.ts
+            // pins the transform + service side).
+            assert.ok(isDshCompactionActive(), "active plan must declare the lane owned");
+            assert.ok(!ctx.registrationOrder().some((e) => e.startsWith("on:internal/config")));
+            assert.equal(ctx.providedServices.length, 0);
             await _stateToolsReadyForTest();
         });
     } finally {
         proxy.close();
         rmrf(home);
         _resetRegisterForTest(undefined);
+        _resetDshCompactionVerdictForTest();
     }
 });
 
@@ -2769,6 +2800,92 @@ test("#1365 apply() attach mode: routed evidence + persistently dead target — 
         _setSpawnForTest(undefined);
         rmrf(home);
         rmrf(stateHome);
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("#1365 explicit BILLION_CONTEXT_ATTACH remains the tool endpoint when the routed model origin denies the plugin manifest", async () => {
+    const toolCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const attach = await startMockProxy(toolCalls);
+    let modelManifestRequests = 0;
+    const modelServer = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            modelManifestRequests += 1;
+            res.writeHead(403);
+            res.end("Forbidden");
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    await new Promise<void>((resolve) => modelServer.listen(0, "127.0.0.1", () => resolve()));
+    const modelOrigin = `http://127.0.0.1:${(modelServer.address() as { port: number }).port}`;
+    let spawnCalls = 0;
+    _setSpawnForTest(async () => {
+        spawnCalls += 1;
+        return "http://127.0.0.1:2";
+    });
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-1365-explicit-attach-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_ATTACH: attach.origin, BILLION_CONTEXT_PROXY: undefined, BILI_ATTACH_HEALTH_DEADLINE_MS: "40" }, async () => {
+            _resetRegisterForTest(attach.origin);
+            _resetRoutedForTest();
+            _noteRoutedForTest(`${modelOrigin}/bili/${R1365_UPSTREAM}`);
+            const ctx = mockCtx();
+            apply(ctx);
+            assert.equal(await _stateRespawnForTest()?.(), attach.origin, "recovery must probe the explicit plugin endpoint, not the model-only origin");
+            await waitFor(() => ctx.registeredTools.length === 1, "explicit-attach tool registration");
+            assert.equal(spawnCalls, 0, "a second proxy must not be spawned for an API-only model route");
+            assert.equal(modelManifestRequests, 0, "pre-existing model-route evidence must not override explicit attach");
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365-explicit" } } });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(toolCalls, [{ conversationId: "s1365-explicit", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
+        });
+    } finally {
+        attach.close();
+        modelServer.close();
+        _setSpawnForTest(undefined);
+        rmrf(home);
+        _resetRoutedForTest();
+        _resetRegisterForTest(undefined);
+    }
+});
+
+test("explicit attach keeps the DSH tool base when a late routed model origin denies the manifest", async () => {
+    const toolCalls: Array<{ conversationId: string; tool: string; args: unknown }> = [];
+    const attach = await startMockProxy(toolCalls);
+    let modelManifestRequests = 0;
+    const modelServer = http.createServer((req, res) => {
+        if (req.url === "/__bili/plugin/manifest") {
+            modelManifestRequests += 1;
+            res.writeHead(403);
+            res.end("Forbidden");
+            return;
+        }
+        res.writeHead(404);
+        res.end("{}");
+    });
+    await new Promise<void>((resolve) => modelServer.listen(0, "127.0.0.1", () => resolve()));
+    const modelOrigin = `http://127.0.0.1:${(modelServer.address() as { port: number }).port}`;
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), "bili-dsh-explicit-attach-late-route-"));
+    try {
+        await withEnv({ DSH_HOME: home, BILLION_CONTEXT_ATTACH: attach.origin, BILLION_CONTEXT_PROXY: undefined }, async () => {
+            _resetRegisterForTest(attach.origin);
+            _resetRoutedForTest();
+            const ctx = mockCtx();
+            apply(ctx);
+            await waitFor(() => ctx.registeredTools.length === 1, "explicit-attach tools before route observation");
+            _noteRoutedForTest(`${modelOrigin}/bili/${R1365_UPSTREAM}`);
+            await waitFor(() => modelManifestRequests === 1, "manifest liveness probe of late routed origin");
+            const out = await ctx.registeredTools[0].execute({ summary: "s" }, { agent: { session: { id: "s1365-explicit-late" } } });
+            assert.equal(out, "compressed 42 tokens");
+            assert.deepEqual(toolCalls, [{ conversationId: "s1365-explicit-late", tool: "compress", args: { summary: "s" }, nativeCaller: true }]);
+        });
+    } finally {
+        attach.close();
+        modelServer.close();
+        rmrf(home);
         _resetRoutedForTest();
         _resetRegisterForTest(undefined);
     }
