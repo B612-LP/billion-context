@@ -95,13 +95,13 @@
  "foldAt": 9,
  "editedAt": 12,
  "summaryFrom": 9,
- "stateDigest": "f4d5bfb97153ec99041c16888125a941e8b2657dc720a866a4099fa3b23fff5b",
- "stateDigestAligned": "fc2df28feea1891b28a3a24ee966534443f83ee588d7aa3412bf0508ff82b379",
+ "stateDigest": "4e2e2fccd5820726841eda5272b73afae6617e82ee38da39227ef6a431feccd8",
+ "stateDigestAligned": "aabc7a4491679c1bc490eb985f54e5b53d0b75034d2698896667f8ec69640b27",
  "sectionDigests": {
   "state": "f93dc1c876c672d4",
   "blockContents": "dc7d13d250c94bb4",
   "stats": "c6f1d434975d047d",
-  "metadata": "b8ac4625e095b31b"
+  "metadata": "a08e46223e8f7c66"
  },
  "stateKeyDigests": {
   "blocks": "3a454b9a16e4f0b9",
