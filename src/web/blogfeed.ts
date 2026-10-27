@@ -295,13 +295,6 @@ export function getBlogFeed(): { items: BlogItem[]; error?: string } {
     return state;
 }
 
-/** GET /__bili/blog — always 200 JSON; the panel degrades on an empty list. */
-export function handleBlogGet(res: ServerResponse): void {
-    const data = getBlogFeed();
-    res.writeHead(200, { "content-type": "application/json; charset=utf-8", "cache-control": "no-cache" });
-    res.end(JSON.stringify(data));
-}
-
 /** One decoded-and-validated path segment list, or undefined for every
  *  rejection class: bad percent-encoding, empty/"."/".."/NUL segments. */
 function safeSegments(urlPath: string): string[] | undefined {
