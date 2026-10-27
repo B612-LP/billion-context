@@ -9,12 +9,13 @@ import {
 } from "../src/turn-integrity.js";
 import type { CoreMessage } from "../src/types.js";
 
-/** CoreMessage plus the Anthropic wire sidecars the codecs attach
+/** CoreMessage plus the wire sidecars the codecs attach
  *  (structurally typed — mirrors the MediaSidecar discipline in
  *  protected.ts: core modules/tests do not import from src/wire/). */
 type SignedCore = CoreMessage & {
   thinkingSignature?: string;
   rawAnthropicBlock?: unknown;
+  reasoningContent?: string;
 };
 
 function user(id: string): CoreMessage {
@@ -225,6 +226,26 @@ describe("#4885 INV3 gate (computeIntegrityWithdrawals)", () => {
     assert.equal(withdrawn.size, 0);
   });
 
+  it("re-checks a signed run after INV2 withdraws its call (fixpoint)", () => {
+    const msgs: SignedCore[] = [
+      reasoning("ra", "sig-A"),
+      toolCall("ca", "call_A"),
+      toolResult("tra", "call_A"),
+      user("u9"),
+    ];
+    // Fold covers thinking + call but NOT the result: INV2 must withdraw
+    // the call first, and the NEXT fixpoint iteration must catch the now
+    // partially folded signed run and withdraw the thinking too — a
+    // signature is never folded alone.
+    const { withdrawn } = computeIntegrityWithdrawals(
+      msgs,
+      new Set(["ra", "ca"]),
+    );
+    assert.ok(withdrawn.has("ca"), "call withdrawn (split pair)");
+    assert.ok(withdrawn.has("tra"), "result recorded with its pair");
+    assert.ok(withdrawn.has("ra"), "thinking withdrawn on re-check");
+  });
+
   it("keeps the #564 reverse split allowed for UNSIGNED runs", () => {
     const unsigned: SignedCore[] = [
       reasoning("ra"),
@@ -251,8 +272,8 @@ describe("#4885 INV3 gate (computeIntegrityWithdrawals)", () => {
         contentType: "reasoning",
         text: "cot",
         // OpenAI reasoning_content echo lane: unsigned by definition.
-        ...( { reasoningContent: "x" } as object ),
-      } as SignedCore),
+        reasoningContent: "x",
+      }),
     );
     assert.ok(!isSignedThinkingFamily(asstText("t")));
   });
