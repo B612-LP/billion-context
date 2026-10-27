@@ -5,8 +5,11 @@
 // the chain:
 //   (A) armFailureShrink had no sidePassthrough gate: a FAILED side-lane
 //       request armed the MAIN session's meter with the side payload's size,
-//       breaking the #388 lane contract. Main-request failures must still
-//       arm (negative direction, #3617).
+//       breaking the #388 lane contract. Pinned in
+//       tests/side-lane-invariants.test.ts (L) — the gate consumes the lane
+//       decision, so the #2170 pairing rule puts it in the dedicated
+//       side-lane suite (main-request failures must still arm there too,
+//       negative direction #3617).
 //   (B) prepare-anthropic wrote localInputEstimate/lastLocalTextEstimate
 //       with no title-gen gate (openai/responses lanes already gate): a
 //       max_tokens<=200 full-pipeline request left its tiny measurement
@@ -34,7 +37,7 @@ import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
-import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts";
+import { _resetPluginStateForTest } from "../src/plugin.ts";
 import { _resetSessionsForTest, getSession } from "../src/session.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 import { resetToolRingForTest } from "../src/tool-ring.ts";
@@ -45,7 +48,6 @@ test.after(() => rmSync(testRoot, { recursive: true, force: true }));
 for (const key of ["XDG_STATE_HOME", "XDG_DATA_HOME", "XDG_CACHE_HOME", "XDG_CONFIG_HOME"]) process.env[key] = testRoot;
 
 type Msg = { role: string; content: string };
-type SendOpts = { agent?: string; maxTokens?: number; tools?: unknown[]; system?: string };
 
 function freshRunDir(): string {
     const dir = mkdtempSync(join(testRoot, "run-"));
@@ -59,19 +61,13 @@ function freshRunDir(): string {
     return dir;
 }
 
-async function mockUpstream(): Promise<{ url: string; setFail: (v: boolean) => void; close: () => void }> {
-    let fail = false;
+async function mockUpstream(): Promise<{ url: string; close: () => void }> {
     return await new Promise((resolve) => {
         const server = http.createServer((req, res) => {
             const chunks: Buffer[] = [];
             req.on("data", (c: Buffer) => chunks.push(c));
             req.on("end", () => {
                 const raw = Buffer.concat(chunks).toString("utf8");
-                if (fail) {
-                    res.writeHead(500, { "content-type": "application/json" });
-                    res.end(JSON.stringify({ type: "error", error: { type: "api_error", message: "forced failure" } }));
-                    return;
-                }
                 if (/TASK: The conversation segment below/.test(raw)) {
                     res.writeHead(200, { "content-type": "application/json" });
                     res.end(JSON.stringify({ id: "msg_sum", role: "assistant", content: [{ type: "text", text: "PREFLIGHT SUMMARY: segment folded." }] }));
@@ -83,7 +79,6 @@ async function mockUpstream(): Promise<{ url: string; setFail: (v: boolean) => v
         });
         server.listen(0, "127.0.0.1", () => resolve({
             url: `http://127.0.0.1:${(server.address() as { port: number }).port}`,
-            setFail: (v: boolean) => { fail = v; },
             close: () => server.close(),
         }));
     });
@@ -133,91 +128,6 @@ async function startWith(options: ProxyOptions): Promise<{ origin: string; close
         },
     };
 }
-
-// ---------------------------------------------------------------------------
-// (A) the arm gate, dsh plugin lane (the incident's host)
-
-test("(A) a FAILED side-lane request must not arm the main session's meter (#4974)", async () => {
-    const dir = freshRunDir();
-    const lines: string[] = [];
-    setLogCapture((_l, msg) => lines.push(msg));
-    const upstream = await mockUpstream();
-    let running: Awaited<ReturnType<typeof startWith>> | null = null;
-    try {
-        running = await startWith(baseOptions(upstream.url, 400_000, join(dir, "bili.log")));
-        const h = running;
-        const send = async (conv: string, messages: Msg[], opts: SendOpts = {}): Promise<number> => {
-            const headers: Record<string, string> = {
-                "content-type": "application/json",
-                "x-acp-session": conv,
-                "x-bili-plugin": "dsh",
-                "x-bili-plugin-conversation": conv,
-            };
-            if (opts.agent !== undefined) headers["x-bili-plugin-agent"] = opts.agent;
-            const body: Record<string, unknown> = { model: "claude-test", max_tokens: opts.maxTokens ?? 256, messages };
-            if (opts.system !== undefined) body.system = opts.system;
-            if (opts.tools !== undefined) body.tools = opts.tools;
-            const r = await fetch(`${h.origin}/bili/${upstream.url}/v1/messages`, { method: "POST", headers, body: JSON.stringify(body) });
-            await r.text();
-            return r.status;
-        };
-        upstream.setFail(true);
-        // side shape 1: declared side agent (dsh title-gen persona)
-        await send("sidefail", [{ role: "user", content: "Generate a title." }], { agent: "title", maxTokens: 1024, system: "MAIN OPERATING SYSTEM" });
-        // side shape 2: budget heuristic (no agent header, max_tokens <= 200, no tools)
-        await send("sidefail", [{ role: "user", content: "summarize" }], { maxTokens: 64, system: "MAIN OPERATING SYSTEM" });
-        assert.ok(lines.some((l) => l.includes("side request") && l.includes("passthrough")), "both requests were classified into the side lane");
-        const s = resolveConversation("sidefail").session!;
-        assert.equal(s.stats.lastInputTokens, 0, "failed side requests must not arm lastInputTokens");
-        assert.notEqual(s.stats.lastInputTokensSource, "estimate", "no estimate-grade baseline may exist after side failures");
-        assert.equal(s.stats.emergencyShrinkAt, undefined, "no emergency shrink may be armed by side failures");
-    } finally {
-        upstream.setFail(false);
-        setLogCapture(null);
-        await running?.close();
-        upstream.close();
-    }
-});
-
-test("(A-) a FAILED main request still arms the emergency shrink (#3617 negative)", async () => {
-    const dir = freshRunDir();
-    const lines: string[] = [];
-    setLogCapture((_l, msg) => lines.push(msg));
-    const upstream = await mockUpstream();
-    let running: Awaited<ReturnType<typeof startWith>> | null = null;
-    try {
-        running = await startWith(baseOptions(upstream.url, 400_000, join(dir, "bili.log")));
-        upstream.setFail(true);
-        const headers = {
-            "content-type": "application/json",
-            "x-acp-session": "mainfail",
-            "x-bili-plugin": "dsh",
-            "x-bili-plugin-conversation": "mainfail",
-            "x-bili-plugin-agent": "main",
-        };
-        const body = {
-            model: "claude-test",
-            max_tokens: 256,
-            system: "MAIN OPERATING SYSTEM",
-            messages: [
-                { role: "user", content: "work ".repeat(500) },
-                { role: "assistant", content: "ok ".repeat(300) },
-            ],
-        };
-        const r = await fetch(`${running.origin}/bili/${upstream.url}/v1/messages`, { method: "POST", headers, body: JSON.stringify(body) });
-        await r.text();
-        assert.equal(r.status, 500, "the forced upstream failure surfaces to the client");
-        const s = resolveConversation("mainfail").session!;
-        assert.ok(s.stats.lastInputTokens > 0, "a failed main request must arm lastInputTokens");
-        assert.equal(s.stats.lastInputTokensSource, "estimate", "the arm is estimate-grade");
-        assert.ok(lines.some((l) => l.includes("armed emergency shrink")), "the arm logs its reason");
-    } finally {
-        upstream.setFail(false);
-        setLogCapture(null);
-        await running?.close();
-        upstream.close();
-    }
-});
 
 // ---------------------------------------------------------------------------
 // (B) the prepare-time meter gate, proxy-mode anthropic wire
