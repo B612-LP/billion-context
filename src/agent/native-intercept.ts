@@ -90,8 +90,18 @@ export interface NativeInterceptState {
      *  merged into the outgoing request headers — dsh-native uses it to
      *  stamp x-bili-plugin* once its tools are registered, gating plugin
      *  mode exactly like pi.ts's before_provider_headers stamp. Returning
-     *  undefined sends the request untouched (wire mode). */
+     *        undefined sends the request untouched (wire mode). */
     headersFor?: (url: string) => Record<string, string> | undefined;
+    /** #4934: the model context window the lane has ALREADY resolved for the
+     *  current request (dsh: its per-model runtime-info cache, warm for any
+     *  session that ran). Consulted ONLY by the degraded direct-send path
+     *  (directSendOrRefuse) as a SECONDARY source when the request itself
+     *  carries no x-bili-plugin-context-window header — which is always the
+     *  case there, because that header is stamped onto the PROXY-rewritten
+     *  request, not the original this path measures. A known window lets the
+     *  #4516 oversize guard arm instead of disarming into a guaranteed
+     *  upstream context_length_exceeded; undefined keeps #4516's fail-open. */
+    resolveContextWindow?: () => number | undefined;
     /** #2399: async pre-send hook — awaited (defensively; a hook error never
      *  breaks the request) per attributed model-API request after the tools
      *  gate clears and BEFORE headersFor is consulted. dsh-native uses it to
@@ -1159,13 +1169,21 @@ export function installNativeFetchIntercept(initialState: NativeInterceptState):
             // model's own window (declared via x-bili-plugin-context-window,
             // stamped by every plugin lane): the upstream rejects it and every
             // retry re-sends the same oversized history, so the turn can never
-            // succeed while the proxy stays down. No header → skip measuring
-            // entirely (the doom check is undefined by construction, and
-            // headerless lanes must not clone/buffer the body — up to 5 GiB —
-            // per degraded direct send for nothing); unreadable body / body
-            // that fits once media is excluded → fail open, exactly like the
-            // gate arms.
-            const declaredWindow = declaredWindowFromHeaders(defaultInput, init);
+            // succeed while the proxy stays down. No header AND no lane-known
+            // window → skip measuring entirely (the doom check is undefined by
+            // construction, and headerless lanes must not clone/buffer the body
+            // — up to 5 GiB — per degraded direct send for nothing); unreadable
+            // body / body that fits once media is excluded → fail open, exactly
+            // like the gate arms. #4934: the header is only present on requests
+            // bili rewrote ONTO the proxy; this degraded path measures the host's
+            // ORIGINAL request, which never carried it — so a headerless body used
+            // to disarm the doom check entirely and ride straight into a
+            // guaranteed upstream context_length_exceeded (the #4934 field shape:
+            // ~1.87M-tok raw history vs a 1M-window model). state.resolveContextWindow
+            // (the lane's own resolved window) fills that blind spot; when even it
+            // is unknown we keep #4516's fail-open (never a false refusal from
+            // missing data).
+            const declaredWindow = declaredWindowFromHeaders(defaultInput, init) ?? state.resolveContextWindow?.();
             const measured = declaredWindow === undefined
                 ? undefined
                 : prep.outcome === "restored"

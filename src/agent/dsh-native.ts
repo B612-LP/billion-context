@@ -2350,6 +2350,13 @@ export function apply(ctx: PluginContext): void {
         }
         return headers;
     };
+    // #4934: the degraded direct-send path measures the host's ORIGINAL request,
+    // which never carries x-bili-plugin-context-window (headersFor stamps it only
+    // onto the proxy-rewritten request). Expose the SAME window headersFor stamps
+    // so the shared oversize guard can arm there instead of disarming into a
+    // guaranteed upstream context_length_exceeded; unknown → undefined keeps the
+    // #4516 fail-open.
+    state.resolveContextWindow = () => effectiveContextWindow(ctx);
 
     // #2399: fork-child adoption runs before headersFor stamps the child's
     // first plugin request — the proxy then binds the replayed prefix to the
