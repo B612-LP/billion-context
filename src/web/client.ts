@@ -1017,13 +1017,17 @@ function changelogCatOf(rawLine) {
             const grossSubPrized = o.netSavedUsdTotal != null
                 ? "≈" + fmtUsd(o.grossSavedUsdTotal || 0) + " · " + t("ov.gross_priced", { n: o.pricedSessions || 0 })
                 : "";
-            $("st-gross").textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
+            const grossEl = $("st-gross");
+            grossEl.textContent = o.grossSavedTotal ? fmtW(o.grossSavedTotal) : t("common.none");
+            grossEl.title = o.grossSavedTotal ? String(Math.round(Number(o.grossSavedTotal))) : "";
             $("st-gross-sub").textContent = (o.hasFoldData ? (grossSubPrized || t("ov.gross_note")) : "")
                 + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.saved_from_legacy", { n: fmtW(o.savedEstimated) }) : "");
             const netSubPrized = o.netSavedUsdTotal != null
                 ? "≈" + fmtUsd(o.netSavedUsdTotal) + " · " + t("ov.net_priced_cost", { c: fmtUsd(o.oneTimeCostTotal || 0) })
                 : "";
-            $("st-netsaved").textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
+            const netEl = $("st-netsaved");
+            netEl.textContent = o.hasFoldData ? ((o.netSavedTotal || 0) < 0 ? "-" : "") + fmtW(Math.abs(o.netSavedTotal || 0)) : t("common.none");
+            netEl.title = o.hasFoldData && o.netSavedTotal ? String(Math.round(Number(o.netSavedTotal))) : "";
             $("st-net-sub").textContent = o.hasFoldData
                 ? (netSubPrized || t("ov.sub_repay", { r: fmtW(o.repayTotal || 0), s: fmtW(o.summaryCostTotal || 0) }))
                 + ((o.savedEstimated || 0) > 0 ? " · " + t("ov.net_excl") : "")
