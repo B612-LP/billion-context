@@ -56,8 +56,8 @@ entries:
     kind: env-only
     audience: user
     group: envonly
-    desc_en: "Storage integrity self-check at open (#4175): every index.db open runs PRAGMA quick_check BEFORE migrations; on failure the shadow layer quarantines the file set (index.db/-wal/-shm renamed to .corrupt-<ts>) and reopens fresh (JSON envelopes remain the recovery source). Set 0 only for boot-time-sensitive huge deployments where the check's cost matters."
-    desc_zh: "存储开库自检（#4175）：每次 index.db 打开在迁移之前先跑 PRAGMA quick_check;失败时影子层把文件组（index.db/-wal/-shm 改名为 .corrupt-<ts>）隔离并重建新库（JSON 信封仍是恢复源）。仅当超大库的启动时间敏感时才设 0 跳过。"
+    desc_en: "Storage integrity self-check at open (#4175/#4609): index.db opens of 512 MiB or less run PRAGMA quick_check synchronously BEFORE migrations (that window blocks startup); larger stores check in the background post-open on a second read-only connection so boot never blocks. Verdicts are cached in an index.db.chk sidecar keyed by schema version + file-set stats — an unchanged file set skips the rescan. Measured cost (#4940, 4.96 GB store, 4 KB pages): ~54–73 s from a cold page cache under memory pressure, ~10–15 s warm — the scan is bound by per-page read overhead (~45 µs/page), not bandwidth; on releases predating #4609 expect a first start after boot on a multi-GB store to exceed the 60 s native spawn budget. On failure the shadow layer quarantines the file set (index.db/-wal/-shm renamed to .corrupt-<ts>) and reopens fresh (JSON envelopes remain the recovery source). Set 0 to skip the check entirely (no check, no cache IO) — also the escape hatch on those older releases."
+    desc_zh: "存储开库自检（#4175/#4609）：≤512 MiB 的 index.db 每次打开在迁移前同步跑 PRAGMA quick_check（该窗口阻塞启动）；更大的库在 open 之后用第二条只读连接后台检查，启动不阻塞。判决缓存在 index.db.chk sidecar（按 schema 版本 + 文件组 size/mtime 判定），文件集不变直接跳过重扫。实测代价（#4940，4.96 GB 库、4 KB 页）：冷页缓存且内存紧张时 ~54–73 s，暖缓存扫描本身 ~10–15 s——瓶颈是每页读开销（~45 µs/页）而非带宽；#4609 之前的版本上，多 GB 库重启后首次启动会超过 60 s 原生 spawn 预算。失败时影子层把文件组（index.db/-wal/-shm 改名为 .corrupt-<ts>）隔离并重建新库（JSON 信封仍是恢复源）。设 0 = 完全跳过（不检查、不读写缓存），也是那些旧版本上的逃生口。"
   - key: BILI_SNAPSHOT_SHADOW
     type: boolean
     default: "true (on)"
