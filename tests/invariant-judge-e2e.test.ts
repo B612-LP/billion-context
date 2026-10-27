@@ -104,7 +104,7 @@ async function harness(opts: { context?: number } = {}) {
     const r = await fetch(url, { method: "POST", headers, body });
     assert.equal(r.status, 200, await r.text());
   };
-  return { send, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
+  return { origin, upstreamUrl, send, close: async () => { store.cancelAll(); proxy.close(); proxy.closeIdleConnections?.(); upstream.close(); upstream.closeIdleConnections?.(); await Promise.all([once(proxy, "close"), once(upstream, "close")]); } };
 }
 
 test("generator: zero false positives across seeded legitimate host behaviors", async () => {
@@ -252,3 +252,35 @@ for (const wire of ["anthropic", "google"] as const) {
     }
   });
 }
+
+// #4862 I3 live proof on the REAL anthropic codec: a paired tool_use/tool_result
+// round-trip must stay clean (the codecs preserve toolCallId on both sides), and
+// stranding the call side must fire unpaired-tool-call — the production shape
+// where a clean I1/I2 verdict shipped an upstream-400 payload.
+test("anthropic wire: paired tool round-trip clean; stranded call side fires (#4862)", async () => {
+  const h = await harness();
+  const seen: JudgeVerdict[] = [];
+  _setInvariantJudgeForTest(true, (v) => { if (!v.ok) seen.push(v); });
+  try {
+    const url = `${h.origin}/bili/${h.upstreamUrl}/v1/messages`;
+    const headers = { "content-type": "application/json", "x-bili-plugin": "fixture", "x-bili-plugin-conversation": "pairing-4862" };
+    const messages = [
+      { role: "user", content: [{ type: "text", text: "list the files" }] },
+      { role: "assistant", content: [{ type: "tool_use", id: "tu_4862", name: "Bash", input: { command: "ls" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "tu_4862", content: "file.txt" }] },
+    ];
+    const r1 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "model-test", max_tokens: 1024, stream: false, messages }) });
+    assert.equal(r1.status, 200, await r1.text());
+    assert.equal(seen.length, 0, JSON.stringify(seen.slice(0, 3)));
+    const before = seen.length;
+    _setInvariantJudgeFaultForTest((c) => c.filter((m) => !(m.contentType === "tool-result" && m.toolCallId === "tu_4862")));
+    const r2 = await fetch(url, { method: "POST", headers, body: JSON.stringify({ model: "model-test", max_tokens: 1024, stream: false, messages }) });
+    assert.equal(r2.status, 200, await r2.text());
+    const fired = seen.slice(before);
+    assert.ok(fired.some((v) => v.violations.some((x) => x.kind === "unpaired-tool-call")), `judge must fire on the stranded tool-call: ${JSON.stringify(fired.slice(0, 2))}`);
+  } finally {
+    _setInvariantJudgeFaultForTest(null);
+    _setInvariantJudgeForTest(false);
+    await h.close();
+  }
+});

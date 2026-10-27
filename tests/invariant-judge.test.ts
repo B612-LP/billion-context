@@ -486,3 +486,90 @@ test("#4241 wiring: maybeRunInvariantJudge honors renderTailStart (green on rend
     _setInvariantJudgeForTest(false);
   }
 });
+
+// #4862 exit pairing (I3): a misapplied fold can strand one side of a
+// tool-call/tool-result pair while I1/I2 stay green — production showed a
+// "clean fold verdict" on every retry of an upstream-400 payload. Positive
+// rows pin zero false positives on legitimate shapes; negative rows pin the
+// two orphan directions; the attribution gate keeps client-originated orphans
+// (incl. re-minted ids, KDD#11) out of the violation set.
+
+test("I3 POS: complete tool-call/tool-result round-trip stays green", () => {
+  const a = [
+    mk("user", "text", "run ls"),
+    mk("assistant", "tool-call", "{\"cmd\":\"ls\"}", { toolName: "bash", toolCallId: "call_1" }),
+    mk("tool", "tool-result", "file.txt", { toolCallId: "call_1" }),
+    mk("assistant", "text", "done"),
+  ];
+  const v = judgeInboundOutbound(a, a);
+  assert.equal(v.ok, true, JSON.stringify(v.violations));
+});
+
+test("I3 POS: parallel calls answered across separate user messages (openai shape) stay green", () => {
+  const a = [
+    mk("assistant", "tool-call", "{\"cmd\":\"a\"}", { toolName: "bash", toolCallId: "c_a" }),
+    mk("assistant", "tool-call", "{\"cmd\":\"b\"}", { toolName: "bash", toolCallId: "c_b" }),
+    mk("tool", "tool-result", "ra", { toolCallId: "c_a" }),
+    mk("tool", "tool-result", "rb", { toolCallId: "c_b" }),
+    mk("assistant", "text", "both done"),
+  ];
+  assert.equal(judgeInboundOutbound(a, a).ok, true);
+});
+
+test("I3 POS: summary carrier inside the answer region does not break coverage", () => {
+  const entry = [
+    mk("assistant", "tool-call", "{}", { toolName: "t", toolCallId: "c_1" }),
+    mk("tool", "tool-result", "r", { toolCallId: "c_1" }),
+    mk("assistant", "text", "next"),
+  ];
+  const exit = [
+    entry[0]!,
+    mk("user", "text", "[Compressed conversation section]\nstuff", { summaryOfBlockId: "b9" }),
+    entry[1]!,
+    entry[2]!,
+  ];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, true);
+});
+
+test("I3 POS: client-originated trailing orphan forwarded verbatim stays green (attribution charter)", () => {
+  const a = [
+    mk("assistant", "tool-call", "{\"cmd\":\"ls\"}", { toolName: "bash", toolCallId: "call_1" }),
+    mk("assistant", "text", "waiting on you"),
+  ];
+  assert.equal(judgeInboundOutbound(a, a).ok, true);
+});
+
+test("I3 POS: orphan re-minted across re-projection stays green (KDD#11, id-independent attribution)", () => {
+  const entry = [mk("assistant", "tool-call", "{\"cmd\":\"ls\"}", { toolName: "bash", toolCallId: "call_1" })];
+  const exit = [mk("assistant", "tool-call", "{\"cmd\":\"ls\"}", { toolName: "bash", toolCallId: "call_REMINTED" })];
+  assert.equal(judgeInboundOutbound(entry, exit).ok, true);
+});
+
+test("I3 NEG: fold carrier replaces ONLY the result side -> I1/I2 green but pairing red (the #4862 shape)", () => {
+  const entry = [
+    mk("user", "text", "preamble"),
+    mk("assistant", "tool-call", "{\"cmd\":\"ls\"}", { toolName: "bash", toolCallId: "call_1" }),
+    mk("tool", "tool-result", "file.txt", { toolCallId: "call_1" }),
+    mk("user", "text", "follow-up"),
+  ];
+  const exit = [
+    mk("user", "text", "preamble"),
+    mk("assistant", "tool-call", "{\"cmd\":\"ls\"}", { toolName: "bash", toolCallId: "call_1" }),
+    mk("user", "text", "[Compressed conversation section]\nold stuff", { summaryOfBlockId: "b7" }),
+    mk("user", "text", "follow-up"),
+  ];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "unpaired-tool-call"), JSON.stringify(v.violations));
+});
+
+test("I3 NEG: exit leaves a tool-result whose call side vanished -> red", () => {
+  const entry = [
+    mk("assistant", "tool-call", "{}", { toolName: "t", toolCallId: "c_9" }),
+    mk("tool", "tool-result", "r", { toolCallId: "c_9" }),
+  ];
+  const exit = [mk("tool", "tool-result", "r", { toolCallId: "c_9" })];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "unpaired-tool-result"), JSON.stringify(v.violations));
+});

@@ -17,6 +17,11 @@
 //   I2 (fold): all divergence is confined to [earliest-fold-start, end); the
 //     bytes before the fold point stay identical, and the fold carrier stays
 //     pinned (anchor drift is a violation too).
+//   I3 (exit pairing, #4862): every outbound tool-call id is answered by a
+//     tool-result before the next assistant turn, and no outbound tool-result
+//     lacks its call — provider validity outlives the fold boundary, so this
+//     scans the WHOLE exit, not just the frozen prefix. Attribution-gated:
+//     only breaks BILI introduced (absent inbound) are violations.
 //
 // Single-request independence: the inbound core IS the client ground truth, so
 // the judge needs no cross-request state — structurally avoiding the process-
@@ -57,7 +62,9 @@ type ViolationKind =
   | "mid-insertion"
   | "fold-boundary-drift"
   | "carrier-drift"
-  | "exemption-overflow";
+  | "exemption-overflow"
+  | "unpaired-tool-call"
+  | "unpaired-tool-result";
 
 interface Violation {
   kind: ViolationKind;
@@ -170,6 +177,44 @@ function isTruncatedTwin(a: CoreMessage, b: CoreMessage): boolean {
   const post = strip(bt.slice(m.index + m[0].length));
   const na = strip(at);
   return pre.length > 0 && post.length > 0 && na.startsWith(pre) && na.endsWith(post);
+}
+
+// #4862 exit pairing: provider validity outlives the fold boundary — a
+// misapplied fold can strand one side of a tool-call/tool-result pair while
+// I1/I2 stay green (#4862: clean fold verdict on every retry, upstream 400).
+// Scans ONE side of the wire for orphans: a tool-call whose id never appears
+// as a tool-result in the following user region (up to the next assistant
+// turn), and a tool-result whose id never appears as any tool-call at all.
+// Reasoning cores are transparent; cores without an id are unverifiable and
+// never flagged (#3842 no-false-positive discipline — codec-dependent ids).
+function pairingOrphans(cores: readonly CoreMessage[]): { calls: CoreMessage[]; results: CoreMessage[] } {
+    const orphCalls: CoreMessage[] = [];
+    const allCallIds = new Set<string>();
+    for (const c of cores) if (c.contentType === "tool-call" && c.toolCallId) allCallIds.add(c.toolCallId);
+    const orphResults = cores.filter((c) => c.contentType === "tool-result" && !!c.toolCallId && !allCallIds.has(c.toolCallId));
+    let i = 0;
+    while (i < cores.length) {
+        if (!(cores[i]!.role === "assistant" && cores[i]!.contentType === "tool-call")) { i++; continue; }
+        // The whole assistant run belongs to one turn (split cores share it);
+        // only id-bearing tool-calls are verifiable.
+        const pending: CoreMessage[] = [];
+        let k = i;
+        while (k < cores.length && cores[k]!.role === "assistant") {
+            if (cores[k]!.contentType === "tool-call" && cores[k]!.toolCallId) pending.push(cores[k]!);
+            k++;
+        }
+        if (pending.length > 0) {
+            const covered = new Set<string>();
+            for (let t = k; t < cores.length; t++) {
+                const u = cores[t]!;
+                if (u.role === "assistant" && u.contentType !== "reasoning") break;
+                if (u.contentType === "tool-result" && u.toolCallId) covered.add(u.toolCallId);
+            }
+            for (const p of pending) if (!covered.has(p.toolCallId!)) orphCalls.push(p);
+        }
+        i = Math.max(k, i + 1);
+    }
+    return { calls: orphCalls, results: orphResults };
 }
 
 function fp(m: CoreMessage): string {
@@ -339,15 +384,42 @@ export function judgeInboundOutbound(
   const ccrExempt = exit.filter(isCcrStoredResult).length;
   const truncateExempt = exit.filter(isTruncationExit).length;
   const exemptTotal = carrierExempt + reasoningExempt + crushExempt + ccrExempt + truncateExempt;
-  if (exemptTotal > maxExempt) {
-    violations.push({
-      kind: "exemption-overflow",
-      index: -1,
-      detail: `named-exemption volume ${exemptTotal} exceeds cap ${maxExempt} (carrier=${carrierExempt} reasoning=${reasoningExempt} crush=${crushExempt} ccr=${ccrExempt} truncate=${truncateExempt})`,
-    });
-  }
+    if (exemptTotal > maxExempt) {
+      violations.push({
+        kind: "exemption-overflow",
+        index: -1,
+        detail: `named-exemption volume ${exemptTotal} exceeds cap ${maxExempt} (carrier=${carrierExempt} reasoning=${reasoningExempt} crush=${crushExempt} ccr=${ccrExempt} truncate=${truncateExempt})`,
+      });
+    }
 
-  return {
+    // #4862 exit pairing, advisory attribution: only BILI-INTRODUCED breaks
+    // count. An orphan whose twin is ALREADY orphaned inbound is the client's
+    // own state forwarded verbatim — not a rewrite. Twin matching rides the
+    // module's own identity relation (stableEqual): CCR/crush/truncation
+    // substitutes and re-minted ids (KDD#11) match by content, never by raw
+    // bytes or id.
+    const entryO = pairingOrphans(entry);
+    const exitO = pairingOrphans(exit);
+    for (const o of exitO.calls) {
+      if (!entryO.calls.some((e) => stableEqual(e, o))) {
+        violations.push({
+          kind: "unpaired-tool-call",
+          index: exit.indexOf(o),
+          detail: `outbound tool-call ${o.toolCallId} (${o.toolName ?? "unknown"}) has no tool-result before the next assistant turn`,
+        });
+      }
+    }
+    for (const o of exitO.results) {
+      if (!entryO.results.some((e) => stableEqual(e, o))) {
+        violations.push({
+          kind: "unpaired-tool-result",
+          index: exit.indexOf(o),
+          detail: `outbound tool-result ${o.toolCallId} (${o.toolName ?? "unknown"}) has no matching tool-call in the payload`,
+        });
+      }
+    }
+
+    return {
     ok: violations.length === 0,
     folded,
     ...(folded && foldStart >= 0 ? { foldStart } : {}),
