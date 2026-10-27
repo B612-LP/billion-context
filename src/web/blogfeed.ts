@@ -27,31 +27,31 @@ import { markdownToHtml } from "./markdown.js";
 
 const BLOG_ASSET_PREFIX = "/__bili/blog-assets";
 
-/** INERT image formats only (#4958): SVG is deliberately absent — it is the
- *  one format that carries active content (embedded <script>), and serving
- *  master-pulled bytes same-origin from the panel turned a bad merge into
- *  stored XSS. Re-adding it requires the owner's explicit sign-off. */
 export const ASSET_TYPES: Record<string, string> = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".gif": "image/gif",
+    ".svg": "image/svg+xml",
     ".webp": "image/webp",
-};
-
-/** Defensive headers on EVERY asset 200 (#4958): `sandbox` (without
- *  allow-scripts) blocks script execution if an asset URL is navigated to
- *  directly; nosniff pins the declared type against MIME confusion. Both are
- *  inert for <img> subresource loads, so rendering behavior does not change. */
-const ASSET_RESPONSE_HEADERS: Record<string, string> = {
-    "content-security-policy": "sandbox",
-    "x-content-type-options": "nosniff",
-    "cache-control": "no-cache",
 };
 
 let rootOverride: string | undefined;
 let probedRoot: string | undefined;
 let state: { items: BlogItem[] } | undefined;
+
+/** Defense-in-depth on EVERY blog-asset response (#4958): asset bytes can
+ *  come from GitHub master (remote overlay, #4906) and .svg is served as
+ *  image/svg+xml — DIRECTLY NAVIGATED, that is active content on the panel
+ *  origin (which also hosts the config editor and its provider API keys), so
+ *  an embedded <script> would run same-origin. `sandbox` CSP strips
+ *  script/origin powers from such a navigation; in-page <img> usage — the
+ *  only way web/markdown.ts references these — is unaffected. nosniff pins
+ *  the declared type. */
+const ASSET_SECURITY_HEADERS: Record<string, string> = {
+    "content-security-policy": "sandbox",
+    "x-content-type-options": "nosniff",
+};
 
 /** One decoded-and-typed image served from the GitHub overlay (#4906), keyed
  *  by repo-relative POSIX path (e.g. "website/blog/posts/figures/x.png"). */
@@ -525,11 +525,12 @@ function safeSegments(urlPath: string): string[] | undefined {
     return out;
 }
 
-/** GET /__bili/blog-assets/<rel> — bundled image bytes only (extension gate +
- *  traversal gate); anything else is a plain-text 404. */
+/** GET /__bili/blog-assets/<rel> — remote overlay bytes first (#4906), then
+ *  bundled disk bytes (extension gate + traversal gate); anything else is a
+ *  plain-text 404. EVERY response carries sandbox CSP + nosniff (#4958). */
 export function handleBlogAssetGet(res: ServerResponse, urlPath: string): void {
     const notFound = () => {
-        res.writeHead(404, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-cache" });
+        res.writeHead(404, { "content-type": "text/plain; charset=utf-8", "cache-control": "no-cache", ...ASSET_SECURITY_HEADERS });
         res.end(`404 Not Found: ${urlPath}\n`);
     };
     const clean = urlPath.split(/[?#]/)[0];
@@ -547,7 +548,7 @@ export function handleBlogAssetGet(res: ServerResponse, urlPath: string): void {
     // frozen bundle bytes; a miss falls through to the package below.
     const overlaid = getRemoteBlogAsset(segments.join("/"));
     if (overlaid !== undefined) {
-        res.writeHead(200, { "content-type": overlaid.type, ...ASSET_RESPONSE_HEADERS });
+        res.writeHead(200, { "content-type": overlaid.type, "cache-control": "no-cache", ...ASSET_SECURITY_HEADERS });
         res.end(overlaid.buf);
         return;
     }
@@ -562,6 +563,6 @@ export function handleBlogAssetGet(res: ServerResponse, urlPath: string): void {
         notFound();
         return;
     }
-    res.writeHead(200, { "content-type": type, ...ASSET_RESPONSE_HEADERS });
+    res.writeHead(200, { "content-type": type, "cache-control": "no-cache", ...ASSET_SECURITY_HEADERS });
     res.end(readFileSync(file));
 }

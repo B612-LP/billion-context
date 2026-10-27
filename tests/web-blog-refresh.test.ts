@@ -29,7 +29,10 @@ import {
     warmBlogRefreshOnce,
     _resetBlogRefreshForTest,
     _setBlogRefreshDisabledForTest,
+    settleRoundImmune,
 } from "../src/web/blog-refresh.ts";
+import { blogCacheStale } from "../src/web/client.ts";
+import { MESSAGES } from "../src/web/i18n.ts";
 
 const CONTENTS_URL = "https://api.github.com/repos/ranxianglei/billion-context/contents/website/blog/posts?ref=master";
 const rawUrl = (rel: string): string => `https://raw.githubusercontent.com/ranxianglei/billion-context/master/${rel}`;
@@ -71,18 +74,13 @@ function installGithubRouter(): void {
             case rawUrl("website/blog/posts/2026-10-08_demo.zh.md"):
                 return new Response("---\ntitle_zh: \"演示（远端更新）\"\nexcerpt_zh: \"中文远端\"\n---\n\n中文远端正文。\n", { status: 200 });
             case rawUrl("website/blog/posts/2026-10-09_fresh.md"):
-                return new Response("# Brand new post\n\nfresh text\n\n![ok](figures/good.png)\n\n![gone](figures/missing.png)\n\n![vec](figures/evil.svg)\n", { status: 200 });
+                return new Response("# Brand new post\n\nfresh text\n\n![ok](figures/good.png)\n\n![gone](figures/missing.png)\n", { status: 200 });
             case rawUrl("website/blog/posts/figures/r.png"):
                 return new Response(REMOTE_PNG, { status: 200 });
             case rawUrl("website/blog/posts/figures/good.png"):
                 return new Response(GOOD_PNG, { status: 200 });
             case rawUrl("website/blog/posts/figures/missing.png"):
                 return new Response("nope", { status: 404 });
-            case rawUrl("website/blog/posts/figures/evil.svg"):
-                // 200 ON PURPOSE: if the round ever fetches it, the hits[]
-                // assertion below fails — the gate must sit at target
-                // collection, not at error handling (#4958).
-                return new Response("<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>", { status: 200 });
             default:
                 return new Response("not here", { status: 404 }); // e.g. articles.json absent ⇒ posts-only
         }
@@ -161,16 +159,6 @@ test("image 404 during download is churn: its reference is dropped, the round st
     const fresh = getBlogFeed().items.find((i) => i.id === "fresh");
     assert.match(fresh?.html ?? "", /good\.png/);
     assert.doesNotMatch(fresh?.html ?? "", /missing\.png/);
-});
-
-test("svg references are never downloaded or cached by a refresh round (#4958)", async () => {
-    installGithubRouter();
-    const out = await runBlogRefreshRound({ force: true });
-    assert.equal(out.ok, true);
-    assert.ok(!hits.some((u) => u.includes("evil.svg")), `round fetched the svg: ${hits.join(", ")}`);
-    const fresh = getBlogFeed().items.find((i) => i.id === "fresh");
-    assert.doesNotMatch(fresh?.html ?? "", /evil\.svg/);
-    assert.equal(getRemoteBlogAsset("website/blog/posts/figures/evil.svg"), undefined);
 });
 
 test("failed round keeps the last good overlay and records an offline marker (nothing throws)", async () => {
@@ -352,4 +340,77 @@ test("collectImageTargets: dedupes, skips scheme targets, resolves against the f
         "website/blog/posts/figs/p.png",
         "website/blog/shared/q.gif",
     ]);
+});
+
+/** Response whose body is never supposed to be read: the precheck must trip
+ *  on the declared content-length BEFORE arrayBuffer() is touched (#4906 P3). */
+function spyBody(body: ConstructorParameters<typeof Response>[0], init?: ConstructorParameters<typeof Response>[1]): { res: Response; bodyRead(): boolean } {
+    let read = false;
+    const res = new Response(body, init);
+    const orig = res.arrayBuffer.bind(res);
+    Object.defineProperty(res, "arrayBuffer", { value: async () => { read = true; return orig(); } });
+    return { res, bodyRead: () => read };
+}
+
+test("#4906 P3 content-length precheck: oversized declarations refuse before the body is read", async () => {
+    installGithubRouter();
+    assert.equal((await runBlogRefreshRound({ force: true })).ok, true); // good baseline
+    // TEXT: declared 600KB > MAX_TEXT_BYTES with a tiny real body — the
+    // precheck must fail the round without downloading a byte.
+    const textSpy = spyBody("tiny", { status: 200, headers: { "content-length": String(600 * 1024) } });
+    router = (url) => {
+        if (url === CONTENTS_URL) return new Response(JSON.stringify([{ name: "2026-10-09_fresh.md", type: "file" }]), { status: 200 });
+        if (url === rawUrl("website/blog/posts/2026-10-09_fresh.md")) return textSpy.res;
+        return new Response("not here", { status: 404 });
+    };
+    assert.equal((await runBlogRefreshRound({ force: true })).ok, true); // fail-soft, marker rides the feed
+    assert.equal(getBlogFeed().error, "offline");
+    assert.equal(textSpy.bodyRead(), false, "oversize text: body never downloaded");
+    // IMAGE: declared 3MB > MAX_IMAGE_BYTES — a silent miss (404-churn
+    // discipline), round still succeeds, body never downloaded.
+    installGithubRouter();
+    assert.equal((await runBlogRefreshRound({ force: true })).ok, true);
+    const imgSpy = spyBody("IMG", { status: 200, headers: { "content-length": String(3 * 1024 * 1024) } });
+    const base = router; // the default GitHub router installed above
+    router = (url) => (url === rawUrl("website/blog/posts/figures/good.png") ? imgSpy.res : base(url));
+    assert.equal((await runBlogRefreshRound({ force: true })).ok, true, "oversize image is churn, not a failed round");
+    assert.equal(getBlogFeed().error, undefined, "no marker: the round itself succeeded");
+    assert.equal(imgSpy.bodyRead(), false, "oversize image: body never downloaded");
+});
+
+test("#4906 P3 lying-small content-length: the post-read byte check stays the authority", async () => {
+    installGithubRouter();
+    assert.equal((await runBlogRefreshRound({ force: true })).ok, true);
+    const big = "x".repeat(512 * 1024 + 1);
+    router = (url) => {
+        if (url === CONTENTS_URL) return new Response(JSON.stringify([{ name: "2026-10-09_fresh.md", type: "file" }]), { status: 200 });
+        if (url === rawUrl("website/blog/posts/2026-10-09_fresh.md")) return new Response(big, { status: 200, headers: { "content-length": "10" } });
+        return new Response("not here", { status: 404 });
+    };
+    assert.equal((await runBlogRefreshRound({ force: true })).ok, true); // fail-soft
+    assert.equal(getBlogFeed().error, "offline", "header said 10 bytes; the real 512KB+1 body still blew the limit");
+});
+
+test("#4906 P3 settleRoundImmune: a rejecting round never leaks an unhandledRejection", async () => {
+    let unhandled: unknown = undefined;
+    const onUn = (e: unknown) => { unhandled = e; };
+    process.on("unhandledRejection", onUn);
+    let settled = 0;
+    const gate = settleRoundImmune(Promise.reject(new Error("unexpected")), () => { settled++; });
+    await gate; // resolves despite the rejecting base — fire-and-forget safe
+    await new Promise((r) => setTimeout(r, 20));
+    process.off("unhandledRejection", onUn);
+    assert.equal(settled, 1, "onSettle ran exactly once");
+    assert.equal(unhandled, undefined, "no unhandledRejection escaped (Node >= 15 would crash)");
+    // Resolving bases settle too — the gate is direction-agnostic.
+    let settled2 = 0;
+    await settleRoundImmune(Promise.resolve(), () => { settled2++; });
+    assert.equal(settled2, 1);
+});
+
+test("#4906 P3 blogCacheStale boundary + neutral offline wording pins", () => {
+    assert.equal(blogCacheStale(0, 60 * 60 * 1000 - 1), false, "just under 1h: cached feed still served");
+    assert.equal(blogCacheStale(0, 60 * 60 * 1000), true, "at 1h: stale -> background re-pull (bl.sub cadence)");
+    assert.ok(MESSAGES["zh-CN"]["bl.offline"].includes("上次拉取未完成"), "zh wording no longer blames GitHub reachability");
+    assert.ok(MESSAGES["en"]["bl.offline"].startsWith("Last refresh did not finish"), "en wording no longer blames GitHub reachability");
 });

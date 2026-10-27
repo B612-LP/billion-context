@@ -4,7 +4,8 @@
  * every gate: dated/undated ordering, bilingual pairing, frontmatter titles,
  * XSS-escaped rendering, image rewrite vs drop (incl. traversal refs),
  * GFM tables, asset route (png allowed / md denied / traversal / encoding /
- * missing), malformed manifest degradation, absent-root empty feed, and the
+ * missing / sandbox+nosniff on every asset response #4958), malformed
+ * manifest degradation, absent-root empty feed, and the
  * real-tree probe finding the repository's website/blog/posts.
  */
 import { test, beforeEach, afterEach } from "node:test";
@@ -36,13 +37,12 @@ function buildFixture(): void {
     writeFileSync(join(pkgRoot, "outside-secret.yaml"), "nope");
     const posts = join(pkgRoot, "website", "blog", "posts");
     writeFileSync(join(posts, "2026-10-08_demo.md"),
-        "---\ntitle: \"Demo post\"\nexcerpt: \"EN excerpt.\"\n---\n\n## Body\n\nText with <script>alert(1)</script> inline.\n\n![shot](figures/shot.png)\n\n![vec](figures/shot.svg)\n\n![escape](../../outside-secret.yaml)\n");
+        "---\ntitle: \"Demo post\"\nexcerpt: \"EN excerpt.\"\n---\n\n## Body\n\nText with <script>alert(1)</script> inline.\n\n![shot](figures/shot.png)\n\n![escape](../../outside-secret.yaml)\n");
     writeFileSync(join(posts, "2026-10-08_demo.zh.md"),
         "---\ntitle_zh: \"演示文章\"\nexcerpt_zh: \"中文摘要。\"\n---\n\n## 正文\n\n中文内容。\n");
     writeFileSync(join(posts, "2026-10-09_new.md"), "# Undated-by-frontmatter post\n\nNewer content.\n");
     writeFileSync(join(posts, "notes.md"), "# Plain notes\n\nNo date anywhere.\n");
     writeFileSync(join(posts, "figures", "shot.png"), "POSTPNG");
-    writeFileSync(join(posts, "figures", "shot.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>");
     writeFileSync(join(pkgRoot, "website", "articles.json"), JSON.stringify({ articles: [
         { file: "paper/a.md", zh_file: "paper/b.md", slug: "alpha" },
         { file: "paper/missing.md" },
@@ -109,9 +109,6 @@ test("asset route: png allowed with exact bytes; md/traversal/encoding/missing a
     assert.equal(ok.status, 200);
     assert.match(String(ok.headers["content-type"]), /^image\/png/);
     assert.equal(ok.body, "PAPERPNG");
-    // #4958: every asset 200 carries the defensive header set.
-    assert.equal(ok.headers["content-security-policy"], "sandbox");
-    assert.equal(ok.headers["x-content-type-options"], "nosniff");
 
     for (const url of [
         "/__bili/blog-assets/outside-secret.yaml",
@@ -130,30 +127,35 @@ test("asset route: png allowed with exact bytes; md/traversal/encoding/missing a
     assert.equal(md.status, 404);
 });
 
-test("svg is inert content: dropped from rendering and 404 on the asset route (#4958)", () => {
-    const data = getBlogFeed();
-    const demo = data.items.find((i) => i.id === "demo")!;
-    assert.ok(!demo.html.includes(".svg"), "svg image ref drops out of the rendered html (any <img> for it would carry .svg)");
-    assert.ok(demo.html.includes("/__bili/blog-assets/website/blog/posts/figures/shot.png"), "inert formats keep rendering");
+test("asset responses pin sandbox CSP + nosniff on every path (#4958): remote overlay, disk fallback, 404", () => {
+    // Remote overlay: a GitHub-master .svg with an embedded <script> is served
+    // same-origin as image/svg+xml — the sandbox header is what keeps direct
+    // navigation from running that script on the panel origin.
+    const evilSvg = "<svg><script>alert(1)</script></svg>";
+    registerRemoteBlogFeed({ items: [], assets: new Map([["paper/figures/remote.svg", { buf: Buffer.from(evilSvg), type: "image/svg+xml" }]]) });
+    const overlay = fakeRes();
+    handleBlogAssetGet(overlay.res, "/__bili/blog-assets/paper/figures/remote.svg");
+    assert.equal(overlay.status, 200);
+    assert.equal(overlay.headers["content-security-policy"], "sandbox");
+    assert.equal(overlay.headers["x-content-type-options"], "nosniff");
+    assert.match(String(overlay.headers["content-type"]), /^image\/svg\+xml/);
+    assert.equal(overlay.body, evilSvg, "body bytes unchanged by the header fix");
 
-    // The file ships in the package but the extension gate refuses it.
-    const svg = fakeRes();
-    handleBlogAssetGet(svg.res, "/__bili/blog-assets/website/blog/posts/figures/shot.svg");
-    assert.equal(svg.status, 404);
-});
+    // On-disk fallback branch keeps the same pair with its bytes/type intact.
+    const disk = fakeRes();
+    handleBlogAssetGet(disk.res, "/__bili/blog-assets/paper/figures/p.png");
+    assert.equal(disk.status, 200);
+    assert.equal(disk.headers["content-security-policy"], "sandbox");
+    assert.equal(disk.headers["x-content-type-options"], "nosniff");
+    assert.match(String(disk.headers["content-type"]), /^image\/png/);
+    assert.equal(disk.body, "PAPERPNG");
 
-test("remote overlay asset 200 carries the same defensive header set as bundled (#4958)", () => {
-    registerRemoteBlogFeed({
-        items: [],
-        assets: new Map([["website/blog/posts/figures/remote.png", { buf: Buffer.from("REMOTEPNG"), type: "image/png" }]]),
-    });
-    const r = fakeRes();
-    handleBlogAssetGet(r.res, "/__bili/blog-assets/website/blog/posts/figures/remote.png");
-    assert.equal(r.status, 200);
-    assert.match(String(r.headers["content-type"]), /^image\/png/);
-    assert.equal(r.body, "REMOTEPNG");
-    assert.equal(r.headers["content-security-policy"], "sandbox");
-    assert.equal(r.headers["x-content-type-options"], "nosniff");
+    // 404s from the asset route carry the pair too — every response of the route.
+    const miss = fakeRes();
+    handleBlogAssetGet(miss.res, "/__bili/blog-assets/paper/figures/nope.png");
+    assert.equal(miss.status, 404);
+    assert.equal(miss.headers["content-security-policy"], "sandbox");
+    assert.equal(miss.headers["x-content-type-options"], "nosniff");
 });
 
 test("handleBlogGet answers 200 JSON always; broken manifest degrades to posts-only", () => {
@@ -167,6 +169,15 @@ test("handleBlogGet answers 200 JSON always; broken manifest degrades to posts-o
     _setBlogRootForTest(pkgRoot); // clears the cache
     const data = getBlogFeed();
     assert.ok(data.items.every((i) => i.kind === "post"));
+});
+
+test("the sandbox/nosniff pair stays scoped to the asset route — the blog feed JSON route does not gain it (#4958)", () => {
+    const feed = fakeRes();
+    handleBlogGet(feed.res);
+    assert.equal(feed.status, 200);
+    assert.equal(feed.headers["content-security-policy"], undefined);
+    assert.equal(feed.headers["x-content-type-options"], undefined);
+    assert.match(String(feed.headers["content-type"]), /^application\/json/);
 });
 
 test("a root without content degrades to an empty list instead of throwing", () => {
