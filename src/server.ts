@@ -97,10 +97,11 @@ import { getStore, setGlobalSessionCommitListener } from "./persist.js";
 import { log as loggerLog, configureLogger, getLogPath, closeLogger, isStreamWriteError, isBenignSocketRaceError, enterSessionContext, muteStderrLeg, onFileLegLive, logTimestamp } from "./logger.js";
 import { queryLogLines } from "./web/logs-query.js";
 import { configFile, defaultLogFile, stateDir } from "./paths.js";
-import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
+import { atomicWriteInstanceFile, clearProxyInstanceFile, classifySameLanePeer, entryScriptFingerprint, entryShape, findPresentUnverifiedSameLaneTwin, findSameLanePredecessor, findVerifiedSameLaneTwin, isPidAlive, listInstances, probePid, readProxyInstanceFile, registerInstanceAndWarn, sameInstanceShape, unregisterInstance, warnOnNewPeers, writeSpawnPortLog, type InstanceShape, type PidProbe, type ProxyInstanceFile, type RegistryEntry, type SameLanePeer } from "./instance.js";
 import { createServedMarkerWriter, reapStaleWriterMarkers, writerMarkerDir, type ServedMarkerWriter } from "./served-markers.js";
 import { recordSplitBrainContest } from "./storage/runtime-status.js";
 import { mayClobberPointer, probeOwnerInfo, resolvePortClaim } from "./port-owner.js";
+import { tcpConnectable } from "./liveness.js";
 import { hoistTrappedToolItems } from "./tool-pair-order.js";
 import { computeAnthropicMessageMarks, stampAnthropicSystemCacheControl, anthropicToolsCarryCacheControl } from "./loop/cache-control.js";
 import { reconcileSystemAnchor } from "./system-anchor.js";
@@ -640,8 +641,23 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         modelWindows: { ...LAUNCHER_MODEL_WINDOWS },
         modelMaxOutputs: { ...LAUNCHER_MODEL_MAX_OUTPUTS },
     };
+    const instances = listInstances();
+    /** Both pre-persistence twin exits below share this tail: createEngineContext
+     *  has not run yet, so its configureLogger call has not happened either —
+     *  open the file leg here (mirroring it) so the twin line lands in bili.log
+     *  like the late-path twin line, gate on opts.log like every other
+     *  startServer line, and drain the stream before exiting or the buffered
+     *  line can be lost with the process. */
+    const exitBeforePersistence = async (hint: string): Promise<never> => {
+        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
+        configureLogger(opts.logFile ?? defaultLogFile());
+        logMsg(opts, "error", listenLine);
+        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
+        await closeLogger();
+        process.exit(eaddrinuseExitCode("twin-collision"));
+    };
     const earlyTwin = await findVerifiedSameLaneTwin(
-        listInstances(),
+        instances,
         opts.port,
         launcherLane,
         ownFingerprint,
@@ -649,18 +665,27 @@ export async function startServer(opts: ProxyOptions): Promise<http.Server> {
         (origin) => probeOwnerInfo(origin),
     );
     if (earlyTwin !== undefined) {
-        const hint = ` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`;
-        const listenLine = `listen failed: EADDRINUSE listen EADDRINUSE: address already in use ${opts.host}:${opts.port}${hint}`;
-        // createEngineContext has not run yet, so its configureLogger call
-        // has not happened either — open the file leg here (mirroring it) so
-        // the adopt line lands in bili.log like the late-path twin line, gate
-        // on opts.log like every other startServer line, and drain the stream
-        // before exiting or the buffered line can be lost with the process.
-        configureLogger(opts.logFile ?? defaultLogFile());
-        logMsg(opts, "error", listenLine);
-        if (launchToken !== undefined) writeSpawnPortLog(opts.port, `${logTimestamp()} [error] [v=${VERSION}] ${listenLine}`);
-        await closeLogger();
-        process.exit(eaddrinuseExitCode("twin-collision"));
+        await exitBeforePersistence(` — port ${opts.port} is already served by a same-build bili instance (pid ${earlyTwin.pid}, lane ${launcherLane}) — exiting before persistence initialization instead of hopping: the duplicate loses and the serving instance keeps serving; the next launch will attach to it (#4341/#3044). A spawner reads this exit as an adopt signal and attaches to the serving instance itself (#3654).`);
+    }
+    // #4977: the verified path above only adopts an occupant that PROVES itself
+    // healthy. The complement case — same-build twin marker whose socket still
+    // accepts connections but whose health probe is silent (dying or
+    // event-loop-wedged, #3654) — used to fall through into persistence init
+    // and open index.db under the zombie before the listen failed EADDRINUSE
+    // (two-writer window #3923/#3959). Same outcome, decided earlier: once the
+    // bind proved the port busy, the late policy classified this exact registry
+    // evidence and fail-fast-exited with the identical code.
+    const presentTwin = await findPresentUnverifiedSameLaneTwin(
+        instances,
+        opts.port,
+        launcherLane,
+        ownFingerprint,
+        (entry) => sameInstanceShape(entryShape(entry), ownShape),
+        (origin) => probeOwnerInfo(origin),
+        (origin) => tcpConnectable(origin),
+    );
+    if (presentTwin !== undefined) {
+        await exitBeforePersistence(` — port ${opts.port} is still held by a same-build bili instance (pid ${presentTwin.pid}, lane ${launcherLane}) whose health probe is silent while its socket accepts connections: it is dying or event-loop-wedged (#3654), not serving — exiting before persistence initialization instead of opening index.db under it (#3923/#3959 two-writer window); the spawner reads this exit as an adopt signal and retries once the port frees (#4811/#4977).`);
     }
 
     const engine = await createEngineContext(opts);
