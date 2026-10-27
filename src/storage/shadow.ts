@@ -1224,8 +1224,39 @@ function warnTailGaps(id: string, view: { tailGaps?: number }): void {
     }
 }
 
+// #4986: the parity digest must compare CONTENTS, not key insertion order.
+// The two legs legitimately hold identical ref maps under different key
+// orders: the expect leg carries the kernel-mutated in-memory order (#4316
+// ledger-aligned byRef is rebuilt in ledger-seq order; rebuildRefIndex lays
+// byRef out in byRaw order) while the got leg rebuilds from stored rows in
+// ingest ord — finishPlan freezes the byRaw key order of the LAST full
+// ingest, so any later in-memory reorder diverges from it. Key order of
+// these lookup maps carries no contract meaning (identity is per-key
+// lookup, never position), so an order-only difference is ALWAYS a false
+// positive; sorting before hashing removes the whole class while keeping
+// every real divergence visible (key sets and values still compare). Same
+// philosophy as #3407's orderedBlockContents and #3113's sortObjectKeys
+// golden pins. shadowDigest is private to this module and both legs always
+// hash under one build, so no persisted digest or golden can depend on its
+// output — the normalization cannot break cross-version comparability.
+function orderInsensitive(value: unknown): unknown {
+    if (Array.isArray(value)) return value.map(orderInsensitive);
+    if (value instanceof Map) {
+        const out = new Map<unknown, unknown>();
+        for (const [k, v] of [...value.entries()].sort((a, b) => (String(a[0]) < String(b[0]) ? -1 : String(a[0]) > String(b[0]) ? 1 : 0))) out.set(k, orderInsensitive(v));
+        return out;
+    }
+    if (value instanceof Set) return new Set([...value.values()].sort((a, b) => (String(a) < String(b) ? -1 : String(a) > String(b) ? 1 : 0)).map(orderInsensitive));
+    if (value && typeof value === "object") {
+        const out: Record<string, unknown> = {};
+        for (const k of Object.keys(value as Record<string, unknown>).sort()) out[k] = orderInsensitive((value as Record<string, unknown>)[k]);
+        return out;
+    }
+    return value;
+}
+
 function shadowDigest(view: unknown): string {
-    return sha256(JSON.stringify(canonicalize(view)));
+    return sha256(JSON.stringify(canonicalize(orderInsensitive(view))));
 }
 
 // #3407: the parity digest must compare blockContents CONTENTS, not insertion order —
