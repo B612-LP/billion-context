@@ -451,7 +451,7 @@ export function peekRegistryPriceProfile(model: string | undefined, host?: strin
     return hit ? priceProfileFromRow(hit.row) : undefined;
 }
 
-export interface RegistryCostRow {
+interface RegistryCostRow {
     /** Catalog key that won the lookup ("provider/model-id") — display identity. */
     key: string;
     /** $/Mtok list price for plain (uncached) input tokens. */

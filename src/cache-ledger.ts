@@ -2004,7 +2004,7 @@ function stampedPriceProfile(session: Session): PriceProfile | undefined {
  *  those sessions stay token-denominated rather than guessing. Metadata is
  *  persisted user-editable JSON, so every field is re-validated on read,
  *  same discipline as stampedPriceProfile. */
-export interface PriceSourceStamp {
+interface PriceSourceStamp {
     kind: "config" | "registry";
     /** #2478 round 2: user-configured ABSOLUTE $/Mtok unit prices (costPerMtok
      *  config) — the stamped profile is already real money, so scale is 1 and
@@ -2052,7 +2052,7 @@ function stampedPriceSource(session: Session): PriceSourceStamp | undefined {
  *  source.absolute), the input anchor ($/Mtok) over ratio profiles.
  *  Returns undefined when the session cannot be priced (no source stamp, or a
  *  ratio profile without an input anchor) — callers keep the token display. */
-export interface PricedFoldSummary {
+interface PricedFoldSummary {
     source: PriceSourceStamp;
     /** μ$ per unit of the effective profile (1 = absolute, else input anchor $/Mtok). */
     scale: number;
