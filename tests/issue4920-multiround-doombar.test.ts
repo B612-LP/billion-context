@@ -281,5 +281,6 @@ test("unit #4920: noteFoldDrift/foldDriftOf round-trip and malformed-shape rejec
     assert.equal(bad("drift"), undefined);
     assert.equal(bad({ matched: "5", expected: 10, at: "t" }), undefined);
     assert.equal(bad({ matched: 5, expected: 10 }), undefined);
+    assert.equal(bad({ matched: 5, expected: 10, at: "2026-01-01T00:00:00Z" }), undefined, "at must be epoch ms");
     assert.equal(bad({ matched: 10, expected: 5, at: "t" }), undefined, "inverted counts are not drift");
 });
