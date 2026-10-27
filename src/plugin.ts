@@ -1028,8 +1028,12 @@ function comparableHistory(value: unknown): boolean {
     if (Array.isArray(value)) return value.every(comparableHistory);
     if (!value || typeof value !== "object") return false;
     const part = value as Record<string, unknown>;
-    if (part.type !== undefined && !["message", "text", "input_text", "output_text", "tool_use", "tool_result", "function_call", "function_call_output"].includes(String(part.type))) return false;
+    if (part.type !== undefined && !["message", "text", "input_text", "output_text", "thinking", "redacted_thinking", "tool_use", "tool_result", "function_call", "function_call_output"].includes(String(part.type))) return false;
     if (part.type === "tool_use" || part.type === "function_call") return true;
+    // #4266: thinking-family blocks project to a named reasoning message
+    // (anthropicToCore reads b.thinking / b.data), so they are comparable by
+    // view — the raw text lives in the `thinking` field, not `text`.
+    if (part.type === "thinking" || part.type === "redacted_thinking") return true;
     if (part.audio !== undefined && part.audio !== null) return false;
     if (part.content !== undefined) return comparableHistory(part.content);
     if (part.output !== undefined) return comparableHistory(part.output);
@@ -1157,7 +1161,12 @@ function sessionRevisionOf(session: Session): string {
 function forkSnapshot(session: Session) {
     const messages = session.pluginSnapshot;
     if (!messages) throw new Error(session.metadata.publicSnapshotCapped === true ? "raw snapshot exceeded the retention cap (BILI_PUBLIC_SNAPSHOT_CAP_BYTES); fork is refused rather than retaining an unbounded raw copy" : "raw snapshot unavailable; send a fresh plugin model request");
-    if (session.metadata.publicSnapshotTextComparable === false || messages.some((m) => (m.thinkingTokens ?? 0) > 0)) throw new Error("multimodal or opaque content cannot be compared by text");
+    // #4266 mechanism 1: thinking mass is no longer an opaque refusal. Wire thinking/
+    // redacted_thinking blocks project to a named reasoning message (anthropicToCore), and
+    // host-projected thinkingTokens is a numeric metering field (cache-ledger GENERATED_METERING_FIELDS)
+    // that forkMessageIdentityHash already digests — both are comparable-by-view, so only genuinely
+    // uncomparable content (images, audio, publicSnapshotTextComparable === false) still refuses.
+    if (session.metadata.publicSnapshotTextComparable === false) throw new Error("multimodal or opaque content cannot be compared by text");
     const store = contentStoreOf(session);
     const expectedStoredRefs = session.metadata.publicSnapshotStoredRefs;
     if (Array.isArray(expectedStoredRefs) && expectedStoredRefs.some((ref) => typeof ref !== "string" || !store.byRef[ref])) throw new Error("CCR original index unavailable");
