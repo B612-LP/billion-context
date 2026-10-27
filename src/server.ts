@@ -3533,7 +3533,7 @@ export async function preflightCompressIfNeeded(
     // #4974: baselineFloor <= 0 has two causes — "no usage baseline at all"
     // (handled by unknownBaseline above) and "a baseline exists but carries no
     // current-route evidence". The second can itself be stale-small: an
-    // estimate-grade value measured on a ~10KB side request while the current
+    // estimate-grade value measured on a ~10KB auxiliary call while the current
     // payload is multi-MB. Such a baseline cannot describe THIS payload — the
     // forward-once bet below would price the body against it and die in the
     // doomed byte-gate with the refusal pinned (#4974's livelock), while
