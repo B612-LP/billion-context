@@ -393,6 +393,17 @@ export class UnifiedStore {
             const started = Date.now();
             let verdict: string;
             try {
+                // #4940: announce the phase BEFORE the scan starts — this is
+                // the only integrity path that blocks startup, and while it
+                // runs the child's log stays empty, so a slow scan read as a
+                // hung child to the launcher (a 5 GB cold scan cost ~60 s and
+                // outran the 60 s spawn budget on pre-#4609 releases).
+                const pageCountRow = db.prepare("PRAGMA page_count").get() as { page_count?: unknown } | null | undefined;
+                const pageSizeRow = db.prepare("PRAGMA page_size").get() as { page_size?: unknown } | null | undefined;
+                const pages = typeof pageCountRow?.page_count === "number" ? pageCountRow.page_count : null;
+                const pageSize = typeof pageSizeRow?.page_size === "number" ? pageSizeRow.page_size : null;
+                const sizeSummary = pages !== null && pageSize !== null ? ` (${(pages * pageSize / (1024 * 1024)).toFixed(1)} MiB, ${pages} pages)` : "";
+                loggerLog("info", `[storage] integrity quick_check started for ${path}${sizeSummary} — synchronous pre-migration scan; startup stays blocked until it finishes (#4940)`);
                 const rows = db.prepare("PRAGMA quick_check").all() as Array<{ quick_check?: unknown }>;
                 verdict = rows.map((row) => String(row.quick_check ?? "")).join(" ").trim();
             } catch (err) {

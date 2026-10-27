@@ -12,6 +12,8 @@
  *      the cache, and the counter reaches 1.
  *   5. BILI_STORAGE_QUICK_CHECK=0: no check, no cache IO.
  *   6. corrupt small store still throws synchronously (cache or no cache).
+ *   7. sync path announces its phase before scanning (#4940); the opt-out
+ *      stays silent.
  */
 import test from "node:test";
 import assert from "node:assert/strict";
@@ -27,6 +29,7 @@ import {
     setIntegritySyncThresholdForTests,
     backgroundIntegrityInflightForTests,
 } from "../src/storage/integrity-check.js";
+import { setLogCapture } from "../src/logger.js";
 
 function tmpDir(): string {
     return mkdtempSync(join(tmpdir(), "bili-integrity-"));
@@ -150,6 +153,30 @@ test("a corrupt small store still fails open synchronously and writes no ok-cach
         const cache = readIntegrityCache(dbPath);
         assert.ok(cache === null || cache.ok === false, "no ok verdict cached for a corrupt store");
     } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("the sync check announces its phase before scanning, and the opt-out stays silent (#4940)", () => {
+    resetIntegrityCheckStateForTests();
+    setIntegritySyncThresholdForTests(null);
+    const dir = tmpDir();
+    const lines: string[] = [];
+    setLogCapture((_level, msg) => lines.push(msg));
+    const prev = process.env.BILI_STORAGE_QUICK_CHECK;
+    try {
+        const dbPath = join(dir, "index.db");
+        UnifiedStore.open(dbPath).close();
+        const announces = lines.filter((m) => m.includes("integrity quick_check started"));
+        assert.equal(announces.length, 1, `one pre-scan announcement; got ${JSON.stringify(lines)}`);
+        assert.match(announces[0], /\(\d+(\.\d+)? MiB, \d+ pages\) — synchronous pre-migration scan/);
+        process.env.BILI_STORAGE_QUICK_CHECK = "0";
+        UnifiedStore.open(dbPath).close();
+        assert.equal(lines.filter((m) => m.includes("integrity quick_check started")).length, 1, "the opt-out added no announcement");
+    } finally {
+        setLogCapture(null);
+        if (prev === undefined) delete process.env.BILI_STORAGE_QUICK_CHECK;
+        else process.env.BILI_STORAGE_QUICK_CHECK = prev;
         rmSync(dir, { recursive: true, force: true });
     }
 });
