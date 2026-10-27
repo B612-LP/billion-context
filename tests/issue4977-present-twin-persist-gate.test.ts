@@ -222,7 +222,7 @@ test("real CLI: silent twin exits before unified SQLite initialization", { timeo
     const instanceId = "zombie-twin-4977";
     // The zombie's exact #3654 signature: accepts TCP but never answers HTTP —
     // socket alive, health silent (dying or event-loop-wedged).
-    const zombie = net.createServer((sock) => { sock.resume(); });
+    const zombie = net.createServer((sock) => { sock.on("error", () => {}); sock.resume(); });
     await new Promise<void>((resolve, reject) => {
         zombie.once("error", reject);
         zombie.listen(0, "127.0.0.1", resolve);
