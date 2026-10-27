@@ -321,6 +321,10 @@ This index is generated from `website/config-reference/*.yaml` — edit the seed
 | `compress.priceProfile.w` | number | unset (registry) | — | Write-price ratio relative to the input price. |
 | `compress.priceProfile.r` | number | unset (registry) | — | Cache-read price ratio relative to the input price. |
 | `compress.priceProfile.q` | number | unset (registry) | — | Output price ratio relative to the input price. |
+| `compress.priceProfile.inputPerMtok` | number | unset (registry) | — | Absolute input list price in $/Mtok; presence switches the profile to absolute mode (wins over w/r/q). |
+| `compress.priceProfile.outputPerMtok` | number | unset (registry) | — | Absolute output list price in $/Mtok (absolute mode). |
+| `compress.priceProfile.cacheReadPerMtok` | number | unset (registry) | — | Absolute cache-read list price in $/Mtok (absolute mode). |
+| `compress.priceProfile.cacheWritePerMtok` | number | unset (registry) | — | Absolute cache-write list price in $/Mtok (absolute mode). |
 | `compress.reasoning.drop` | boolean | true | — | Drop finished-round reasoning runs longer than the threshold. |
 | `compress.reasoning.threshold` | number | 2048 | — | Character threshold above which finished reasoning runs are dropped. |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | Deprecated alias of minCompressRangeChars (accepted, mapped onto it). _(deprecated)_ |

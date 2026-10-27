@@ -321,6 +321,10 @@
 | `compress.priceProfile.w` | number | unset (registry) | — | 写入价相对输入价的比率。 |
 | `compress.priceProfile.r` | number | unset (registry) | — | 缓存读价相对输入价的比率。 |
 | `compress.priceProfile.q` | number | unset (registry) | — | 输出价相对输入价的比率。 |
+| `compress.priceProfile.inputPerMtok` | number | unset (registry) | — | 绝对输入列表价（$/Mtok）；存在即切换到绝对价模式（整体胜出 w/r/q）。 |
+| `compress.priceProfile.outputPerMtok` | number | unset (registry) | — | 绝对输出列表价（$/Mtok，绝对价模式）。 |
+| `compress.priceProfile.cacheReadPerMtok` | number | unset (registry) | — | 绝对缓存读列表价（$/Mtok，绝对价模式）。 |
+| `compress.priceProfile.cacheWritePerMtok` | number | unset (registry) | — | 绝对缓存写列表价（$/Mtok，绝对价模式）。 |
 | `compress.reasoning.drop` | boolean | true | — | 丢弃超过阈值的已结束轮次推理块。 |
 | `compress.reasoning.threshold` | number | 2048 | — | 已结束推理块被丢弃的字符阈值。 |
 | `compress.minCompressRange` | number | same as minCompressRangeChars | — | minCompressRangeChars 的弃用别名（接受，映射到后者）。 _(已弃用)_ |
