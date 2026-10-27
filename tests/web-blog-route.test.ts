@@ -126,16 +126,16 @@ test("default and other hashes do NOT activate the blog view or hit the blog end
 // dots, ...), and the list links them via encodeURIComponent. The route() regex
 // must accept what the index emits, or every such click falls through to
 // overview and the detail page is permanently unreachable.
-const WEIRD_IDS = ["\u6f14\u793a\u6587\u7ae0", "v1.2-notes"];
+const WEIRD_IDS = ["\u6f14\u793a\u6587\u7ae0", "v1.2-notes", "v1.2\u00b7\u538b\u7f29\u4e0a\u7ebf"];
 const FEED_WEIRD = { items: WEIRD_IDS.map((id, i) => ({
     id,
-    kind: i === 0 ? "post" : "article",
+    kind: "post",
     date: "2026-10-08",
     title: "Title " + id,
-    titleZh: i === 0 ? "\u6f14\u793a" : "",
+    titleZh: "",
     excerpt: "",
     html: "<p>body-" + i + "</p>",
-    htmlZh: i === 0 ? "<p>zh-body-0</p>" : "",
+    htmlZh: "",
 })) };
 
 test("#/blog/<slug> accepts the encoded hrefs the index emits for non-ASCII and dotted ids (#4957)", async () => {
@@ -152,7 +152,16 @@ test("#/blog/<slug> accepts the encoded hrefs the index emits for non-ASCII and 
         assert.ok(r.els.get("page-blog") && !r.els.get("page-blog")!.hidden, `${WEIRD_IDS[i]}: blog section shown (no overview fallback)`);
         assert.ok(r.els.get("page-overview")!.hidden, `${WEIRD_IDS[i]}: overview hidden`);
         const bl = r.els.get("bl-list")!;
-        assert.ok(bl.innerHTML.includes(i === 0 ? "zh-body-0" : "body-1"), `${WEIRD_IDS[i]}: the matching article body rendered`);
+        assert.ok(bl.innerHTML.includes("body-" + i), `${WEIRD_IDS[i]}: the matching article body rendered`);
         assert.ok(bl.innerHTML.includes('<a href="#/blog" class="bl-back">'), `${WEIRD_IDS[i]}: back link present`);
     }
+});
+
+test("unknown encoded non-ASCII blog id degrades to the back-link card without a crash (#4957)", async () => {
+    const hash = "#/blog/" + encodeURIComponent("\u4e0d\u5b58\u5728\u7684\u6587\u7ae0");
+    const r = await runClient(hash, FEED_WEIRD);
+    assert.equal(r.unhandled.length, 0, `${hash} raised unhandled rejection`);
+    const list = r.els.get("bl-list")!;
+    assert.ok(list.innerHTML.includes('<a href="#/blog" class="bl-back">'), "back link present for an unknown encoded id");
+    assert.ok(!list.innerHTML.includes("post-body"), "no article body for an unknown id");
 });
