@@ -64,12 +64,26 @@ test("#4889 salvageCompressArgs: strict JSON still verbatim byte-identical (#103
     assert.equal(s.out, valid);
 });
 
-test("#4889 repairCompressArgs: wraps bad shape A into strict JSON", () => {
+test("#4889 repairCompressArgs: wraps bad shape A into strict JSON with range count", () => {
     const out = repairCompressArgs(INCIDENT_C, "call_ext");
     assert.ok(out !== null);
-    const obj = JSON.parse(out!) as { content: unknown };
+    assert.equal(out!.ranges, 1);
+    const obj = JSON.parse(out!.json) as { content: unknown };
     assert.equal(typeof obj.content, "string");
-    assert.ok(parseCompressArgs(out!, { callId: "verify" }).ranges.length >= 1);
+    assert.ok(parseCompressArgs(out!.json, { callId: "verify" }).ranges.length >= 1);
+});
+
+test("#4889 repairCompressArgs: reports every recovered range (N > 1)", () => {
+    const multi = [
+        '{"content": m00001\u2013m00010 第一段',
+        "摘要一",
+        'm00020\u2013m00030 第二段',
+        "摘要二",
+        "}",
+    ].join("\n");
+    const out = repairCompressArgs(multi, "call_ext_multi");
+    assert.ok(out !== null);
+    assert.equal(out!.ranges, 2);
 });
 
 test("#4889 repairCompressArgs: strict JSON passes through as null", () => {

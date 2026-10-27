@@ -9,10 +9,17 @@
 // #1039 boundary inherited from the ladder: strict-JSON input returns null
 // (leave it byte-identical), unrecoverable input returns null too (the host
 // rejects it as today); non-null is always strict JSON ready to parse.
+// `ranges` = how many compress ranges the rescue recovered, so gateways can
+// log how much was salvaged per repair (#4891 gateway feedback).
 
 import { salvageCompressArgs } from "./plugin-compress-salvage.js";
 
-export function repairCompressArgs(raw: string, callId?: string): string | null {
+export interface RepairCompressArgsResult {
+    json: string;   // strict JSON, ready for the host's single JSON.parse
+    ranges: number; // compress ranges recovered by the rescue
+}
+
+export function repairCompressArgs(raw: string, callId?: string): RepairCompressArgsResult | null {
     const s = salvageCompressArgs(raw, callId ?? "external-salvage");
-    return s.action === "canonicalized" || s.action === "wrapped" ? s.out : null;
+    return s.action === "canonicalized" || s.action === "wrapped" ? { json: s.out, ranges: s.ranges } : null;
 }
