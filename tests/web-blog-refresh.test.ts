@@ -71,13 +71,18 @@ function installGithubRouter(): void {
             case rawUrl("website/blog/posts/2026-10-08_demo.zh.md"):
                 return new Response("---\ntitle_zh: \"演示（远端更新）\"\nexcerpt_zh: \"中文远端\"\n---\n\n中文远端正文。\n", { status: 200 });
             case rawUrl("website/blog/posts/2026-10-09_fresh.md"):
-                return new Response("# Brand new post\n\nfresh text\n\n![ok](figures/good.png)\n\n![gone](figures/missing.png)\n", { status: 200 });
+                return new Response("# Brand new post\n\nfresh text\n\n![ok](figures/good.png)\n\n![gone](figures/missing.png)\n\n![vec](figures/evil.svg)\n", { status: 200 });
             case rawUrl("website/blog/posts/figures/r.png"):
                 return new Response(REMOTE_PNG, { status: 200 });
             case rawUrl("website/blog/posts/figures/good.png"):
                 return new Response(GOOD_PNG, { status: 200 });
             case rawUrl("website/blog/posts/figures/missing.png"):
                 return new Response("nope", { status: 404 });
+            case rawUrl("website/blog/posts/figures/evil.svg"):
+                // 200 ON PURPOSE: if the round ever fetches it, the hits[]
+                // assertion below fails — the gate must sit at target
+                // collection, not at error handling (#4958).
+                return new Response("<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>", { status: 200 });
             default:
                 return new Response("not here", { status: 404 }); // e.g. articles.json absent ⇒ posts-only
         }
@@ -156,6 +161,16 @@ test("image 404 during download is churn: its reference is dropped, the round st
     const fresh = getBlogFeed().items.find((i) => i.id === "fresh");
     assert.match(fresh?.html ?? "", /good\.png/);
     assert.doesNotMatch(fresh?.html ?? "", /missing\.png/);
+});
+
+test("svg references are never downloaded or cached by a refresh round (#4958)", async () => {
+    installGithubRouter();
+    const out = await runBlogRefreshRound({ force: true });
+    assert.equal(out.ok, true);
+    assert.ok(!hits.some((u) => u.includes("evil.svg")), `round fetched the svg: ${hits.join(", ")}`);
+    const fresh = getBlogFeed().items.find((i) => i.id === "fresh");
+    assert.doesNotMatch(fresh?.html ?? "", /evil\.svg/);
+    assert.equal(getRemoteBlogAsset("website/blog/posts/figures/evil.svg"), undefined);
 });
 
 test("failed round keeps the last good overlay and records an offline marker (nothing throws)", async () => {
