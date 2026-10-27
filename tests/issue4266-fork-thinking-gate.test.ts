@@ -10,8 +10,12 @@
 // gone. Pins both directions (#3617): thinking parents fork (snapshot 200,
 // fork 201, grandchild fork 201, child follow-up round-trip 200, stamped
 // thinkingTokens cells fork too), responses-wire typed reasoning items fork
-// too, while genuinely uncomparable content (image blocks) still refuses
-// with SNAPSHOT_UNAVAILABLE.
+// too, while genuinely uncomparable content (image blocks, payload-less
+// thinking blocks) still refuses with SNAPSHOT_UNAVAILABLE. Fork identity
+// itself pins both sides of the metering/signature split: a stamped
+// signature-only cell passes the child's first-request prefix gate
+// (one-sided thinkingTokens must not read as drift), while a rotated
+// signature under an unchanged id DOES read as hash-drift-under-same-id.
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -23,7 +27,7 @@ import { join } from "node:path";
 import { defaultConfig } from "acp-kernel";
 import { startServer } from "../src/server.ts";
 import type { ProxyOptions } from "../src/config.ts";
-import { _resetPluginStateForTest, resolveConversation } from "../src/plugin.ts";
+import { _resetPluginStateForTest, publicForkInputCheck, resolveConversation } from "../src/plugin.ts";
 import { _resetSessionsForTest } from "../src/session.ts";
 import { _setForTest } from "../src/registry.ts";
 import { closeServers } from "./server-close-guard.ts";
@@ -178,5 +182,51 @@ test("responses-wire typed reasoning items no longer refuse the fork (#4589 resi
         assert.equal(fork.status, 201, JSON.stringify(fork.body));
         const childSession = resolveConversation("child4").session!;
         assert.ok(childSession.pluginSnapshot!.some((m) => m.contentType === "reasoning"), "the child inherits the parent's reasoning message");
+    } finally { await h.close(); }
+});
+
+test("stamped signature-only thinking passes the child's first-request prefix gate; a rotated signature reads as drift", { timeout: 60_000 }, async () => {
+    const h = await harness();
+    try {
+        const shapeB = () => [
+            { role: "user", content: "open task ".repeat(50) },
+            { role: "assistant", content: [{ type: "thinking", signature: "sig-only-shape-b-4266" }] },
+            { role: "user", content: "next step" },
+        ];
+        // Two requests so the provider usage report exists before mass projection stamps.
+        // Unique ids: the unified store outlives individual harnesses in-process, and
+        // earlier tests in this file already registered "child".
+        await h.sendModel("parent-sigb", shapeB().slice(0, 2));
+        await h.sendModel("parent-sigb", shapeB());
+        const parentSession = resolveConversation("parent-sigb").session!;
+        const reasoningCells = parentSession.pluginSnapshot!.filter((m) => m.contentType === "reasoning");
+        assert.ok(reasoningCells.length > 0, "the signature-only block must ride the snapshot as a reasoning message");
+        assert.ok(reasoningCells.every((m) => typeof m.thinkingTokens === "number" && m.thinkingTokens > 0), "mass projection must have stamped the signature-only cell — precondition for the spurious-drift bug");
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent-sigb");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "parent-sigb", "child-sigb"));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const childSession = resolveConversation("child-sigb").session!;
+        // The child's first request replays the inherited prefix verbatim plus its own turn.
+        const firstRequest = { model: "claude-test", max_tokens: 1024, stream: false, messages: [...shapeB(), { role: "user", content: "child first turn" }] };
+        assert.deepEqual(publicForkInputCheck(childSession, "anthropic", firstRequest), { ok: true }, "one-sided metering mass must not read as identity drift");
+        const rotated = structuredClone(firstRequest);
+        for (const block of (rotated.messages[1] as { content: { type: string; signature?: string }[] }).content) if (block.type === "thinking") block.signature = "sig-rotated-4266";
+        const verdict = publicForkInputCheck(childSession, "anthropic", rotated);
+        assert.equal(verdict.ok, false, JSON.stringify(verdict));
+        if (!verdict.ok) assert.match(verdict.reason, /hash-drift-under-same-id/, verdict.reason);
+    } finally { await h.close(); }
+});
+
+test("payload-less thinking block keeps the session non-comparable (fail-closed)", { timeout: 60_000 }, async () => {
+    const h = await harness();
+    try {
+        await h.sendModel("parent", [
+            { role: "user", content: "first original ".repeat(50) },
+            { role: "assistant", content: [{ type: "thinking" }, { type: "text", text: "visible answer ".repeat(50) }] },
+        ]);
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 409, JSON.stringify(snapshot.body));
+        assert.equal(snapshot.body.code, "SNAPSHOT_UNAVAILABLE");
     } finally { await h.close(); }
 });
