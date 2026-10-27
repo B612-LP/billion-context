@@ -181,7 +181,7 @@ export const CODEX_NATIVE_CHECKPOINT_TYPE = "compaction";
  *  are bili's own forged blobs, already handled by the echo-replace path above.
  *  Malformed shapes (missing / non-string / empty encrypted_content) never
  *  match; they are ignored, never fatal. */
-export function isNativeCodexCheckpointItem(item: unknown): boolean {
+function isNativeCodexCheckpointItem(item: unknown): boolean {
     const it = item as { type?: unknown; encrypted_content?: unknown } | null;
     if (!it || typeof it !== "object" || it.type !== CODEX_NATIVE_CHECKPOINT_TYPE) return false;
     if (isBiliCompactionItem(it)) return false;
