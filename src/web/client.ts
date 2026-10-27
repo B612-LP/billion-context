@@ -4320,7 +4320,10 @@ if (d.keepalive) kv(parts, t("det.keepalive"), d.keepalive.tierLabel + " · " + 
             if (name === "logs" && hq) applyLogFilter(hq);
         } else {
             const ses = hash.match(new RegExp("^#/sessions(?:/(.+))?$")) || hash.match(new RegExp("^#/session/(.+)$"));
-            const blg = hash.match(new RegExp("^#/blog/([A-Za-z0-9_-]+)$"));
+            // #4957: slugs keep arbitrary filename chars and the index links them
+            // encodeURIComponent'd — accept anything, like the sessions route;
+            // loadBlog exact-matches the decoded id and degrades to not-found.
+            const blg = hash.match(new RegExp("^#/blog/(.+)$"));
             if (ses) {
                 name = "sessions";
                 if (ses[1]) detailId = decodeURIComponent(ses[1]);

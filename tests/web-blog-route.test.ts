@@ -36,7 +36,7 @@ const mkHarnessEl = (): HarnessEl => ({
 
 const FEED = { items: [{ id: "demo", kind: "post", date: "2026-10-08", title: "Demo post", titleZh: "演示", excerpt: "ex", html: "<p>hi</p>", htmlZh: "<p>你好</p>" }] };
 
-async function runClient(hash: string): Promise<{ els: Map<string, HarnessEl>; blogHits: number; unhandled: unknown[] }> {
+async function runClient(hash: string, feed: unknown = FEED): Promise<{ els: Map<string, HarnessEl>; blogHits: number; unhandled: unknown[] }> {
     const unhandled: unknown[] = [];
     const onRej = (r: unknown) => unhandled.push(r);
     process.on("unhandledRejection", onRej);
@@ -62,7 +62,7 @@ async function runClient(hash: string): Promise<{ els: Map<string, HarnessEl>; b
             fetch: async (url: string | URL | Request) => {
                 if (String(url).endsWith("/blog")) {
                     blogHits += 1;
-                    return { ok: true, status: 200, json: async () => FEED };
+                    return { ok: true, status: 200, json: async () => feed };
                 }
                 return { ok: true, status: 200, json: async () => ({}) };
             },
@@ -119,5 +119,40 @@ test("default and other hashes do NOT activate the blog view or hit the blog end
         assert.equal(r.unhandled.length, 0, `${hash} raised unhandled rejection`);
         assert.equal(r.blogHits, 0, `${hash} must not fetch the blog feed`);
         assert.ok(r.els.get("page-blog")!.hidden, `${hash} keeps the blog section hidden`);
+    }
+});
+
+// #4957: ids keep arbitrary filename characters (blogfeed.ts slug — Chinese,
+// dots, ...), and the list links them via encodeURIComponent. The route() regex
+// must accept what the index emits, or every such click falls through to
+// overview and the detail page is permanently unreachable.
+const WEIRD_IDS = ["\u6f14\u793a\u6587\u7ae0", "v1.2-notes"];
+const FEED_WEIRD = { items: WEIRD_IDS.map((id, i) => ({
+    id,
+    kind: i === 0 ? "post" : "article",
+    date: "2026-10-08",
+    title: "Title " + id,
+    titleZh: i === 0 ? "\u6f14\u793a" : "",
+    excerpt: "",
+    html: "<p>body-" + i + "</p>",
+    htmlZh: i === 0 ? "<p>zh-body-0</p>" : "",
+})) };
+
+test("#/blog/<slug> accepts the encoded hrefs the index emits for non-ASCII and dotted ids (#4957)", async () => {
+    const idx = await runClient("#/blog", FEED_WEIRD);
+    assert.equal(idx.unhandled.length, 0, "index raised unhandled rejection");
+    const list = idx.els.get("bl-list")!;
+    for (const id of WEIRD_IDS) {
+        assert.ok(list.innerHTML.includes('href="#/blog/' + encodeURIComponent(id) + '"'), `index links ${id} via its encoded href`);
+    }
+    for (let i = 0; i < WEIRD_IDS.length; i++) {
+        // the exact hash a card click puts into location.hash
+        const r = await runClient("#/blog/" + encodeURIComponent(WEIRD_IDS[i]), FEED_WEIRD);
+        assert.equal(r.unhandled.length, 0, `${WEIRD_IDS[i]}: raised unhandled rejection`);
+        assert.ok(r.els.get("page-blog") && !r.els.get("page-blog")!.hidden, `${WEIRD_IDS[i]}: blog section shown (no overview fallback)`);
+        assert.ok(r.els.get("page-overview")!.hidden, `${WEIRD_IDS[i]}: overview hidden`);
+        const bl = r.els.get("bl-list")!;
+        assert.ok(bl.innerHTML.includes(i === 0 ? "zh-body-0" : "body-1"), `${WEIRD_IDS[i]}: the matching article body rendered`);
+        assert.ok(bl.innerHTML.includes('<a href="#/blog" class="bl-back">'), `${WEIRD_IDS[i]}: back link present`);
     }
 });
