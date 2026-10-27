@@ -9,8 +9,9 @@
 // metering field forkMessageIdentityHash already digests), so the gate is
 // gone. Pins both directions (#3617): thinking parents fork (snapshot 200,
 // fork 201, grandchild fork 201, child follow-up round-trip 200, stamped
-// thinkingTokens cells fork too), while genuinely uncomparable content
-// (image blocks) still refuses with SNAPSHOT_UNAVAILABLE.
+// thinkingTokens cells fork too), responses-wire typed reasoning items fork
+// too, while genuinely uncomparable content (image blocks) still refuses
+// with SNAPSHOT_UNAVAILABLE.
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
@@ -62,6 +63,10 @@ async function harness() {
         req.on("end", () => {
             void chunks;
             res.writeHead(200, { "content-type": "application/json" });
+            if (req.url?.endsWith("/v1/responses")) {
+                res.end(JSON.stringify({ id: "resp_1", object: "response", status: "completed", output: [{ type: "message", role: "assistant", content: [{ type: "output_text", text: "answer" }] }], usage: { input_tokens: 10000, output_tokens: 10 } }));
+                return;
+            }
             res.end(JSON.stringify({ id: "msg_test", role: "assistant", content: [{ type: "text", text: "answer" }], usage: { input_tokens: 10000, output_tokens: 10 } }));
         });
     });
@@ -84,7 +89,12 @@ async function harness() {
         const text = await response.text();
         assert.equal(response.status, 200, text);
     };
-    return { request, sendModel, origin, upstreamUrl, close: async () => { await closeServers([proxy, upstream], "issue4266 harness"); } };
+    const sendResponsesModel = async (conversationId: string, input: unknown[]) => {
+        const response = await fetch(`${origin}/bili/${upstreamUrl}/v1/responses`, { method: "POST", headers: { "content-type": "application/json", "x-bili-plugin": "test", "x-bili-plugin-conversation": conversationId }, body: JSON.stringify({ model: "claude-test", max_output_tokens: 1024, input }) });
+        const text = await response.text();
+        assert.equal(response.status, 200, text);
+    };
+    return { request, sendModel, sendResponsesModel, origin, upstreamUrl, close: async () => { await closeServers([proxy, upstream], "issue4266 harness"); } };
 }
 
 function forkRequest(snapshot: SnapshotBody, parent: string, child: string, count = 3) {
@@ -149,5 +159,24 @@ test("genuinely uncomparable content still refuses: image blocks stay SNAPSHOT_U
         assert.equal(fork.status, 409);
         assert.equal(fork.body.status, "unavailable");
         assert.equal(resolveConversation("child3").session, undefined, "no child may leak out of a refused fork");
+    } finally { await h.close(); }
+});
+
+test("responses-wire typed reasoning items no longer refuse the fork (#4589 residual)", { timeout: 60_000 }, async () => {
+    const h = await harness();
+    try {
+        await h.sendResponsesModel("parent", [
+            { type: "message", role: "user", content: [{ type: "input_text", text: "first original ".repeat(250) }] },
+            { type: "reasoning", id: "rs_1", content: [{ type: "reasoning_text", text: "chain of thought ".repeat(200) }] },
+            { type: "message", role: "assistant", content: [{ type: "output_text", text: "visible answer ".repeat(120) }] },
+            { type: "message", role: "user", content: [{ type: "input_text", text: "tail original" }] },
+        ]);
+        const snapshot = await h.request("/__bili/plugin/snapshot?conversationId=parent");
+        assert.equal(snapshot.status, 200, JSON.stringify(snapshot.body));
+        assert.ok(snapshot.body.messages.some((m) => m.contentType === "reasoning"), "the reasoning item must ride the snapshot as a reasoning message");
+        const fork = await h.request("/__bili/plugin/fork", forkRequest(snapshot.body, "parent", "child4"));
+        assert.equal(fork.status, 201, JSON.stringify(fork.body));
+        const childSession = resolveConversation("child4").session!;
+        assert.ok(childSession.pluginSnapshot!.some((m) => m.contentType === "reasoning"), "the child inherits the parent's reasoning message");
     } finally { await h.close(); }
 });

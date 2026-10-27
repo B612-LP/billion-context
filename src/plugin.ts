@@ -1044,12 +1044,14 @@ function comparableHistory(value: unknown): boolean {
     if (Array.isArray(value)) return value.every(comparableHistory);
     if (!value || typeof value !== "object") return false;
     const part = value as Record<string, unknown>;
-    if (part.type !== undefined && !["message", "text", "input_text", "output_text", "thinking", "redacted_thinking", "tool_use", "tool_result", "function_call", "function_call_output"].includes(String(part.type))) return false;
+    if (part.type !== undefined && !["message", "text", "input_text", "output_text", "thinking", "redacted_thinking", "reasoning", "tool_use", "tool_result", "function_call", "function_call_output"].includes(String(part.type))) return false;
     if (part.type === "tool_use" || part.type === "function_call") return true;
-    // #4266: thinking-family blocks project to a named reasoning message
-    // (anthropicToCore reads b.thinking / b.data), so they are comparable by
-    // view — the raw text lives in the `thinking` field, not `text`.
-    if (part.type === "thinking" || part.type === "redacted_thinking") return true;
+    // #4266: thinking-family blocks project to a named reasoning message and
+    // every wire hashes their bytes into that message's text — anthropicToCore
+    // reads b.thinking, openaiToCore carries reasoning_content, responsesToCore
+    // takes reasoning-item content (or a canonical opaque seed when only
+    // encrypted content is present) — so they are comparable by view.
+    if (part.type === "thinking" || part.type === "redacted_thinking" || part.type === "reasoning") return true;
     if (part.audio !== undefined && part.audio !== null) return false;
     if (part.content !== undefined) return comparableHistory(part.content);
     if (part.output !== undefined) return comparableHistory(part.output);
