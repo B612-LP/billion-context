@@ -5,7 +5,8 @@
  * deleted-on-master drops out / curated articles stay bundled), access-driven
  * throttle (one round per window, force bypasses, failures throttled too),
  * fail-soft paths (network reject, HTTP 500 listing, non-array payload, empty
- * listing = content anomaly, per-file failure keeps the bundled twin), remote
+ * listing = content anomaly, over-cap listing = anomaly not truncation,
+ * per-file failure keeps the bundled twin), remote
  * image rewrite (relative → raw host, traversal drop, absolute passthrough),
  * malformed listing rows skipped individually, budget overrun aborting the
  * whole refresh so no partial set becomes authoritative, and
@@ -192,6 +193,18 @@ test("listing HTTP 500, non-array payload and empty listing all fail soft to bun
     data = await getLiveBlogFeed();
     assert.equal(data.error, "offline", "empty listing is a content anomaly, not truth");
     assert.equal(data.items.length, 3, "bundled posts survive an empty master listing");
+});
+
+test("a listing over the post cap fails soft — truncation would read as deletions on master", async () => {
+    const rows = Array.from({ length: 51 }, (_, i) => ({
+        type: "file",
+        name: `post-${String(i).padStart(2, "0")}.md`,
+        download_url: rawUrl(`post-${String(i).padStart(2, "0")}.md`),
+    }));
+    globalThis.fetch = (() => Promise.resolve(jsonResponse(rows))) as typeof fetch;
+    const data = await getLiveBlogFeed();
+    assert.equal(data.error, "offline", "over-cap is an anomaly, not a truth to truncate");
+    assert.deepEqual(data.items.map((i) => i.id), ["demo", "gone", "alpha"], "bundled feed intact");
 });
 
 test("per-file failure keeps just that post on its bundled twin", async () => {

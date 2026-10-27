@@ -157,7 +157,10 @@ async function runRefresh(): Promise<void> {
             if (!listingResult.response.ok) throw new Error(`GitHub contents returned HTTP ${listingResult.response.status}`);
             const raw = await listingResult.response.json();
             if (!Array.isArray(raw)) throw new Error("listing payload is not a JSON array");
-            entries = raw.map(parseListingEntry).filter((e): e is LiveEntry => e !== undefined).slice(0, MAX_FILES);
+            entries = raw.map(parseListingEntry).filter((e): e is LiveEntry => e !== undefined);
+            // Truncating here would make the dropped posts look deleted-on-master and
+            // silently strip them from the panel — over-cap is an anomaly, fail soft.
+            if (entries.length > MAX_FILES) throw new Error(`live listing has ${entries.length} posts (cap ${MAX_FILES})`);
         } finally {
             listingResult.stopIdleTimer();
         }
