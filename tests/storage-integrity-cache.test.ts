@@ -14,10 +14,12 @@
  *   6. corrupt small store still throws synchronously (cache or no cache).
  *   7. sync path announces its phase before scanning (#4940); the opt-out
  *      stays silent.
+ *   8. a store padded past the REAL 512 MiB boundary (sparse tail, tiny page
+ *      count) takes the background path — no synchronous rescan (#4940).
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, utimesSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, readFileSync, writeFileSync, utimesSync, truncateSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { UnifiedStore, StorageIntegrityError } from "../src/storage/store.js";
@@ -153,6 +155,30 @@ test("a corrupt small store still fails open synchronously and writes no ok-cach
         const cache = readIntegrityCache(dbPath);
         assert.ok(cache === null || cache.ok === false, "no ok verdict cached for a corrupt store");
     } finally {
+        rmSync(dir, { recursive: true, force: true });
+    }
+});
+
+test("a store padded past the real 512 MiB boundary takes the background path without a synchronous rescan (#4940)", () => {
+    resetIntegrityCheckStateForTests();
+    setIntegritySyncThresholdForTests(null); // exercise the REAL threshold constant
+    const dir = tmpDir();
+    const lines: string[] = [];
+    setLogCapture((_level, msg) => lines.push(msg));
+    try {
+        const dbPath = join(dir, "index.db");
+        UnifiedStore.open(dbPath).close(); // small store: sync check + verdict cache written
+        lines.length = 0;
+        truncateSync(dbPath, 513 * 1024 * 1024); // sparse tail: stat sees >512 MiB while the page count stays tiny
+        const store = UnifiedStore.open(dbPath);
+        assert.ok(lines.some((m) => m.includes("background quick_check started for") && m.includes("over the 512 MiB sync threshold")), `padded open dispatched to the background check; got ${JSON.stringify(lines)}`);
+        assert.ok(!lines.some((m) => m.includes("synchronous pre-migration scan")), "no synchronous rescan on the padded open");
+        const done = waitFor(() => !backgroundIntegrityInflightForTests(dbPath) && integrityCheckRunsForTests() === 2 && existsSync(integrityCachePath(dbPath)), 15000);
+        assert.ok(done, "background check completed within 15s");
+        assert.ok(readIntegrityCache(dbPath)?.ok === true, "background verdict cached as ok");
+        store.close();
+    } finally {
+        setLogCapture(null);
         rmSync(dir, { recursive: true, force: true });
     }
 });
