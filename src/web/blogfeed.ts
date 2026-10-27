@@ -27,13 +27,26 @@ import { markdownToHtml } from "./markdown.js";
 
 const BLOG_ASSET_PREFIX = "/__bili/blog-assets";
 
+/** INERT image formats only (#4958): SVG is deliberately absent — it is the
+ *  one format that carries active content (embedded <script>), and serving
+ *  master-pulled bytes same-origin from the panel turned a bad merge into
+ *  stored XSS. Re-adding it requires the owner's explicit sign-off. */
 export const ASSET_TYPES: Record<string, string> = {
     ".png": "image/png",
     ".jpg": "image/jpeg",
     ".jpeg": "image/jpeg",
     ".gif": "image/gif",
-    ".svg": "image/svg+xml",
     ".webp": "image/webp",
+};
+
+/** Defensive headers on EVERY asset 200 (#4958): `sandbox` (without
+ *  allow-scripts) blocks script execution if an asset URL is navigated to
+ *  directly; nosniff pins the declared type against MIME confusion. Both are
+ *  inert for <img> subresource loads, so rendering behavior does not change. */
+const ASSET_RESPONSE_HEADERS: Record<string, string> = {
+    "content-security-policy": "sandbox",
+    "x-content-type-options": "nosniff",
+    "cache-control": "no-cache",
 };
 
 let rootOverride: string | undefined;
@@ -534,7 +547,7 @@ export function handleBlogAssetGet(res: ServerResponse, urlPath: string): void {
     // frozen bundle bytes; a miss falls through to the package below.
     const overlaid = getRemoteBlogAsset(segments.join("/"));
     if (overlaid !== undefined) {
-        res.writeHead(200, { "content-type": overlaid.type, "cache-control": "no-cache" });
+        res.writeHead(200, { "content-type": overlaid.type, ...ASSET_RESPONSE_HEADERS });
         res.end(overlaid.buf);
         return;
     }
@@ -549,6 +562,6 @@ export function handleBlogAssetGet(res: ServerResponse, urlPath: string): void {
         notFound();
         return;
     }
-    res.writeHead(200, { "content-type": type, "cache-control": "no-cache" });
+    res.writeHead(200, { "content-type": type, ...ASSET_RESPONSE_HEADERS });
     res.end(readFileSync(file));
 }

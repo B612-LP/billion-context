@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { ServerResponse } from "node:http";
-import { getBlogFeed, handleBlogGet, handleBlogAssetGet, _setBlogRootForTest } from "../src/web/blogfeed.ts";
+import { getBlogFeed, handleBlogGet, handleBlogAssetGet, registerRemoteBlogFeed, _setBlogRootForTest } from "../src/web/blogfeed.ts";
 
 let pkgRoot = "";
 let outsideDir = "";
@@ -36,12 +36,13 @@ function buildFixture(): void {
     writeFileSync(join(pkgRoot, "outside-secret.yaml"), "nope");
     const posts = join(pkgRoot, "website", "blog", "posts");
     writeFileSync(join(posts, "2026-10-08_demo.md"),
-        "---\ntitle: \"Demo post\"\nexcerpt: \"EN excerpt.\"\n---\n\n## Body\n\nText with <script>alert(1)</script> inline.\n\n![shot](figures/shot.png)\n\n![escape](../../outside-secret.yaml)\n");
+        "---\ntitle: \"Demo post\"\nexcerpt: \"EN excerpt.\"\n---\n\n## Body\n\nText with <script>alert(1)</script> inline.\n\n![shot](figures/shot.png)\n\n![vec](figures/shot.svg)\n\n![escape](../../outside-secret.yaml)\n");
     writeFileSync(join(posts, "2026-10-08_demo.zh.md"),
         "---\ntitle_zh: \"演示文章\"\nexcerpt_zh: \"中文摘要。\"\n---\n\n## 正文\n\n中文内容。\n");
     writeFileSync(join(posts, "2026-10-09_new.md"), "# Undated-by-frontmatter post\n\nNewer content.\n");
     writeFileSync(join(posts, "notes.md"), "# Plain notes\n\nNo date anywhere.\n");
     writeFileSync(join(posts, "figures", "shot.png"), "POSTPNG");
+    writeFileSync(join(posts, "figures", "shot.svg"), "<svg xmlns=\"http://www.w3.org/2000/svg\"><script>alert(1)</script></svg>");
     writeFileSync(join(pkgRoot, "website", "articles.json"), JSON.stringify({ articles: [
         { file: "paper/a.md", zh_file: "paper/b.md", slug: "alpha" },
         { file: "paper/missing.md" },
@@ -108,6 +109,9 @@ test("asset route: png allowed with exact bytes; md/traversal/encoding/missing a
     assert.equal(ok.status, 200);
     assert.match(String(ok.headers["content-type"]), /^image\/png/);
     assert.equal(ok.body, "PAPERPNG");
+    // #4958: every asset 200 carries the defensive header set.
+    assert.equal(ok.headers["content-security-policy"], "sandbox");
+    assert.equal(ok.headers["x-content-type-options"], "nosniff");
 
     for (const url of [
         "/__bili/blog-assets/outside-secret.yaml",
@@ -124,6 +128,32 @@ test("asset route: png allowed with exact bytes; md/traversal/encoding/missing a
     const md = fakeRes();
     handleBlogAssetGet(md.res, "/__bili/blog-assets/paper/a.md");
     assert.equal(md.status, 404);
+});
+
+test("svg is inert content: dropped from rendering and 404 on the asset route (#4958)", () => {
+    const data = getBlogFeed();
+    const demo = data.items.find((i) => i.id === "demo")!;
+    assert.ok(!demo.html.includes(".svg"), "svg image ref drops out of the rendered html (any <img> for it would carry .svg)");
+    assert.ok(demo.html.includes("/__bili/blog-assets/website/blog/posts/figures/shot.png"), "inert formats keep rendering");
+
+    // The file ships in the package but the extension gate refuses it.
+    const svg = fakeRes();
+    handleBlogAssetGet(svg.res, "/__bili/blog-assets/website/blog/posts/figures/shot.svg");
+    assert.equal(svg.status, 404);
+});
+
+test("remote overlay asset 200 carries the same defensive header set as bundled (#4958)", () => {
+    registerRemoteBlogFeed({
+        items: [],
+        assets: new Map([["website/blog/posts/figures/remote.png", { buf: Buffer.from("REMOTEPNG"), type: "image/png" }]]),
+    });
+    const r = fakeRes();
+    handleBlogAssetGet(r.res, "/__bili/blog-assets/website/blog/posts/figures/remote.png");
+    assert.equal(r.status, 200);
+    assert.match(String(r.headers["content-type"]), /^image\/png/);
+    assert.equal(r.body, "REMOTEPNG");
+    assert.equal(r.headers["content-security-policy"], "sandbox");
+    assert.equal(r.headers["x-content-type-options"], "nosniff");
 });
 
 test("handleBlogGet answers 200 JSON always; broken manifest degrades to posts-only", () => {
