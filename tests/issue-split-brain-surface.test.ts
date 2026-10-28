@@ -9,7 +9,10 @@
 //      machine-global sessions dir is the supported topology (several
 //      `bili pi -r` instances are a normal multi-terminal posture);
 //      registry miss (unknown pid) keeps the loud corruption warning
-//      (benign=false).
+//      (benign=false); a registry hit whose lock boot stamp predates the
+//      live process's start (stale marker + reused pid, #5014 follow-up)
+//      keeps the alarm too (Linux /proc probe; off-Linux the probe is
+//      unavailable and the hit stays benign).
 //   G1 a real split-brain contest surfaces session id + title + both sides'
 //      pid/lane (log line AND web wire); no contest → nothing surfaced.
 //   G2 the surfaced entry is dismissable (POST /__bili/storage/split-brain/
@@ -169,7 +172,7 @@ test("#3959 D1: secondProcess stays while the foreign pid lives, self-clears onc
 
 // ---- D2: cross-lane downgrade at store open ----------------------------------
 
-test("#3959 D2: registry hit (any lane) is benign; registry miss is not", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host" }, async () => {
+test("#3959 D2: registry hit (any lane) is benign; stale-lock reuse and registry miss are not", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host" }, async () => {
     const snap = saveEnv();
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3959-d2-"));
     const logs: string[] = [];
@@ -212,6 +215,25 @@ test("#3959 D2: registry hit (any lane) is benign; registry miss is not", { skip
             _resetStorageRuntimeStatusForTest();
             logs.length = 0;
 
+            // stale lock + reused pid: registry hits (peer-pi from above) but
+            // the lock's boot stamp predates the live process's start by an
+            // hour — the holder cannot be the registered instance → alarm.
+            // Linux-only direction: the start-time probe reads /proc; off-Linux
+            // the probe is unavailable and the registry hit stays benign.
+            fs.writeFileSync(path.join(base, "sessions", "d.db.lock"), JSON.stringify({ pid: child.pid, boot: Date.now() - 3_600_000 }));
+            store = UnifiedStore.open(path.join(base, "sessions", "d.db"));
+            wire = storageStatusWire();
+            if (process.platform === "linux") {
+                assert.equal(wire.secondProcess?.benign, false, "stale lock predating the live process's start is not the registered instance");
+                assert.ok(logs.some((l) => l.startsWith("error ") && l.includes("already writing")), "stale-lock hit logs the corruption error");
+                assert.ok(!logs.some((l) => l.startsWith("info ") && l.includes("informational only")), "stale-lock hit does NOT log the informational downgrade");
+            } else {
+                assert.equal(wire.secondProcess?.benign, true, "no /proc start-time probe off-Linux: registry hit stays benign");
+            }
+            store.close();
+            _resetStorageRuntimeStatusForTest();
+            logs.length = 0;
+
             // registry miss: unknown process → NOT benign, no lane recorded
             fs.rmSync(path.join(base, "state", "billion-context", "instances"), { recursive: true, force: true });
             fs.writeFileSync(path.join(base, "sessions", "c.db.lock"), JSON.stringify({ pid: child.pid }));
@@ -220,7 +242,7 @@ test("#3959 D2: registry hit (any lane) is benign; registry miss is not", { skip
             assert.equal(wire.secondProcess?.benign, false, "unknown process keeps the loud warning");
             assert.equal(wire.secondProcess?.lane, undefined);
             assert.equal(wire.secondProcess?.instanceId, undefined);
-            assert.ok(logs.some((l) => l.startsWith("error ") && l.includes("already writing") && l.includes("NOT a known bili instance")), "registry miss logs the corruption error");
+            assert.ok(logs.some((l) => l.startsWith("error ") && l.includes("already writing") && l.includes("NOT a live known bili instance")), "registry miss logs the corruption error");
             store.close();
         } finally {
             child.kill("SIGKILL");

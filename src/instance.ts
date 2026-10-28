@@ -620,6 +620,26 @@ export function procMainScript(pid: number): string | undefined {
     return undefined;
 }
 
+/** Wall-clock start time (ms epoch) of a live process from Linux /proc.
+ *  undefined when undeterminable (non-Linux, unreadable, parse failure) —
+ *  callers must treat undefined as "no evidence", never as death. */
+export function procStartTimeMs(pid: number): number | undefined {
+    if (process.platform !== "linux") return undefined;
+    try {
+        const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+        // field 22 (starttime, clock ticks since boot); comm (field 2) may
+        // contain spaces/parens, so anchor after the LAST ") "
+        const rest = stat.slice(stat.lastIndexOf(") ") + 2).split(" ");
+        const ticks = Number(rest[19]);
+        const btime = fs.readFileSync("/proc/stat", "utf8").match(/^btime (\d+)/m);
+        if (!Number.isFinite(ticks) || !btime) return undefined;
+        const CLK_TCK = 100; // x86_64/arm64 Linux; coarse stale-lock comparison only
+        return Number(btime[1]) * 1000 + Math.round((ticks / CLK_TCK) * 1000);
+    } catch {
+        return undefined;
+    }
+}
+
 function reapDeadMarkers(ours: string): void {
     for (const name of readMarkerNames()) {
         if (!name.endsWith(".json")) continue;

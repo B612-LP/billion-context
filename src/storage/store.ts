@@ -25,7 +25,7 @@ import { migrateSchema, storagePragmas, WAL_JOURNAL_SIZE_LIMIT } from "./schema.
 import { identityOfStoredContent } from "./identity.js";
 import { recordIntegrityOutcome, recordSecondProcessOwner, recordBackupOutcome } from "./runtime-status.js";
 import { integrityModeFor, writeIntegrityCache, scheduleBackgroundIntegrityCheck, backgroundIntegrityInflightForTests, noteIntegrityCheckRun } from "./integrity-check.js";
-import { listInstances, type RegistryEntry } from "../instance.js";
+import { listInstances, procStartTimeMs, type RegistryEntry } from "../instance.js";
 import type { MessageContentStore } from "acp-kernel";
 
 /** #3250: run a PASSIVE wal_checkpoint every N successful ingests. The
@@ -423,7 +423,7 @@ export class UnifiedStore {
         let foreignLockHolder: { pid: number } | null = null;
         try {
             if (existsSync(lockPath)) {
-                const parsed = JSON.parse(readFileSync(lockPath, "utf8")) as { pid?: unknown };
+                const parsed = JSON.parse(readFileSync(lockPath, "utf8")) as { pid?: unknown; boot?: unknown };
                 const pid = typeof parsed.pid === "number" ? parsed.pid : null;
                 if (pid !== null && pid !== process.pid && processAlive(pid)) {
                     foreignLockHolder = { pid };
@@ -441,11 +441,24 @@ export class UnifiedStore {
                     const peer = listInstances()
                         .filter((e) => e.pid === pid)
                         .reduce<RegistryEntry | undefined>((best, e) => (best === undefined || (e.startedAt ?? 0) > (best.startedAt ?? 0) ? e : best), undefined);
-                    const benign = peer !== undefined;
+                    // #5014 follow-up: a registry hit only proves some instance
+                    // ONCE held this pid — dead markers persist until the next
+                    // startup (#1235) and the OS reuses pids. The lock's boot
+                    // stamp was written by its holder; if the live process
+                    // started well after it, the lock is stale and the holder
+                    // is not the registered instance.
+                    let benign = peer !== undefined;
+                    if (benign) {
+                        const lockBoot = typeof parsed.boot === "number" ? parsed.boot : null;
+                        if (lockBoot !== null) {
+                            const started = procStartTimeMs(pid);
+                            if (started !== undefined && started > lockBoot + 5000) benign = false;
+                        }
+                    }
                     if (benign) {
                         loggerLog("info", `[storage] bili instance (pid ${pid}, lane ${peer?.lane ?? "undeclared"}, instance ${peer?.instanceId.slice(0, 8)}) is also using ${path} — instances share the machine-global sessions dir and SQLite WAL serializes the writers; informational only (#3923/#3959).`);
                     } else {
-                        loggerLog("error", `[storage] another process (pid ${pid}) is already writing ${path} and is NOT a known bili instance — an unknown writer on one index.db can corrupt it (#3923/#3959). This lane keeps running but the condition is reported.`);
+                        loggerLog("error", `[storage] another process (pid ${pid}) is already writing ${path} and is NOT a live known bili instance — an unknown writer on one index.db can corrupt it (#3923/#3959). This lane keeps running but the condition is reported.`);
                     }
                     recordSecondProcessOwner(pid, { lane: peer?.lane, instanceId: peer?.instanceId, benign });
                 }
