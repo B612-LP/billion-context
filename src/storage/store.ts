@@ -428,19 +428,24 @@ export class UnifiedStore {
                 if (pid !== null && pid !== process.pid && processAlive(pid)) {
                     foreignLockHolder = { pid };
                     // #3923/#3959: a live foreign pid that maps to a KNOWN bili
-                    // instance of a DIFFERENT lane is the deliberate shared-directory
-                    // topology — informational, not a corruption alarm. When stale
-                    // entries share the pid (restarted instance), the newest
-                    // startedAt is the live one.
+                    // instance (any lane, including our own) is the deliberate
+                    // shared-directory topology — each instance writes its own
+                    // sessions' rows and SQLite WAL + busy_timeout serialize the
+                    // writers, so it is informational, not a corruption alarm.
+                    // Running several same-lane instances (e.g. one `bili pi -r`
+                    // per terminal) against the machine-global sessions dir is
+                    // a normal multi-instance posture; the genuinely dangerous
+                    // double-serve of ONE session has its own split-brain guard
+                    // (#3952). When stale entries share the pid (restarted
+                    // instance), the newest startedAt is the live one.
                     const peer = listInstances()
                         .filter((e) => e.pid === pid)
                         .reduce<RegistryEntry | undefined>((best, e) => (best === undefined || (e.startedAt ?? 0) > (best.startedAt ?? 0) ? e : best), undefined);
-                    const ownLane = process.env.BILI_LAUNCHER_LANE?.trim() || undefined;
-                    const benign = peer !== undefined && ownLane !== undefined && peer.lane !== undefined && peer.lane !== ownLane;
+                    const benign = peer !== undefined;
                     if (benign) {
-                        loggerLog("info", `[storage] process (pid ${pid}, lane ${peer?.lane}, instance ${peer?.instanceId.slice(0, 8)}) is also using ${path} — different lanes sharing one sessions directory is the supported topology (#3923/#3959); informational only.`);
+                        loggerLog("info", `[storage] bili instance (pid ${pid}, lane ${peer?.lane ?? "undeclared"}, instance ${peer?.instanceId.slice(0, 8)}) is also using ${path} — instances share the machine-global sessions dir and SQLite WAL serializes the writers; informational only (#3923/#3959).`);
                     } else {
-                        loggerLog("error", `[storage] another process (pid ${pid}) is already writing ${path} — two processes on one index.db corrupt it (#3923/#3959). One session dir must have exactly one instance (#3633); this lane keeps running but the condition is reported.`);
+                        loggerLog("error", `[storage] another process (pid ${pid}) is already writing ${path} and is NOT a known bili instance — an unknown writer on one index.db can corrupt it (#3923/#3959). This lane keeps running but the condition is reported.`);
                     }
                     recordSecondProcessOwner(pid, { lane: peer?.lane, instanceId: peer?.instanceId, benign });
                 }

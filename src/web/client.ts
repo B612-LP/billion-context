@@ -1298,9 +1298,9 @@ function changelogCatOf(rawLine) {
             if (sp && typeof sp.pid === "number") {
                 spb.hidden = false;
                 spb.classList.add("show");
-                // #3923/#3959: a known bili instance of a DIFFERENT lane sharing
-                // the machine-global sessions dir is the supported topology —
-                // informational styling, not a corruption alarm.
+                // #3923/#3959: a known bili instance (any lane, including our
+                // own) sharing the machine-global sessions dir is the supported
+                // topology — informational styling, not a corruption alarm.
                 if (sp.benign === true) {
                     spb.classList.remove("warn");
                     spb.classList.add("info");

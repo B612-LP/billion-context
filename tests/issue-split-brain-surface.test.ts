@@ -4,9 +4,12 @@
 // owner-required surface, both directions each (#3617):
 //   D1 the secondProcess warning never freezes: a live foreign pid stays
 //      surfaced; a pid that has exited self-clears at the status read.
-//   D2 cross-lane registry hit → benign=true (informational log + wire);
-//      same-lane / registry miss / undeclared lane keep the loud corruption
-//      warning (benign=false).
+//   D2 registry hit → benign=true (informational log + wire) — cross-lane
+//      AND same-lane peers alike: any known bili instance sharing the
+//      machine-global sessions dir is the supported topology (several
+//      `bili pi -r` instances are a normal multi-terminal posture);
+//      registry miss (unknown pid) keeps the loud corruption warning
+//      (benign=false).
 //   G1 a real split-brain contest surfaces session id + title + both sides'
 //      pid/lane (log line AND web wire); no contest → nothing surfaced.
 //   G2 the surfaced entry is dismissable (POST /__bili/storage/split-brain/
@@ -166,7 +169,7 @@ test("#3959 D1: secondProcess stays while the foreign pid lives, self-clears onc
 
 // ---- D2: cross-lane downgrade at store open ----------------------------------
 
-test("#3959 D2: cross-lane registry hit is benign; same lane / registry miss are not", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host" }, async () => {
+test("#3959 D2: registry hit (any lane) is benign; registry miss is not", { skip: !(probeBuiltinSqlite() || probeHostBetterSqlite3()) && "no SQLite engine available on this host" }, async () => {
     const snap = saveEnv();
     const base = fs.mkdtempSync(path.join(os.tmpdir(), "bili-3959-d2-"));
     const logs: string[] = [];
@@ -189,20 +192,22 @@ test("#3959 D2: cross-lane registry hit is benign; same lane / registry miss are
             assert.equal(wire.secondProcess?.benign, true, "known bili instance of a different lane is the supported topology");
             assert.equal(wire.secondProcess?.lane, "dsh");
             assert.equal(wire.secondProcess?.instanceId, "peer-dsh");
-            assert.ok(logs.some((l) => l.startsWith("info ") && l.includes(`pid ${child.pid}`) && l.includes("lane dsh") && l.includes("supported topology")), "informational log, not the corruption error");
+            assert.ok(logs.some((l) => l.startsWith("info ") && l.includes(`pid ${child.pid}`) && l.includes("lane dsh") && l.includes("informational only")), "informational log, not the corruption error");
             assert.ok(!logs.some((l) => l.startsWith("error ") && l.includes("already writing")), "cross-lane hit does NOT log the corruption error");
             store.close();
             _resetStorageRuntimeStatusForTest();
             logs.length = 0;
 
-            // same lane: registry entry with lane "pi" === own "pi" → NOT benign
+            // same lane: registry entry with lane "pi" === own "pi" → ALSO benign
+            // (multi-instance same-lane is the normal multi-terminal topology)
             writeInstanceEntry(path.join(base, "state"), "peer-pi", child.pid!, "pi");
             fs.writeFileSync(path.join(base, "sessions", "b.db.lock"), JSON.stringify({ pid: child.pid }));
             store = UnifiedStore.open(path.join(base, "sessions", "b.db"));
             wire = storageStatusWire();
-            assert.equal(wire.secondProcess?.benign, false, "same-lane peer keeps the loud warning");
+            assert.equal(wire.secondProcess?.benign, true, "same-lane known instance is the supported topology too");
             assert.equal(wire.secondProcess?.lane, "pi");
-            assert.ok(logs.some((l) => l.startsWith("error ") && l.includes("already writing") && l.includes("corrupt")), "same-lane peer logs the corruption error");
+            assert.ok(logs.some((l) => l.startsWith("info ") && l.includes(`pid ${child.pid}`) && l.includes("informational only")), "same-lane hit logs informational, not the corruption error");
+            assert.ok(!logs.some((l) => l.startsWith("error ") && l.includes("already writing")), "same-lane hit does NOT log the corruption error");
             store.close();
             _resetStorageRuntimeStatusForTest();
             logs.length = 0;
@@ -215,7 +220,7 @@ test("#3959 D2: cross-lane registry hit is benign; same lane / registry miss are
             assert.equal(wire.secondProcess?.benign, false, "unknown process keeps the loud warning");
             assert.equal(wire.secondProcess?.lane, undefined);
             assert.equal(wire.secondProcess?.instanceId, undefined);
-            assert.ok(logs.some((l) => l.startsWith("error ") && l.includes("already writing")), "registry miss logs the corruption error");
+            assert.ok(logs.some((l) => l.startsWith("error ") && l.includes("already writing") && l.includes("NOT a known bili instance")), "registry miss logs the corruption error");
             store.close();
         } finally {
             child.kill("SIGKILL");
