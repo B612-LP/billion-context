@@ -364,12 +364,12 @@ test("#3959 web: status carries secondProcess/splitBrain; ack endpoint clears; p
         assert.ok(WEB_CLIENT.includes('API_ROOT + "/storage/split-brain/ack"'), "dismiss button POSTs the ack endpoint");
         assert.ok(WEB_CLIENT.includes('"btn sm"'), "dismiss button follows the sm button convention");
         assert.ok(WEB_CLIENT.includes('sp.benign === true'), "benign second-process hits the informational branch");
-        assert.ok(WEB_CLIENT.includes('t("sys.storage_second_process_cross_lane"'), "informational branch uses the cross-lane copy");
+        assert.ok(WEB_CLIENT.includes('t("sys.storage_second_process_benign"'), "informational branch uses the known-instance copy");
         assert.ok(WEB_CLIENT.includes('classList.add("info")'), "informational branch swaps to info styling");
         for (const locale of ["zh-CN", "en"] as const) {
             for (const key of [
-                "sys.storage_second_process_cross_lane_title",
-                "sys.storage_second_process_cross_lane",
+                "sys.storage_second_process_benign_title",
+                "sys.storage_second_process_benign",
                 "sys.split_brain_title",
                 "sys.split_brain",
                 "sys.split_brain_lane_undeclared",

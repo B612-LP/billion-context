@@ -1304,7 +1304,7 @@ function changelogCatOf(rawLine) {
                 if (sp.benign === true) {
                     spb.classList.remove("warn");
                     spb.classList.add("info");
-                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_cross_lane_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_cross_lane", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
+                    spb.innerHTML = "<strong>" + escapeHtml(t("sys.storage_second_process_benign_title")) + "</strong> " + escapeHtml(t("sys.storage_second_process_benign", { pid: String(sp.pid), lane: typeof sp.lane === "string" && sp.lane ? sp.lane : t("sys.split_brain_lane_undeclared") }));
                 } else {
                     spb.classList.remove("info");
                     spb.classList.add("warn");
