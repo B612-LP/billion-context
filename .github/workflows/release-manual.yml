@@ -8,7 +8,7 @@ on:
         required: false
         default: ""
       train:
-        description: "RETIRED 2026-10-25 (was: ship the open patch train). Patch lanes are now merge-gated: merging the final carry PR INTO the protected lane publishes (release-bugfix.yml pull_request_target). This box refuses; see reference/release.md."
+        description: "RETIRED 2026-10-25 (was: ship the open patch train). This box refuses by design — leave it unchecked for a normal one-click release. See reference/release.md."
         type: boolean
         required: false
         default: false
@@ -45,7 +45,7 @@ jobs:
         if: inputs.train == true
         run: |
           set -euo pipefail
-          echo "::error::train mode is RETIRED (2026-10-25) — its direct-push mechanics predate protected lanes. Ship the lane by MERGING its final carry PR INTO it (merge-gated publish in release-bugfix.yml); see reference/release.md"
+          echo "::error::train mode is RETIRED (2026-10-25) — un-check the train box for a normal one-click release; current publish channels are documented in reference/release.md"
           exit 1
           if [ -z "$LAST" ]; then echo "::error::train mode: no v* tags found"; exit 1; fi
           TRAIN="bugfix-v${LAST#v}"
