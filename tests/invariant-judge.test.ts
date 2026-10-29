@@ -98,6 +98,16 @@ test("NEG malformed note shape against an image twin still red (#5049 item 2)", 
   assert.equal(v.ok, false);
 });
 
+test("NEG note-shaped text embedded in a longer exit cell stays red (anchored full-string, #1456)", () => {
+  // The exemption matches the producer's WHOLE-cell format, never a substring —
+  // an image twin whose outbound cell merely contains the note is a rewrite.
+  const entry = [mk("user", "text", "[image]", { imagePart: true })];
+  const exit = [mk("user", "text", `archived, see ${SHED_NOTE} for details`)];
+  const v = judgeInboundOutbound(entry, exit);
+  assert.equal(v.ok, false);
+  assert.ok(v.violations.some((x) => x.kind === "mid-history-rewrite" || x.kind === "mid-history-drop"));
+});
+
 test("I1 tool-call id re-mint with identical content does not false-positive (#2821)", () => {
   const entry = [mk("assistant", "tool-call", "{\"cmd\":\"ls\"}", { toolName: "bash", toolCallId: "call_1" })];
   const exit = [mk("assistant", "tool-call", "{\"cmd\":\"ls\"}", { toolName: "bash", toolCallId: "call_REMINTED" })];
