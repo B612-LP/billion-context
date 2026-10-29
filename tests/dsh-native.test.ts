@@ -2120,6 +2120,11 @@ test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, ever
             assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized");
             assert.equal(localLines().length, 1, "one durable LOCAL-refusal line");
             assert.match(localLines()[0]!, /≥1000001 tok \(core est 4000004B\/4\) exceeds window 1000000 \(declared 1000; never assumes below 1000000\)/);
+            // #5067 option A: the doom line carries the thrown message AND the
+            // flattened stack (this initiator throws an Error) — the frame
+            // attribution artifact for the #5026 failure class.
+            assert.match(localLines()[0]!, /attribution threw \(agent initiator scope is disposed\) and body ≥1000001 tok/);
+            assert.match(localLines()[0]!, / — stack: Error: agent initiator scope is disposed/);
             // 4,000,000 B / 4 = 1M tok == floored bar: NOT provably over → direct.
             assert.equal(await gate(url, { bytes: 4_000_000 }), false);
             // #4079 floor both-ways: a body over the DECLARED window (4004B/4
@@ -2128,6 +2133,20 @@ test("#2924 gate `threw` persists: provably-oversized body refuses LOCALLY, ever
             assert.equal(await gate(url, { bytes: 4004 }), false);
             // Unreadable body / unknown size → #1117 direct semantics.
             assert.equal(await gate(url), false);
+            // #5067 option A negative leg: a non-Error throw has no stack — the
+            // doom line must not fabricate one.
+            ctx.agents.currentInitiator = () => { throw "bare-string doom"; };
+            assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized");
+            assert.equal(localLines().length, 2);
+            assert.match(localLines()[1]!, /attribution threw \(bare-string doom\) and body ≥1000001 tok/);
+            assert.ok(!localLines()[1]!.includes(" — stack:"), "non-Error throws must not fabricate a stack");
+            // #5067 option A cap leg: an oversized stack is bounded + marked, never verbatim.
+            const huge = new Error("huge-stack");
+            huge.stack = `Error: huge-stack\n${"frame ".repeat(400)}`;
+            ctx.agents.currentInitiator = () => { throw huge; };
+            assert.equal(await gate(url, { bytes: 4_000_004 }), "refuse-oversized");
+            assert.equal(localLines().length, 3);
+            assert.match(localLines()[2]!, / — stack: Error: huge-stack frame .* …\[truncated\]$/);
             // No window resolvable → the size arm disarms entirely → direct.
             _setModelInfoForTest();
             assert.equal(await gate(url, { bytes: 4004 }), false);
