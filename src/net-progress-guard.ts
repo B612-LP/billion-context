@@ -32,6 +32,18 @@ import { SELF_HEAL_SUPPRESS_CAP_MS, nudgeSuppressed } from "./session-self-heal.
  * (same channel as the #2155 suppress-nudge remedy) until a round
  * demonstrably reduces the context below the bar, or the #3004 wall cap
  * expires. Constants by design (#2155 precedent: no new config knobs).
+ *
+ * Storage is PROCESS-LOCAL (WeakMap keyed by the session object), never
+ * persisted: persist serializes session.metadata into the state file, and
+ * this guard fires on EVERY successful fold commit, so writing it there put
+ * a volatile ≤10-minute runtime latch into the persisted document of every
+ * long session and drifted the byte-for-byte storage goldens deterministically
+ * (#4790 precedent — same mechanism family, same fix shape). Entries die with
+ * their session object; an evicted-and-reloaded session re-seeds silently —
+ * harmless because the latch self-expires within SELF_HEAL_SUPPRESS_CAP_MS
+ * anyway, and a fresh arm needs one more successful fold commit followed by
+ * at most NET_PROGRESS_STRIKE_LIMIT non-progress rounds. The web badge
+ * therefore only appears while the session object is live.
  */
 
 /** Below pre-fold level by MORE than this counts as progress. Half the flat
@@ -55,48 +67,40 @@ type NetProgressState = {
     armedAt?: number;
 };
 
-const METADATA_KEY = "netProgressGuard";
+const states = new WeakMap<object, NetProgressState>();
 
-function parseState(session: Session): NetProgressState | undefined {
-    const raw = session.metadata[METADATA_KEY];
-    if (raw === null || typeof raw !== "object") return undefined;
-    const rec = raw as Record<string, unknown>;
-    if (typeof rec["baseline"] !== "number" || !Number.isFinite(rec["baseline"]) || rec["baseline"] <= 0) return undefined;
-    if (typeof rec["expectedFloor"] !== "number" || !Number.isFinite(rec["expectedFloor"])) return undefined;
-    if (typeof rec["strikes"] !== "number" || rec["strikes"] < 0) return undefined;
-    const st: NetProgressState = {
-        baseline: rec["baseline"],
-        expectedFloor: rec["expectedFloor"],
-        strikes: rec["strikes"],
-    };
-    if (typeof rec["armedAt"] === "number" && Number.isFinite(rec["armedAt"])) st.armedAt = rec["armedAt"];
-    return st;
+/** Live view of the session object's evidence window (in-process only).
+ *  Returns the internal record itself so tests can time-travel armedAt; a
+ *  record is replaced whole on each re-baseline, so never retain it across
+ *  one. Object-typed so the web layer can pass its minimal SummarySource. */
+export function netProgressState(key: object): NetProgressState | undefined {
+    return states.get(key);
 }
 
 /** Called on the compress success path (src/stream.ts) with the live-view
- * token total and the rendered post-fold estimate of the SAME request. A new
- * fold starts a fresh evidence window: prior strikes are stale. */
+ *  token total and the rendered post-fold estimate of the SAME request. A new
+ *  fold starts a fresh evidence window: prior strikes are stale. */
 export function recordNetProgressBaseline(session: Session, viewTokens: number, expectedFloor: number): void {
     if (!Number.isFinite(viewTokens) || viewTokens <= 0) return;
-    session.metadata[METADATA_KEY] = {
+    states.set(session, {
         baseline: Math.round(viewTokens),
         expectedFloor: Math.max(0, Math.round(expectedFloor)),
         strikes: 0,
-    };
+    });
 }
 
 /** True while this session's nudge injection is held by the net-progress
- * latch (and within the #3004 wall cap). Gates every willInjectNudge site
- * together with the #2155 latch via nudgeInjectionBlocked. */
+ *  latch (and within the #3004 wall cap). Gates every willInjectNudge site
+ *  together with the #2155 latch via nudgeInjectionBlocked. */
 export function netProgressNudgeBlocked(session: Session): boolean {
-    const st = parseState(session);
+    const st = states.get(session);
     if (st === undefined || st.armedAt === undefined) return false;
     return Date.now() - st.armedAt < SELF_HEAL_SUPPRESS_CAP_MS;
 }
 
 /** The ONE suppression expression for nudge-injection sites: the #2155
- * self-heal latch OR the #5058 net-progress latch. Both share the
- * decide-ladder fallback punch-through, which the callers keep outside. */
+ *  self-heal latch OR the #5058 net-progress latch. Both share the
+ *  decide-ladder fallback punch-through, which the callers keep outside. */
 export function nudgeInjectionBlocked(session: Session): boolean {
     return nudgeSuppressed(session) || netProgressNudgeBlocked(session);
 }
@@ -104,10 +108,10 @@ export function nudgeInjectionBlocked(session: Session): boolean {
 type LogFn = (level: "info" | "warn", message: string) => void;
 
 /** Evaluate one nudge-carrying round's resent-payload level against the last
- * fold's baseline. Pure w.r.t. inputs; mutates only session.metadata
- * (survives restarts with the snapshot, visible on /__bili/sessions). */
+ *  fold's baseline. Pure w.r.t. inputs; mutates only the process-local store
+ *  (never persisted — see module doc). */
 export function evaluateNetProgressRound(session: Session, observedTokens: number, log: LogFn): void {
-    const st = parseState(session);
+    const st = states.get(session);
     if (st === undefined) return;
     if (!Number.isFinite(observedTokens) || observedTokens <= 0) return;
     const now = Date.now();
@@ -115,7 +119,7 @@ export function evaluateNetProgressRound(session: Session, observedTokens: numbe
     // (a reducing round) that may never arrive in a dead session, and the
     // suppressed channel is the only one left to prompt compression.
     if (st.armedAt !== undefined && now - st.armedAt >= SELF_HEAL_SUPPRESS_CAP_MS) {
-        delete session.metadata[METADATA_KEY];
+        states.delete(session);
         log("info", `[${session.id}] [net-progress] nudge suppression expired after ${Math.round((now - st.armedAt) / 60_000)} min without a demonstrable reduction — suppression lifted; the next successful fold opens a fresh evidence window (re-arms after ${NET_PROGRESS_STRIKE_LIMIT} more non-progress rounds if compression still does not shrink) (#5058)`);
         return;
     }
@@ -125,16 +129,12 @@ export function evaluateNetProgressRound(session: Session, observedTokens: numbe
         }
         st.strikes = 0;
         delete st.armedAt;
-        session.metadata[METADATA_KEY] = st;
         return;
     }
     if (st.armedAt !== undefined) return;
     st.strikes += 1;
     if (st.strikes >= NET_PROGRESS_STRIKE_LIMIT) {
         st.armedAt = now;
-        session.metadata[METADATA_KEY] = st;
         log("warn", `[${session.id}] [net-progress] compression is NOT shrinking this session: ${st.strikes} consecutive rounds after the last fold left the resent context at ~${observedTokens} tokens (pre-fold level ~${st.baseline}, post-fold estimate ~${st.expectedFloor}) — each compress action costs about as much as its fold saves. Nudge suppressed for this session until a round drops the context below ~${st.baseline - NET_PROGRESS_MARGIN_TOKENS} (or ${SELF_HEAL_SUPPRESS_CAP_MS / 60_000} min elapse). If the session keeps growing, rotate to a fresh session — see CLIENTS.md, long-running sessions (#5058)`);
-    } else {
-        session.metadata[METADATA_KEY] = st;
     }
 }

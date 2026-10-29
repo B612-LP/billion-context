@@ -10,6 +10,7 @@ import {
     NET_PROGRESS_STRIKE_LIMIT,
     evaluateNetProgressRound,
     netProgressNudgeBlocked,
+    netProgressState,
     nudgeInjectionBlocked,
     recordNetProgressBaseline,
 } from "../src/net-progress-guard.ts";
@@ -33,11 +34,6 @@ function mkSession(): Session {
     } as unknown as Session;
 }
 
-function state(s: Session): Record<string, unknown> | undefined {
-    const raw = s.metadata["netProgressGuard"];
-    return raw === null || typeof raw !== "object" ? undefined : (raw as Record<string, unknown>);
-}
-
 // ---- unit: baseline + strike state machine ----------------------------------
 
 test("unit: arms only after exactly two consecutive non-progress rounds and warns once", () => {
@@ -49,16 +45,16 @@ test("unit: arms only after exactly two consecutive non-progress rounds and warn
     // Round 1: still above the bar — one strike, not armed yet.
     evaluateNetProgressRound(s, 610_000, log);
     assert.equal(netProgressNudgeBlocked(s), false, "one strike must not arm");
-    assert.equal(state(s)?.["strikes"], 1);
+    assert.equal(netProgressState(s)?.strikes, 1);
 
     // Round 2: still above — arms with a warn carrying the numbers.
     evaluateNetProgressRound(s, 640_000, log);
     assert.equal(netProgressNudgeBlocked(s), true, "second consecutive non-progress round arms");
-    const st = state(s)!;
-    assert.equal(st["baseline"], 600_000);
-    assert.equal(st["expectedFloor"], 120_000);
-    assert.equal(st["strikes"], NET_PROGRESS_STRIKE_LIMIT);
-    assert.ok(typeof st["armedAt"] === "number");
+    const st = netProgressState(s)!;
+    assert.equal(st.baseline, 600_000);
+    assert.equal(st.expectedFloor, 120_000);
+    assert.equal(st.strikes, NET_PROGRESS_STRIKE_LIMIT);
+    assert.ok(typeof st.armedAt === "number");
     const warns = logs.filter((l) => l.startsWith("warn:"));
     assert.equal(warns.length, 1, "exactly one warn at arm");
     assert.match(warns[0], /\[net-progress\]/);
@@ -78,8 +74,8 @@ test("unit: a progress round resets strikes and lifts an active latch", () => {
     // Below pre-fold level by more than the margin: compression is working again.
     evaluateNetProgressRound(s, 600_000 - NET_PROGRESS_MARGIN_TOKENS - 1, log);
     assert.equal(netProgressNudgeBlocked(s), false, "reducing round lifts the latch early");
-    assert.equal(state(s)?.["strikes"], 0);
-    assert.equal(state(s)?.["armedAt"], undefined);
+    assert.equal(netProgressState(s)?.strikes, 0);
+    assert.equal(netProgressState(s)?.armedAt, undefined);
     assert.ok(logs.some((l) => l.startsWith("info:") && /\[net-progress\]/.test(l)), "recovery is logged");
 });
 
@@ -87,7 +83,7 @@ test("unit: boundary — observed exactly at baseline-minus-margin counts as non
     const s = mkSession();
     recordNetProgressBaseline(s, 600_000, 120_000);
     evaluateNetProgressRound(s, 600_000 - NET_PROGRESS_MARGIN_TOKENS, noop);
-    assert.equal(state(s)?.["strikes"], 1, "the margin must be exceeded strictly");
+    assert.equal(netProgressState(s)?.strikes, 1, "the margin must be exceeded strictly");
 });
 
 test("unit: wall cap — predicate expires inline and the next evaluate clears the latch", () => {
@@ -98,13 +94,13 @@ test("unit: wall cap — predicate expires inline and the next evaluate clears t
     assert.equal(netProgressNudgeBlocked(s), true);
 
     // Time-travel past the #3004 cap without any further round.
-    const st = state(s)!;
-    st["armedAt"] = Date.now() - SELF_HEAL_SUPPRESS_CAP_MS - 1;
+    const st = netProgressState(s)!;
+    st.armedAt = Date.now() - SELF_HEAL_SUPPRESS_CAP_MS - 1;
     assert.equal(netProgressNudgeBlocked(s), false, "expired latch blocks nothing");
 
     const logs: string[] = [];
     evaluateNetProgressRound(s, 900_000, (level: string, msg: string) => logs.push(`${level}:${msg}`));
-    assert.equal(state(s), undefined, "expiry deletes the whole evidence window");
+    assert.equal(netProgressState(s), undefined, "expiry deletes the whole evidence window");
     assert.ok(logs.some((l) => l.startsWith("info:") && /expired/.test(l)), "expiry is logged");
 });
 
@@ -116,7 +112,7 @@ test("unit: while armed, extra non-progress rounds neither re-warn nor grow stri
     evaluateNetProgressRound(s, 900_000, log);
     evaluateNetProgressRound(s, 900_000, log);
     evaluateNetProgressRound(s, 950_000, log);
-    assert.equal(state(s)?.["strikes"], NET_PROGRESS_STRIKE_LIMIT);
+    assert.equal(netProgressState(s)?.strikes, NET_PROGRESS_STRIKE_LIMIT);
     assert.equal(logs.filter((l) => l.startsWith("warn:")).length, 1, "no warn spam while latched");
 });
 
@@ -124,42 +120,51 @@ test("unit: a new fold commit opens a fresh window and resets strikes", () => {
     const s = mkSession();
     recordNetProgressBaseline(s, 600_000, 120_000);
     evaluateNetProgressRound(s, 900_000, noop);
-    assert.equal(state(s)?.["strikes"], 1);
+    assert.equal(netProgressState(s)?.strikes, 1);
 
     recordNetProgressBaseline(s, 950_000, 200_000);
-    const st = state(s)!;
-    assert.equal(st["baseline"], 950_000);
-    assert.equal(st["strikes"], 0);
-    assert.equal(st["armedAt"], undefined, "a new fold also lifts an armed latch");
+    const st = netProgressState(s)!;
+    assert.equal(st.baseline, 950_000);
+    assert.equal(st.strikes, 0);
+    assert.equal(st.armedAt, undefined, "a new fold also lifts an armed latch");
 });
 
 test("unit: degenerate inputs are no-ops", () => {
     const s = mkSession();
     recordNetProgressBaseline(s, NaN, 100);
     recordNetProgressBaseline(s, 0, 100);
-    assert.equal(state(s), undefined, "invalid baselines are not recorded");
+    assert.equal(netProgressState(s), undefined, "invalid baselines are not recorded");
 
     recordNetProgressBaseline(s, 600_000, 120_000);
     evaluateNetProgressRound(s, NaN, noop);
     evaluateNetProgressRound(s, 0, noop);
     evaluateNetProgressRound(s, -5, noop);
-    assert.equal(state(s)?.["strikes"], 0, "non-positive observations count for nothing");
+    assert.equal(netProgressState(s)?.strikes, 0, "non-positive observations count for nothing");
 
     // No baseline at all: the guard stays silent.
     const bare = mkSession();
     evaluateNetProgressRound(bare, 900_000, noop);
-    assert.equal(state(bare), undefined);
+    assert.equal(netProgressState(bare), undefined);
 });
 
-test("unit: corrupt persisted state is ignored without throwing", () => {
+test("unit: the guard never touches persisted session state (storage goldens stay clean)", () => {
+    // persist serializes session.metadata into the state file; writing the
+    // volatile latch there drifted every storage golden on each fold commit
+    // (#4790 precedent). Exercise every mutation path, then pin the document.
     const s = mkSession();
-    s.metadata["netProgressGuard"] = { baseline: "huge" };
-    assert.equal(netProgressNudgeBlocked(s), false);
+    recordNetProgressBaseline(s, 600_000, 120_000);
     evaluateNetProgressRound(s, 900_000, noop);
-    s.metadata["netProgressGuard"] = { baseline: 600_000 };
     evaluateNetProgressRound(s, 900_000, noop);
-    s.metadata["netProgressGuard"] = [1, 2, 3];
-    assert.equal(netProgressNudgeBlocked(s), false);
+    assert.equal(netProgressNudgeBlocked(s), true, "armed before the persistence pin");
+    // expiry path
+    netProgressState(s)!.armedAt = Date.now() - SELF_HEAL_SUPPRESS_CAP_MS - 1;
+    evaluateNetProgressRound(s, 900_000, noop);
+    // re-arm + recovery path
+    recordNetProgressBaseline(s, 600_000, 120_000);
+    evaluateNetProgressRound(s, 900_000, noop);
+    evaluateNetProgressRound(s, 900_000, noop);
+    evaluateNetProgressRound(s, 600_000 - NET_PROGRESS_MARGIN_TOKENS - 1, noop);
+    assert.deepEqual(Object.keys(s.metadata), [], "session.metadata must stay untouched");
 });
 
 test("unit: a healthy long session never arms", () => {
@@ -171,7 +176,7 @@ test("unit: a healthy long session never arms", () => {
         recordNetProgressBaseline(s, 500_000 + i * 1_000, 150_000 + i * 1_000);
     }
     assert.equal(netProgressNudgeBlocked(s), false);
-    assert.equal(state(s)?.["strikes"], 0);
+    assert.equal(netProgressState(s)?.strikes, 0);
 });
 
 // ---- unit: the shared suppression expression --------------------------------

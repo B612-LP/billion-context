@@ -415,18 +415,25 @@ it cannot see the cross-round trajectory.
 - **Remedy** — suppress the nudge at all four `willInjectNudge` gates via
   `nudgeInjectionBlocked(session)` (the D1 predicate OR'd with this one); the
   decide ladder's fallback escape still punches through ONE legacy advisory
-  while suppressed (same #3004 deadlock guard as D1). Latch:
-  `session.metadata.netProgressGuard = { baseline, expectedFloor, strikes,
-  armedAt }`; wall expiry reuses `SELF_HEAL_SUPPRESS_CAP_MS` (10 min) so a
-  latched session is never silent past that without fresh evidence; any real
-  reduction lifts it early. Evaluate MUST run while suppressed or recovery
-  could never be observed (the #3004 circular-wait trap).
+  while suppressed (same #3004 deadlock guard as D1). Latch state
+  `{ baseline, expectedFloor, strikes, armedAt }` lives PROCESS-LOCAL in a
+  WeakMap keyed by the session object — persist serializes session.metadata
+  into the state file, and this guard fires on every successful fold commit,
+  so a persisted latch would drift the byte-for-byte storage goldens on every
+  long session (#4790 precedent); an evicted-and-reloaded session re-seeds
+  silently, which is harmless because wall expiry reuses
+  `SELF_HEAL_SUPPRESS_CAP_MS` (10 min) so a latched session is never silent
+  past that without fresh evidence; any real reduction lifts it early; and a
+  fresh arm needs one more successful fold commit followed by at most
+  `NET_PROGRESS_STRIKE_LIMIT` non-progress rounds. Evaluate MUST run while
+  suppressed or recovery could never be observed (the #3004 circular-wait trap).
 
-Observability: armed state is exposed in `/__bili/sessions` (`netProgress`)
-and badged in the web UI ("swelling"); arm/recovery/expiry each log one
-`[net-progress]` line with the observed vs baseline numbers and the rotate-to-
-fresh-session advice. No config surface — constants by design (same precedent
-as #2155); operators who want a lazier cadence set `compress.nudgeGrowthTokens`.
+Observability: armed state is exposed in `/__bili/sessions` (`netProgress`,
+live sessions only) and badged in the web UI ("swelling"); arm/recovery/
+expiry each log one `[net-progress]` line with the observed vs baseline
+numbers and the rotate-to-fresh-session advice. No config surface — constants
+by design (same precedent as #2155); operators who want a lazier cadence set
+`compress.nudgeGrowthTokens`.
 
 ## Degraded direct fallback — refuse, self-heal, announce (#4516, #3304, #2924, #4079)
 
