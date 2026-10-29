@@ -33,7 +33,7 @@ import { type Session } from "./session.js";
  *  window is seconds; the deadlock it replaces is permanent — live-first is
  *  the right trade, and the kernel prune removes the ambiguity entirely for
  *  fresh restamps. */
-export interface SupersededResolution<T extends { startRef: string; endRef: string } = { startRef: string; endRef: string; summary: string }> {
+interface SupersededResolution<T extends { startRef: string; endRef: string } = { startRef: string; endRef: string; summary: string }> {
     rejection: string | null;
     translatedRanges: T[];
     translated: number;
