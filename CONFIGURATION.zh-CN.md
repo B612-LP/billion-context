@@ -1316,6 +1316,34 @@ deadline 语义（#4833）：`targetTimeoutMs` 限制的是**每一次单独派�
 
 auto-fold 的增长触发是**收益门槛制**（#3444），不是裸阈值：只有文本通道超出有效目标预算至少 **4096 token** 才会武装增长折叠——已坐在目标上（或刚刚过线）的载荷会直接照常转发，不会为了省不到固定成本的量去烧一整轮外部摘要往返。折叠后同一道门槛再算一次：一场增长折叠实际省下不足 4096 token，就按零进展同样处理，武装 10 分钟退避。图片主导的载荷豁免（图片不可折叠，其超出量永远算不上“预期收益”）；经典溢出折叠不受影响——那是必须触发的。另外，有效目标有一个**实测下限**：当会话不可压缩的基线（系统提示词 + 工具定义 + 存活尾巴）大于配置的 `autoFoldTargetTokens` 时，目标会被抬到实测值并告警提示真实数字——否则一个永远够不着的目标会在每轮请求上重复武装注定徒劳的折叠。下限永远不会把目标抬过模型窗口。
 
+#### Fork 策略：阶段择时与外部摘要
+
+本 fork 在 `compress.externalSummary` 增加显式启用的策略，上游默认行为不变。复用同一组外部模型 targets、凭据引用、budget 和 global/provider/model 的整链替换机制，不自动复用主模型的 OAuth 登录。
+
+```json
+{
+  "compress": {
+    "nudgeGrowthTokens": 50000,
+    "externalSummary": {
+      "enabled": true,
+      "targets": ["summary/glm-5.3-flash"],
+      "autoFold": false,
+      "taskPhase": true,
+      "taskPhaseMinTokens": 250000,
+      "hardThresholdTokens": 350000,
+      "autoFoldTargetTokens": 250000
+    }
+  }
+}
+```
+
+- `taskPhase`：布尔值，默认关闭。由独立服务判断是否已越过某阶段、旧材料是否已经用完；适合时直接执行外部摘要，不让主模型写交接、做压缩规划。这是转发前等待完成的操作，不保证零延迟后台并行。
+- `taskPhaseMinTokens`：绝对占用软判断起点。低于此值不派发阶段判断；后续复用 `compress.nudgeGrowthTokens` 的增长节奏限制检查频率，不在每次工具返回时都询问。硬阈值以下的否决、busy 或无效判断不改变请求。
+- `hardThresholdTokens`：独立策略上限，不修改模型物理窗口。达到或超过它时，必须通过外部摘要把出站上下文降到上限以下，否则明确拒绝转发。语义否决、退避、目标不可用、没有安全范围或摘要失败不能静默绕过，不能把应急截断当作摘要成功。
+- `autoFoldTargetTokens`：在阶段策略下也作为压缩目标，必须低于硬上限。语义择时模式建议关闭旧 `autoFold`，避免纯数值自动折叠先行触发。
+
+范围校验、近期保护仍然生效。模型判断与摘要不等于完美记忆保证；原文保持可找回。硬保护仅约束被插件成功接管的流量，禁用或绕过插件不能执行任何策略；部署后需验证 DSH 接管链路。GLM-5.3 Flash 使用已有命名 HTTP provider recipe 与私有凭据引用，不能把 Key 提交到仓库。
+
 #### Agent 上报的 providers（兜底层）
 
 ACP 原生 agent（当前为 `pi` 扩展）会在每个进程内向代理上报自己已配置的 providers（`POST /__bili/agent-providers`）：provider 名、base URL、线上协议、已解析的 API key 与模型清单。这些 recipes 构成一个**兜底层** —— 链可以直接引用 `"zhipu/glm-5"`，无需在文件里重复拨号字段；在 agent 自身配置过的 provider 可直接用作摘要目标。合并序为**文件优先**：同名 file recipe 会完全遮蔽 agent 对该 provider 的贡献（含模型清单）。agent 层永不落盘：key 只存在于代理进程内存，配置 API 不返回，也不进日志。上报侧的跳过规则：OAuth 认证的 provider、`auth.json`（“stored”）凭据、端点指回代理自身的 provider、以及没有摘要拨号协议的 provider（`bedrock`、`vertex`、`mistral`、`pi-messages`）都不会上报；plain-HTTP 非回环 baseUrl 同样不会发送（服务端会拒绝——内联 apiKey 不能走明文，#2585）。接收按条目隔离：被拒的条目只会被记录并出现在响应的 `skipped` 列表里，不再丢弃整份上报——其余条目照常注册。Web 面板的目标下拉里 agent 上报的模型带 `(agent)` 标记。

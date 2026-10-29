@@ -40,6 +40,9 @@ export interface ExternalSummarySettings {
      *  auto-fold (nudges come back). */
     autoFold?: boolean;
     autoFoldTargetTokens?: number;
+    taskPhase?: boolean;
+    taskPhaseMinTokens?: number;
+    hardThresholdTokens?: number;
 }
 
 /** A chain as it sits in the config file: model references into the named
@@ -52,6 +55,9 @@ export interface ExternalSummaryChain {
     concurrency?: number;
     autoFold?: boolean;
     autoFoldTargetTokens?: number;
+    taskPhase?: boolean;
+    taskPhaseMinTokens?: number;
+    hardThresholdTokens?: number;
 }
 
 const SUMMARY_DEFAULT_BUDGET: Readonly<SummaryBudget> = {
@@ -117,12 +123,25 @@ function parseAutoFold(settings: Record<string, unknown>): { autoFold?: boolean;
     }
     // A target without the switch is inert config noise, not an error; the
     // switch without a target is the normal "half the window" default.
-    if (autoFold !== true) return {};
+    if (autoFold !== true && settings.taskPhase !== true) return {};
     return { autoFold, ...(autoFoldTargetTokens !== undefined ? { autoFoldTargetTokens } : {}) };
 }
 
 /** [#2657] Pool sizing rides the same enabled-gate as autoFold: parsed only
  *  on an enabled chain, absent → undefined → the executor's base size. */
+function parseTaskPhase(settings: Record<string, unknown>): Pick<ExternalSummarySettings, "taskPhase" | "taskPhaseMinTokens" | "hardThresholdTokens"> {
+    if (settings.taskPhase !== undefined && typeof settings.taskPhase !== "boolean") throw new Error("External summary taskPhase must be boolean");
+    const taskPhaseMinTokens = settings.taskPhaseMinTokens === undefined ? undefined : integer(settings.taskPhaseMinTokens, 250_000, AUTO_FOLD_TARGET_MIN, AUTO_FOLD_TARGET_MAX);
+    const hardThresholdTokens = settings.hardThresholdTokens === undefined ? undefined : integer(settings.hardThresholdTokens, 350_000, AUTO_FOLD_TARGET_MIN, AUTO_FOLD_TARGET_MAX);
+    if (settings.taskPhase === true) {
+        const minimum = taskPhaseMinTokens ?? 250_000;
+        const hard = hardThresholdTokens;
+        const target = settings.autoFoldTargetTokens ?? minimum;
+        if (hard !== undefined && (minimum >= hard || typeof target !== "number" || target >= hard)) throw new Error("External summary taskPhase minimum and autoFoldTargetTokens must be below hardThresholdTokens");
+    }
+    return { ...(settings.taskPhase !== undefined ? { taskPhase: settings.taskPhase as boolean } : {}), ...(taskPhaseMinTokens !== undefined ? { taskPhaseMinTokens } : {}), ...(hardThresholdTokens !== undefined ? { hardThresholdTokens } : {}) };
+}
+
 function parseConcurrency(settings: Record<string, unknown>): { concurrency?: number } {
     if (settings.concurrency === undefined) return {};
     const value = settings.concurrency;
@@ -170,7 +189,7 @@ function noteAutoFoldIgnored(settings: Record<string, unknown>): void {
  *  against the providers table at expansion time (expandExternalSummaryChain). */
 export function parseExternalSummaryChain(value: unknown): ExternalSummaryChain {
     const settings = object(value);
-    knownKeys(settings, ["enabled", "targets", "budget", "concurrency", "autoFold", "autoFoldTargetTokens"]);
+    knownKeys(settings, ["enabled", "targets", "budget", "concurrency", "autoFold", "autoFoldTargetTokens", "taskPhase", "taskPhaseMinTokens", "hardThresholdTokens"]);
     if (settings.enabled !== undefined && typeof settings.enabled !== "boolean") throw new Error("External summary enabled must be boolean");
     const enabled = settings.enabled === true;
     if (!enabled) {
@@ -179,7 +198,7 @@ export function parseExternalSummaryChain(value: unknown): ExternalSummaryChain 
         // whole compress block over a stale typo here would disable
         // compression itself. Strict validation re-engages the moment the
         // (possibly deeper-level) chain is enabled.
-        return { enabled: false, targets: [], budget: SUMMARY_DEFAULT_BUDGET };
+        return { enabled: false, targets: [], budget: SUMMARY_DEFAULT_BUDGET, ...parseTaskPhase(settings) };
     }
     if (settings.targets !== undefined && !Array.isArray(settings.targets)) throw new Error("External summary targets must be an array of \"provider/model\" references");
     const refs = (settings.targets ?? []) as unknown[];
@@ -190,7 +209,7 @@ export function parseExternalSummaryChain(value: unknown): ExternalSummaryChain 
         if (slash <= 0 || slash === target.length - 1) throw new Error(`External summary target "${target}" must reference a provider and model as "provider/model"`);
         return target;
     });
-    return { enabled, targets, budget: parseBudget(settings.budget), ...parseConcurrency(settings), ...parseAutoFold(settings) };
+    return { enabled, targets, budget: parseBudget(settings.budget), ...parseConcurrency(settings), ...parseAutoFold(settings), ...parseTaskPhase(settings) };
 }
 
 /** Expand chain references against the named providers table. THROWS on an
@@ -200,7 +219,7 @@ export function parseExternalSummaryChain(value: unknown): ExternalSummaryChain 
  *  (#2336 agent-registry form) — it expands to an inline-key target instead
  *  of a credential reference. */
 export function expandExternalSummaryChain(chain: ExternalSummaryChain, recipes: Record<string, NamedProviderRecipe & { apiKey?: string }>): ExternalSummarySettings {
-    if (!chain.enabled) return { enabled: false, targets: [], budget: chain.budget ?? SUMMARY_DEFAULT_BUDGET };
+    if (!chain.enabled) return { enabled: false, targets: [], budget: chain.budget ?? SUMMARY_DEFAULT_BUDGET, ...parseTaskPhase(chain as unknown as Record<string, unknown>) };
     const names = new Set<string>();
     const targets = chain.targets.map((ref): ExternalSummaryTarget => {
         const slash = ref.indexOf("/");
@@ -222,7 +241,7 @@ export function expandExternalSummaryChain(chain: ExternalSummaryChain, recipes:
         return { name, protocol: recipe.api, url: derivedSummaryEndpoint(recipe, model, stream), model, ...(inlineKey !== undefined ? { apiKey: inlineKey } : { credentialRef }), contextWindow, outputTokens, stream };
     });
     return { enabled: true, targets, budget: chain.budget ?? SUMMARY_DEFAULT_BUDGET
-        , ...(chain.concurrency !== undefined ? { concurrency: chain.concurrency } : {}), ...parseAutoFold(chain as unknown as Record<string, unknown>) };
+        , ...(chain.concurrency !== undefined ? { concurrency: chain.concurrency } : {}), ...parseAutoFold(chain as unknown as Record<string, unknown>), ...parseTaskPhase(chain as unknown as Record<string, unknown>) };
 }
 
 /** Derive the full request endpoint from a recipe's baseUrl + api type —
@@ -257,12 +276,12 @@ function derivedSummaryEndpoint(recipe: NamedProviderRecipe, model: string, stre
 export function parseExternalSummarySettings(value: unknown, options: { inlineKeys?: boolean } = {}): ExternalSummarySettings {
     const inlineKeys = options.inlineKeys === true;
     const settings = object(value);
-    knownKeys(settings, ["enabled", "targets", "budget", "concurrency", "autoFold", "autoFoldTargetTokens"]);
+    knownKeys(settings, ["enabled", "targets", "budget", "concurrency", "autoFold", "autoFoldTargetTokens", "taskPhase", "taskPhaseMinTokens", "hardThresholdTokens"]);
     if (settings.enabled !== undefined && typeof settings.enabled !== "boolean") throw new Error("External summary enabled must be boolean");
     const enabled = settings.enabled === true;
     if (!enabled) {
         noteAutoFoldIgnored(settings);
-        return { enabled: false, targets: [], budget: SUMMARY_DEFAULT_BUDGET };
+        return { enabled: false, targets: [], budget: SUMMARY_DEFAULT_BUDGET, ...parseTaskPhase(settings) };
     }
     if (settings.targets !== undefined && !Array.isArray(settings.targets)) throw new Error("External summary targets must be an array");
     const values = (settings.targets ?? []) as unknown[];
@@ -301,7 +320,7 @@ export function parseExternalSummarySettings(value: unknown, options: { inlineKe
         }
         return { name, protocol, url: url.href, model, ...(inlineKey !== undefined ? { apiKey: inlineKey } : { credentialRef }), contextWindow, outputTokens, stream: target.stream === true };
     });
-    return { enabled: true, targets, budget: parseBudget(settings.budget), ...parseConcurrency(settings), ...parseAutoFold(settings) };
+    return { enabled: true, targets, budget: parseBudget(settings.budget), ...parseConcurrency(settings), ...parseAutoFold(settings), ...parseTaskPhase(settings) };
 }
 
 const seenExpansionWarnings = new Set<string>();
@@ -319,6 +338,6 @@ export function expandExternalSummaryChainTolerant(chain: ExternalSummaryChain, 
             seenExpansionWarnings.add(message);
             loggerLog("warn", `[external-summary] ${message} — the chain is disabled until the reference is fixed`);
         }
-        return { enabled: false, targets: [], budget: SUMMARY_DEFAULT_BUDGET };
+        return { enabled: false, targets: [], budget: SUMMARY_DEFAULT_BUDGET, ...parseTaskPhase(chain as unknown as Record<string, unknown>) };
     }
 }

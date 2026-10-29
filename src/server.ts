@@ -79,7 +79,8 @@ import { ccrEnabled, ccrLoopConfig, ccrPluginWireOk, contentStoreOf, executeRetr
 import { buildIncomingImageIndex, pruneRetrieveImgExports } from "./image-restore.js";
 import { rulesEnabled, storeEffectiveRules } from "./rules-feature.js";
 import { storeEffectiveSearchPlanAware } from "./decompress-shared.js";
-import { armAutoFoldBackoff, autoFoldEngaged, autoFoldFloor, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, withExternalSummaryTools } from "./external-summary-surface.js";
+import { armAutoFoldBackoff, autoFoldEngaged, autoFoldFloor, AUTO_FOLD_BACKOFF_MS, externalQueueDroppedAll, taskPhaseEnabled, withExternalSummaryTools } from "./external-summary-surface.js";
+import { runTaskPhase } from "./task-phase.js";
 import { AUTO_FOLD_TARGET_MIN, AUTO_FOLD_MIN_BENEFIT_TOKENS } from "./external-summary-settings.js";
 import { auditStartupSummaryCredentials } from "./external-summary-credentials.js";
 import { applyRanges } from "./stream.js";
@@ -3688,6 +3689,23 @@ export async function preflightCompressIfNeeded(
     const tokenCount = unknownBaseline
         ? estimateCoreMessagesUpper(prepared.processedMessages) + overheadEstimate + imageTokens
         : Math.max(baselineFloor, calibratedPayload);
+    if (taskPhaseEnabled(config) || (config as ResolvedKernelConfig).externalSummary?.hardThresholdTokens !== undefined) {
+        const abort = new AbortController();
+        registerRequestAbort(res, abort);
+        let stopHold: (() => void) | undefined;
+        const hold = setTimeout(() => { stopHold = beginPreflightHold(res, prepared, log); }, preflightHoldGraceMs());
+        hold.unref();
+        try {
+            return await runTaskPhase({ prepared, core, config, size: tokenCount,
+                measure: (outbound) => {
+                    const measured = outboundPayloadBreakdown(outbound, opts, route, req.url ?? "");
+                    return applyEstimateCalibration(measured.textEstimate + measured.overheadEstimate, kFactor, kOrigin, currentOrigin) + measured.imageTokens;
+                }, rebuild: runPrepare, signal: abort.signal, log });
+        } finally {
+            clearTimeout(hold);
+            stopHold?.();
+        }
+    }
     // #1843 dual-channel accounting: the trigger runs on the TEXT channel —
     // text vs `target − imageReserve`. Exact algebraic rewrite of the old
     // total-view trigger: subtracting the constant reserve from both sides of

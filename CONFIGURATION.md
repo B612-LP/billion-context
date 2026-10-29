@@ -1313,6 +1313,34 @@ Two optional knobs turn the chain into a **proxy-driven auto-folder** (`autoFold
 
 Auto-fold growth triggers are benefit-gated (#3444), not bare threshold crossings: a growth fold arms only when the text channel exceeds the effective target budget by at least **4096 tokens** — payloads sitting at (or barely past) the target forward as-is instead of burning a full external-summary round trip to save less than its fixed cost. The same gate applies post-fold: a growth fold that ends up saving fewer than 4096 tokens arms the 10-minute backoff exactly like a zero-progress pass. Image-dominant payloads are exempt (images are not foldable, so their overage is never "expected benefit"), and classic overflow folding is untouched — there, firing is mandatory. Additionally, the effective target has a **measured floor**: when the session's irreducible baseline (system prompt + tool definitions + live tail) is larger than the configured `autoFoldTargetTokens`, the target is raised to that measured size and a warning names the real number — an unreachable target would otherwise re-arm a futile fold on every request. The floor never lifts the target above the model window.
 
+#### Fork policy: task-phase external summaries
+
+This fork adds an opt-in policy under `compress.externalSummary`; upstream defaults are unchanged. It reuses the same independent provider targets, credential references, budget and global/provider/model whole-chain replacement. It does not reuse the conversation model's OAuth credentials.
+
+```json
+{
+  "compress": {
+    "nudgeGrowthTokens": 50000,
+    "externalSummary": {
+      "enabled": true,
+      "targets": ["summary/glm-5.3-flash"],
+      "autoFold": false,
+      "taskPhase": true,
+      "taskPhaseMinTokens": 250000,
+      "hardThresholdTokens": 350000,
+      "autoFoldTargetTokens": 250000
+    }
+  }
+}
+```
+
+- `taskPhase` (boolean, default false) asks the independent service whether older eligible material has been consumed and a phase boundary makes compression useful. A positive decision directly executes external summaries; the conversation model is not asked to plan compression or write a handoff. This is an awaited preflight operation, not a guarantee of latency-free background work.
+- `taskPhaseMinTokens` is the absolute soft-check floor. Below it, no task-phase decision is dispatched. Subsequent checks are growth-gated using the existing `compress.nudgeGrowthTokens` cadence rather than querying on every tool round. A negative/busy/invalid decision below the hard threshold leaves the request unchanged.
+- `hardThresholdTokens` is an independent policy ceiling, not a replacement for the model's physical window. At or above it, the policy must reduce the outbound context below the ceiling using independent summaries or explicitly refuse forwarding. A semantic veto, cooldown, unavailable target, no safe candidates or failed summary cannot silently bypass this guard. It does not treat emergency truncation as successful summarization.
+- `autoFoldTargetTokens` also serves as the reduction target in task-phase mode and must be below the configured hard ceiling. Keep legacy `autoFold` off when semantic scheduling is wanted, so a competing numeric auto-folder does not act first.
+
+Range validation and protected recent content still apply. Semantic judgment and summaries are model outputs, not guarantees of perfect memory; original content remains recoverable. The guard operates only on traffic successfully intercepted by this plugin: disabling/bypassing the plugin cannot enforce any policy. Validate the active DSH lane before relying on it. Configure GLM-5.3 Flash using an existing supported named HTTP provider recipe and a private credential reference; never commit keys.
+
 #### Agent-reported providers (fallback layer)
 
 An ACP-native agent (currently the `pi` extension) reports its own configured providers to the proxy once per process (`POST /__bili/agent-providers`): provider name, base URL, wire protocol, resolved API key, and model list. These recipes form a **fallback layer** — a chain may reference `"zhipu/glm-5"` without the dial fields being duplicated in the file, so a provider configured once in the agent's own config is directly usable as a summary target. Merge order is **file wins**: a file recipe with the same name shadows the agent's contribution for that provider entirely (including its models). The agent layer never persists to disk: keys live only in proxy process memory, are never returned by the configuration API, and never appear in logs. Skip rules on the reporting side: OAuth-authenticated providers, `auth.json` ("stored") credentials, providers whose endpoint points back at the proxy itself, and wire protocols without a summary dial (`bedrock`, `vertex`, `mistral`, `pi-messages`) are not reported; plain-HTTP non-loopback baseUrls are not sent either (the server would refuse them — the inline apiKey must not travel over plaintext, #2585). Intake is per-entry: a refused entry is logged and named in the response's `skipped` list instead of discarding the whole report — the remaining entries register normally. The Web UI marks agent-reported models with an `(agent)` badge in the target dropdown.

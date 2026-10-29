@@ -7,7 +7,7 @@ import path from "node:path";
 import { performance } from "node:perf_hooks";
 import { defaultPrompts, type CompressionCore, type Config, type PackSurface, type Prompts } from "acp-kernel";
 import { conversationSignalAnthropic, conversationSignalGoogle, conversationSignalOpenai, conversationIdentityResponses, conversationSignalResponses, googleSystemText, type AnthropicRequestBody, type GoogleRequestBody, type OpenAIRequestBody, type ResponsesRequestBody } from "acp-kernel/wire";
-import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig } from "../compress-settings.js";
+import { resolveCompress, resolveCompressPrompts, resolveCompressSurfaceDetailed, resolveRequestConfig, type ResolvedKernelConfig } from "../compress-settings.js";
 import { FALLBACK_EFFECTIVE_WINDOW_FLOOR, findRoute, findRouteKey, lookupContextLimit, resolveConfiguredContextLimit, resolveConfiguredOutputLimit, resolveCompressProtocol, resolveDeclaredProtocol, type ProxyOptions } from "../config.js";
 import { resolveProxyDecision } from "../upstream-proxy.js";
 import { contextFromRegistry, peekRegistryContext, peekRegistryOutputLimit, peekRegistryPriceProfile } from "../registry.js";
@@ -21,7 +21,7 @@ import { biliToolsDeclaredOnWire, countBiliToolUses, declaresMcpBiliToolsOnWire,
 import { acquireInFlight, getSession, hasProcessedState, markDirty, peekSession, releaseInFlight, storeEffectiveConfig, tickPostRebuildAnchor, withSessionLock, type Session } from "../session.js";
 import { buildCompressSystemPrompt } from "../compress-tool.js";
 import { storeEffectiveSearchPlanAware } from "../decompress-shared.js";
-import { externalSummaryEnabled } from "../external-summary-surface.js";
+import { externalSummaryEnabled, taskPhaseEnabled } from "../external-summary-surface.js";
 import { estimateRawBodyTokens } from "../preflight.js";
 import { gcDumpDirIfConfigured } from "../state-gc.js";
 import { imageTokensInParsedBody } from "../image-tokens.js";
@@ -2419,7 +2419,7 @@ async function handleRequest(
                     // #2228: model-decided nudge timing — resolved through the standard
                     // three-level compress cascade; presence of the object enables the
                     // side-call decision path at tier-1 arms (off unless explicitly set).
-                    const decide = cs.nudgeModelDecided === true
+                    const decide = !taskPhaseEnabled(reqConfig) && cs.nudgeModelDecided === true
                         ? { maxTokens: typeof cs.nudgeDecisionMaxTokens === "number" && cs.nudgeDecisionMaxTokens > 0 ? Math.floor(cs.nudgeDecisionMaxTokens) : DEFAULT_DECIDE_MAX_TOKENS }
                         : undefined;
                     // #1279: stamp this request's effective cache-economics price
@@ -2652,7 +2652,7 @@ async function handleRequest(
                 // A locally-served codex compaction forge never reaches an
                 // upstream: preflight would burn summarization rounds for a
                 // reply that is already forged (#3008 prompt form).
-                if (!countTokens && !responsesCompact && !prepared.codexForge && !prepared.threadsLane) {
+                if (!countTokens && !responsesCompact && !prepared.codexForge && (!prepared.threadsLane || taskPhaseEnabled(reqConfig) || (reqConfig as ResolvedKernelConfig).externalSummary?.hardThresholdTokens !== undefined)) {
                     const outcome = await preflightCompressIfNeeded(
                         prepared,
                         runPrepare,
