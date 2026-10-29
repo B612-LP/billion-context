@@ -19,6 +19,7 @@ import { METADATA_DRIFT_ESCALATED } from "./fold-reconcile.js";
 import { safePrefix, safeSuffix, scrubLoneSurrogates } from "./text-safe.js";
 import { applyConfiguredCompression } from "./external-summary-compress.js";
 import { describeUncoveredRuns, shortTokenCount, uncoveredHistoryRuns } from "./uncovered.js";
+import { recordNetProgressBaseline } from "./net-progress-guard.js";
 
 export type RewriteCtx = {
     core: CompressionCore;
@@ -1335,6 +1336,10 @@ export function applyRanges(parsed: ReturnType<typeof parseCompressInput>, ctx: 
         if (shrinkRatio >= DEGENERATE_FOLD_COVERAGE) {
             ctx.log(`[warn: degenerate-fold] [acp-compress-obs] covers ${Math.round(shrinkRatio * 100)}% of the live context (~${r.tokensCompressed}/${viewTokens} tok) leaving ${activeBlockCount} active block(s), anchor≈${anchorTok} tok — the whole prefix rewrites and the prefix cache restarts from scratch on the next request`);
         }
+        // #5058: cross-round net-progress baseline — later rounds are measured
+        // against THIS live-view level; folds that never bring the resent
+        // context back below it arm the per-session nudge quiet-down.
+        recordNetProgressBaseline(ctx.session, viewTokens, postCtx);
         // #800: feed the cache ledger — the next request's usage report will
         // attribute its re-pay cliff to these folds via decomposeSample.
         const newFoldBlocks = res.state.blocks.filter((b) => !beforeIds.has(b.blockId));

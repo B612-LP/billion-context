@@ -948,6 +948,13 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         && typeof (amfRaw as Record<string, unknown>)["lastAt"] === "number"
         ? { count: (amfRaw as Record<string, unknown>)["count"] as number, lastAt: (amfRaw as Record<string, unknown>)["lastAt"] as number, ...(typeof (amfRaw as Record<string, unknown>)["lastVariant"] === "string" ? { lastVariant: (amfRaw as Record<string, unknown>)["lastVariant"] as string } : {}) }
         : undefined;
+    // #5058: armed net-progress latch (folds stop shrinking this session —
+    // nudge suppressed) — surface only while latched so the list can badge it.
+    const npRaw = metaRec["netProgressGuard"];
+    const npRec = npRaw !== null && typeof npRaw === "object" ? npRaw as Record<string, unknown> : undefined;
+    const netProgress = npRec !== undefined && typeof npRec["baseline"] === "number" && typeof npRec["armedAt"] === "number"
+        ? { baseline: npRec["baseline"] as number, expectedFloor: (typeof npRec["expectedFloor"] === "number" ? npRec["expectedFloor"] : 0) as number, strikes: (typeof npRec["strikes"] === "number" ? npRec["strikes"] : 0) as number, since: npRec["armedAt"] as number }
+        : undefined;
     const clientHint = typeof metaRec["pluginAgent"] === "string" && metaRec["pluginAgent"]
         ? metaRec["pluginAgent"] as string
         : typeof metaRec["clientHint"] === "string" && metaRec["clientHint"] ? metaRec["clientHint"] as string : "";
@@ -983,6 +990,7 @@ function summaryOf(s: SummarySource, live: boolean): WebSessionSummary {
         blocks: s.state.blocks.length,
         ...(typeof s.metadata.effectiveContextLimit === "number" ? { contextWindow: s.metadata.effectiveContextLimit } : {}),
         ...(selfHeal ? { selfHeal } : {}),
+        ...(netProgress ? { netProgress } : {}),
         ...(autoModeForge ? { autoModeForge } : {}),
         ...(keepalive ? { keepalive } : {}),
         lastSeen: new Date(s.lastSeen).toISOString(),
