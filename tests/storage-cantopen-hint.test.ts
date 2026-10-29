@@ -18,6 +18,9 @@ import { rmrf } from "./tmp-rm.ts";
  */
 
 const CANT_OPEN = "Error: [storage:node:sqlite] Error: unable to open database file";
+// #5103 field shape: the db OPENS fine but writes are refused — same OS-level
+// refusal class, different SQLite errno.
+const READONLY_WRITE = "Error: [storage:node:sqlite] Error: attempt to write a readonly database";
 
 function stubPlatform(platform: string): () => void {
     const original = Object.getOwnPropertyDescriptor(process, "platform");
@@ -29,6 +32,19 @@ test("hint: win32 + CANTOPEN carries the OS-level suspects", () => {
     const restore = stubPlatform("win32");
     try {
         const hint = sqliteOpenFailureHint(CANT_OPEN);
+        assert.ok(hint.includes("win32"), "names the platform");
+        assert.ok(hint.includes("antivirus"), "points at AV exclusions");
+        assert.ok(hint.includes("%USERPROFILE%\\.local\\share\\billion-context\\"), "names the exclusion target");
+        assert.ok(hint.includes("deleting the file will not clear a lock"), "corrects the delete-file advice");
+    } finally {
+        restore();
+    }
+});
+
+test("hint: win32 + readonly-write carries the same OS-level suspects (#5103)", () => {
+    const restore = stubPlatform("win32");
+    try {
+        const hint = sqliteOpenFailureHint(READONLY_WRITE);
         assert.ok(hint.includes("win32"), "names the platform");
         assert.ok(hint.includes("antivirus"), "points at AV exclusions");
         assert.ok(hint.includes("%USERPROFILE%\\.local\\share\\billion-context\\"), "names the exclusion target");
@@ -56,6 +72,7 @@ test("hint: non-win32 platforms stay silent even on CANTOPEN", () => {
         const restore = stubPlatform(p);
         try {
             assert.equal(sqliteOpenFailureHint(CANT_OPEN), "", `expected no hint on ${p}`);
+            assert.equal(sqliteOpenFailureHint(READONLY_WRITE), "", `expected no hint on ${p}`);
         } finally {
             restore();
         }

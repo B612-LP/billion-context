@@ -53,20 +53,23 @@ export const VERIFY_EVERY_INGESTS = 20;
  *  every save, and the first clean sample re-admits the session. */
 export const DRIFT_ESCALATE_STREAK = 3;
 
-/** #3823: on win32 "unable to open database file" (SQLITE_CANTOPEN) is almost
- * always an OS-level refusal — antivirus/Defender holding the dir, OneDrive
- * placeholder files under the profile dir, a path past MAX_PATH, or a
- * restricted/sandboxed process whose writes Windows integrity control refuses
- * (#3823 field report: a DSH-launched child at low integrity hit exactly this
- * class on its CA bundle) — NOT a corrupt index.db, so the generic "delete
- * the file" recovery advice misleads for that class; name the real suspects
- * instead. Empty elsewhere: every field instance of this failure domain is
- * win32-x64 (#3338/#3385/#3788/#3823), and Linux/macOS CANTOPEN causes
- * (permissions, disk full) are too varied to hint at usefully. */
+/** #3823/#5103: on win32 "unable to open database file" (SQLITE_CANTOPEN) and
+ * "attempt to write a readonly database" (SQLITE_READONLY) are almost always
+ * OS-level refusals — antivirus/Defender holding the dir, OneDrive placeholder
+ * files under the profile dir, a path past MAX_PATH, or a restricted/sandboxed
+ * process whose writes Windows integrity control refuses (#3823 field report:
+ * a DSH-launched child at low integrity hit exactly this class on its CA
+ * bundle; #5103 field report: the same refusal on index.db WRITES after a
+ * forced power loss, while the open itself had succeeded) — NOT a corrupt
+ * index.db, so the generic "delete the file" recovery advice misleads for that
+ * class; name the real suspects instead. Empty elsewhere: every field instance
+ * of this failure domain is win32-x64 (#3338/#3385/#3788/#3823), and
+ * Linux/macOS CANTOPEN causes (permissions, disk full) are too varied to hint
+ * at usefully. */
 export function sqliteOpenFailureHint(err: string): string {
     if (process.platform !== "win32") return "";
-    if (!/unable to open database file/i.test(err)) return "";
-    return " (win32: the OS refused to open the file — usually antivirus/Defender locking the sessions dir, OneDrive placeholder files under the profile dir, a path over 260 chars, or a restricted/sandboxed process (low-integrity label, app container) whose writes Windows integrity control refuses; exclude %USERPROFILE%\\.local\\share\\billion-context\\ from antivirus real-time scanning first; deleting the file will not clear a lock)";
+    if (!/unable to open database file|attempt to write a readonly database/i.test(err)) return "";
+    return " (win32: the OS refused access to the database file — usually antivirus/Defender locking the sessions dir, OneDrive placeholder files under the profile dir, a path over 260 chars, or a restricted/sandboxed process (low-integrity label, app container) whose writes Windows integrity control refuses; exclude %USERPROFILE%\\.local\\share\\billion-context\\ from antivirus real-time scanning first; deleting the file will not clear a lock)";
 }
 
 // Canonical home for StorageMode/resolveStorageMode is src/knobs.ts (env-var
@@ -139,16 +142,38 @@ export class UnifiedShadow {
      *  implicitly serialized inside one event-loop turn. */
     private queueTail: Promise<void> = Promise.resolve();
     private readonly legacyLoad: (record: unknown) => LegacySessionLike | null;
+    /** #5103: the sqlite file behind this shadow (null on network backends).
+     *  Ingest-failure warnings must name it — "staying legacy-only" without a
+     *  path left users hunting %TEMP% logs for which file said what. */
+    private readonly dbPath: string | null;
     private consecutiveFailures = 0;
     /** #3133: per-session ingest counters (verify sampling). Per-process
      *  only — nothing persisted, no schema change. */
     private readonly ingestCounts = new Map<string, number>();
 
-    private constructor(mode: StorageMode, store: UnifiedStore | null, legacyLoad: (record: unknown) => LegacySessionLike | null, backend?: StorageBackend) {
+    private constructor(mode: StorageMode, store: UnifiedStore | null, legacyLoad: (record: unknown) => LegacySessionLike | null, backend?: StorageBackend, dbPath?: string) {
         this.mode = mode;
         this.sync = store;
         if (store === null) this.backend = backend ?? null;
         this.legacyLoad = legacyLoad;
+        this.dbPath = dbPath ?? null;
+    }
+
+    /** #5103: one ingest failure recorded — the FIRST failure of a streak now
+     *  warns with the file named (before, strikes one and two were silent and
+     *  the user learned of the degradation from missing features, not logs);
+     *  at MAX_CONSECUTIVE_FAILURES the sidecar disables itself, same as before. */
+    private noteIngestFailure(err: unknown): void {
+        this.consecutiveFailures++;
+        const errStr = String(err);
+        this.stats.lastError = errStr;
+        if (this.consecutiveFailures === 1) {
+            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} failed to ingest (${errStr})${sqliteOpenFailureHint(errStr)} — serving from JSON envelopes until it recovers or disables after ${MAX_CONSECUTIVE_FAILURES} consecutive failures`);
+        }
+        if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+            this.stats.disabled = true;
+            loggerLog("warn", `[storage] unified sidecar ${this.dbPath ?? "backend"} disabled after ${this.consecutiveFailures} consecutive failures (last: ${errStr})${sqliteOpenFailureHint(errStr)} — staying legacy-only`);
+        }
     }
 
     /** #3931 step 3: true when this shadow rides a network backend (mysql).
@@ -253,7 +278,7 @@ export class UnifiedShadow {
             recordSidecarOpenFailure(errStr);
             return null;
         }
-        const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null));
+        const shadow = new UnifiedShadow(mode, store, legacyLoad ?? (() => null), undefined, `${dir}/index.db`);
         recordSidecarInstance(shadow);
         const engineTag = ` [engine: ${store.engine}/${store.engineSource}]`;
         const walTag = ` [wal-cap: ${walLimit}]`;
@@ -462,12 +487,7 @@ export class UnifiedShadow {
             }
             this.consecutiveFailures = 0;
         } catch (err) {
-            this.consecutiveFailures++;
-            this.stats.lastError = String(err);
-            if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-                this.stats.disabled = true;
-                loggerLog("warn", `[storage] unified shadow disabled after ${this.consecutiveFailures} consecutive failures (last: ${String(err)})`);
-            }
+            this.noteIngestFailure(err);
         }
     }
 
@@ -980,12 +1000,7 @@ export class UnifiedShadow {
                 }
                 this.consecutiveFailures = 0;
             } catch (err) {
-                this.consecutiveFailures++;
-                this.stats.lastError = String(err);
-                if (this.consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
-                    this.stats.disabled = true;
-                    loggerLog("warn", `[storage] unified shadow disabled after ${this.consecutiveFailures} consecutive failures (last: ${String(err)})`);
-                }
+                this.noteIngestFailure(err);
             }
         });
     }
