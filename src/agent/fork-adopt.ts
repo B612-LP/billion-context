@@ -454,11 +454,24 @@ export async function tryForkAdoption(opts: {
         }
         if (res.status === 201 || res.status === 200) {
             let replayed = false;
+            let inheritedBlocks = 0;
+            let parentBlocks: number | undefined;
             try {
-                const parsed = await res.json() as { replayed?: unknown };
+                const parsed = await res.json() as { replayed?: unknown; inheritedBlocks?: unknown; parentBlocks?: unknown };
                 replayed = parsed.replayed === true;
+                inheritedBlocks = Array.isArray(parsed.inheritedBlocks) ? parsed.inheritedBlocks.length : 0;
+                parentBlocks = typeof parsed.parentBlocks === "number" ? parsed.parentBlocks : undefined;
             } catch {
                 replayed = false;
+            }
+            // #5123: zero inherited fold state while the parent held blocks AND the child
+            // presented more history than matched = the branch point collapsed below every
+            // block. Claiming "adopted" here sets publicForkReceipt and skips
+            // resume-inheritance, so the child replays raw on its next turn. Degrade
+            // instead: the receipt stays unset, so the #1486 ref-overlap recovery runs.
+            if (typeof parentBlocks === "number" && inheritedBlocks === 0 && parentBlocks > 0 && branchPoint < core.length) {
+                opts.log?.(`fork child ${opts.childConversationId} from parent ${opts.parentConversationId} inherited 0 of ${parentBlocks} blocks (branch point ${branchPoint}/${core.length}); degrading to resume-inheritance (#5123)`);
+                return { outcome: "degraded", reason: `fork inherited 0 of ${parentBlocks} parent blocks (branch point ${branchPoint}/${core.length})` };
             }
             opts.log?.(`fork child ${opts.childConversationId} adopted parent ${opts.parentConversationId} at branch point ${branchPoint}${replayed ? " (replayed)" : ""} (#2399)`);
             return { outcome: "adopted", branchPoint, replayed };
