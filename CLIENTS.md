@@ -221,7 +221,8 @@ entry's `captureFetch: false` in your profile's `cordis.patch.yml` (rest of the
 inspector stays active); ② disable dsh Developer Tools; ③
 `BILI_RECLAIM_FETCH_PATCH=0` (loses the #1158 self-heal). The clean fix belongs
 on the inspector side — degrade only fetch-capture instead of throwing the whole
-entry.
+entry. See also the `BILI_RECLAIM_FETCH_PATCH` coexistence note (#3528) in
+CONFIGURATION.md.
 
 ## Kimi Code (Moonshot)
 
