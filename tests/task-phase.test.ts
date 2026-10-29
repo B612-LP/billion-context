@@ -6,7 +6,7 @@ import type { SummaryWork } from "../src/external-summary.ts";
 import { ConfiguredSummaryPlan } from "../src/external-summary-runtime.ts";
 import { parseExternalSummaryChain, expandExternalSummaryChainTolerant, parseExternalSummarySettings } from "../src/external-summary-settings.ts";
 import type { ResolvedKernelConfig } from "../src/compress-settings.ts";
-import { parsePhaseDecision, phaseEvidence, PHASE_JUDGE_INSTRUCTIONS, runTaskPhase } from "../src/task-phase.ts";
+import { parsePhaseDecision, phaseEvidence, phaseJudgeContent, PHASE_JUDGE_INSTRUCTIONS, PHASE_JUDGE_TIMEOUT_MS, runTaskPhase } from "../src/task-phase.ts";
 import type { Prepared } from "../src/server.ts";
 
 const candidates = [{ id: "c0", startRef: "m00001", endRef: "m00002", tokens: 1000 }];
@@ -160,6 +160,63 @@ test("judge evidence uses current projection without resurrecting huge folded or
     assert.equal(input.find((message) => message.id === eligible.id)?.text, eligible.text);
     assert.equal(input.find((message) => message.id === absent.id)?.text, absent.text);
     assert.ok(input.some((message) => message.id === "current" && message.text?.includes("Current unfinished task")));
+});
+
+test("2MB judge input is excerpted within total budget while preserving boundary and current messages", async (t) => {
+    const f = fixture();
+    const large: CoreMessage[] = Array.from({ length: 475 }, (_unused, index) => ({ id: `scale-${index}`, role: "assistant", contentType: "text", text: `Completed phase ${index}: ${"0123456789abcdef".repeat(280)}` }));
+    f.prepared.originalMessages.splice(2, 0, ...large);
+    assert.ok(JSON.stringify(f.prepared.originalMessages).length > 2_000_000);
+    const turn = f.ctx.core.processTurn({ messages: f.prepared.originalMessages, state: f.session.state, config: f.config, tokenCount: 12_000, renderTags: "none" });
+    f.session.state = turn.state;
+    f.prepared.processedMessages = turn.messages;
+    const logs: string[] = [];
+    t.mock.method(ConfiguredSummaryPlan.prototype, "summarize", async (work: readonly SummaryWork[]) => {
+        const content = work[0].content;
+        assert.ok(content.length <= 300_000);
+        assert.ok(JSON.stringify(work).length < 400_000);
+        assert.match(content, /\[\.\.\.elided \d+ chars\.\.\.\]/);
+        const input = JSON.parse(content) as { candidates: { startRef: string; endRef: string }[]; conversation: { id: string; ref: string; text: string }[] };
+        for (const candidate of input.candidates) {
+            assert.ok(input.conversation.some((message) => message.ref === candidate.startRef));
+            assert.ok(input.conversation.some((message) => message.ref === candidate.endRef));
+        }
+        assert.ok(input.conversation.some((message) => message.id === "current" && message.text.includes("Current unfinished task")));
+        assert.equal(phaseJudgeContent(f.prepared, input.candidates.map((candidate, index) => ({ ...candidate, id: `c${index}`, tokens: 0 }))), content, "evidence allocation is deterministic");
+        return { status: "finished", results: [{ status: "success", summary: '{"decision":"no","ranges":[]}', targetIndex: 0, attempts: [] }] };
+    });
+    assert.equal(await runTaskPhase({ ...f.ctx, log: (_level: string, message: string) => logs.push(message) }), f.prepared);
+    assert.ok(logs.some((line) => /evidenceChars=\d+ elapsedMs=\d+/.test(line)));
+});
+
+for (const hard of [false, true]) test(`dedicated judge deadline ${hard ? "refuses above hard" : "permits below hard"} without summary fallback`, async (t) => {
+    const f = fixture(hard ? 20_000 : 12_000);
+    const deadline = new AbortController();
+    const caller = new AbortController();
+    t.mock.method(AbortSignal, "timeout", (milliseconds: number) => {
+        assert.equal(milliseconds, 45_000);
+        assert.equal(milliseconds, PHASE_JUDGE_TIMEOUT_MS);
+        return deadline.signal;
+    });
+    let calls = 0;
+    t.mock.method(ConfiguredSummaryPlan.prototype, "summarize", async (work: readonly SummaryWork[], signal?: AbortSignal) => {
+        calls++;
+        assert.equal(work[0].purpose, "judge");
+        assert.ok(signal && signal !== caller.signal);
+        queueMicrotask(() => deadline.abort(new DOMException("judge deadline", "TimeoutError")));
+        return new Promise((_resolve, reject) => signal!.addEventListener("abort", () => reject(signal!.reason), { once: true }));
+    });
+    const state = JSON.stringify(f.session.state);
+    const result = await runTaskPhase({ ...f.ctx, signal: caller.signal });
+    assert.equal("failFast" in result, hard);
+    if ("failFast" in result) {
+        assert.equal(result.respond, true);
+        assert.match(result.message, /NOT forwarded/);
+    } else assert.equal(result, f.prepared);
+    assert.equal(caller.signal.aborted, false);
+    assert.equal(calls, 1);
+    assert.equal(JSON.stringify(f.session.state), state);
+    assert.equal(f.rebuilds(), 0);
 });
 
 test("policy fields survive disabled and unresolvable chains, targets validate below hard", () => {

@@ -7,6 +7,14 @@ import type { Prepared } from "./server.js";
 import { markDirty } from "./session.js";
 import { imagePlaceholders } from "./image-note.js";
 
+export const PHASE_JUDGE_TIMEOUT_MS = 45_000;
+const PHASE_EVIDENCE_MAX_CHARS = 300_000;
+
+function evidenceText(text: string | undefined): string | undefined {
+    if (text === undefined || text.length <= 1600) return text;
+    return `${text.slice(0, 1200)}[...elided ${text.length - 1600} chars...]${text.slice(-400)}`;
+}
+
 export type PhaseCandidate = { id: string; startRef: string; endRef: string; tokens: number };
 export type PhaseDecision = { decision: "yes" | "no" | "busy"; ranges: string[] };
 
@@ -63,7 +71,35 @@ export function phaseEvidence(prepared: Prepared, candidates: readonly PhaseCand
     const seen = new Set(projected.map((message) => message.id));
     const messages = projected.map((message) => source.get(message.id) ?? message);
     for (const message of source.values()) if (!seen.has(message.id)) messages.push(message);
-    return messages.map((message) => ({ id: message.id, ref: refs[message.id], role: message.role, text: message.text, media: imagePlaceholders(message) }));
+    return messages.map((message) => ({ id: message.id, ref: refs[message.id], role: message.role, text: evidenceText(message.text), media: imagePlaceholders(message).map((note) => evidenceText(note)) }));
+}
+
+export function phaseJudgeContent(prepared: Prepared, candidates: readonly PhaseCandidate[]): string {
+    const messages = phaseEvidence(prepared, candidates);
+    const summaries = prepared.session.state.blocks.filter((block) => block.active).map(({ topic, summary }) => ({ topic: evidenceText(topic), summary: evidenceText(summary) }));
+    const payload = { candidates, conversation: [] as typeof messages, summaries, elision: "[...elided 0 messages...]" };
+    let remaining = PHASE_EVIDENCE_MAX_CHARS - JSON.stringify(payload).length - 256;
+    const boundaries = new Set(candidates.flatMap((candidate) => [candidate.startRef, candidate.endRef]));
+    const priority = messages.map((message, index) => ({ message, index })).filter(({ message, index }) => boundaries.has(message.ref) || index >= messages.length - 5);
+    const retained = new Set<number>();
+    for (const { message, index } of priority) {
+        const cost = JSON.stringify(message).length + 1;
+        if (cost > remaining) throw new Error("Task-phase boundary evidence exceeds the judge budget");
+        retained.add(index);
+        remaining -= cost;
+    }
+    for (const [index, message] of messages.entries()) {
+        if (retained.has(index)) continue;
+        const cost = JSON.stringify(message).length + 1;
+        if (cost > remaining) continue;
+        retained.add(index);
+        remaining -= cost;
+    }
+    payload.conversation = messages.filter((_message, index) => retained.has(index));
+    payload.elision = `[...elided ${messages.length - retained.size} messages; message excerpts keep head/tail, never treat omitted evidence as proof of completion...]`;
+    const content = JSON.stringify(payload);
+    if (content.length > PHASE_EVIDENCE_MAX_CHARS) throw new Error("Task-phase evidence exceeds the judge budget");
+    return content;
 }
 
 export async function runTaskPhase(ctx: PhaseContext): Promise<Prepared | PhaseRefusal> {
@@ -101,13 +137,22 @@ export async function runTaskPhase(ctx: PhaseContext): Promise<Prepared | PhaseR
     let chosen: PhaseCandidate[];
     {
         let batch;
-        try { batch = await plan.summarize([{ purpose: "judge", instructions: PHASE_JUDGE_INSTRUCTIONS,
-            content: JSON.stringify({ candidates, conversation: phaseEvidence(ctx.prepared, candidates), summaries: state.blocks.filter((block) => block.active).map(({ topic, summary }) => ({ topic, summary })) }),
-            minSummaryChars: 1, maxSummaryChars: 16_384 }], signal); } catch { return mandatory || signal?.aborted ? refuse("external phase judgment failed or was cancelled") : ctx.prepared; }
+        let content = "";
+        const started = performance.now();
+        const deadline = AbortSignal.timeout(PHASE_JUDGE_TIMEOUT_MS);
+        const judgeSignal = signal ? AbortSignal.any([signal, deadline]) : deadline;
+        try {
+            content = phaseJudgeContent(ctx.prepared, candidates);
+            batch = await plan.summarize([{ purpose: "judge", instructions: PHASE_JUDGE_INSTRUCTIONS, content,
+                minSummaryChars: 1, maxSummaryChars: 16_384 }], judgeSignal);
+        } catch {
+            ctx.log("info", `[${session.id}] external task-phase judge: failed evidenceChars=${content.length} elapsedMs=${Math.round(performance.now() - started)}`);
+            return mandatory || signal?.aborted ? refuse("external phase judgment failed or was cancelled") : ctx.prepared;
+        }
         if (signal?.aborted || session.state !== state || session.revisionEpoch !== revision) return mandatory || signal?.aborted ? refuse("request cancelled or session changed during phase judgment") : ctx.prepared;
         const reply = batch.results[0];
-        const decision = reply?.status === "success" ? parsePhaseDecision(reply.summary, candidates) : undefined;
-        ctx.log("info", `[${session.id}] external task-phase judge: ${decision?.decision ?? "invalid/unavailable"}`);
+        const decision = !judgeSignal.aborted && reply?.status === "success" ? parsePhaseDecision(reply.summary, candidates) : undefined;
+        ctx.log("info", `[${session.id}] external task-phase judge: ${decision?.decision ?? "invalid/unavailable"} evidenceChars=${content.length} elapsedMs=${Math.round(performance.now() - started)}`);
         if (decision?.decision !== "yes") return mandatory ? refuse(`external phase judgment is ${decision?.decision ?? "invalid or unavailable"}; no safe selection was authorized`) : ctx.prepared;
         chosen = candidates.filter((candidate) => decision.ranges.includes(candidate.id));
         if (mandatory) {
