@@ -49,7 +49,7 @@ import {
 import type { CompressPromptSections, Prompts, SectionOverride, ToolPrompts } from "acp-kernel";
 import { log as loggerLog } from "./logger.js";
 import { maxShrinkPerCompress } from "./fetch-util.js";
-import { EXTERNAL_SUMMARY_NOTE } from "./external-summary-surface.js";
+import { EXTERNAL_SUMMARY_NOTE, TASK_PHASE_OWNERSHIP_NOTE } from "./external-summary-surface.js";
 
 export {
     COMPRESS_TOOL_NAME,
@@ -726,6 +726,6 @@ const SUMMARY_BUDGET_NOTE =
  *  external-summary disclosure instead: the model's summary is only a hint the
  *  kernel never checks against the cap (the service's output is), so the
  *  budget rule cannot apply (#4460). */
-export function withSummaryBudgetNote(text: string, external: boolean): string {
-    return text + (external ? EXTERNAL_SUMMARY_NOTE : SUMMARY_BUDGET_NOTE);
+export function withSummaryBudgetNote(text: string, external: boolean, taskPhase = false): string {
+    return text + (taskPhase ? `\n\n[${TASK_PHASE_OWNERSHIP_NOTE}]` : external ? EXTERNAL_SUMMARY_NOTE : SUMMARY_BUDGET_NOTE);
 }

@@ -22,7 +22,7 @@ import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL, RULE_TOOL, absorbToolsFor, 
 import { applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
-import { autoFoldEngaged, autoFoldFloor, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { autoFoldEngaged, autoFoldFloor, externalSummaryEnabled, growthFoldingArmed, taskPhaseEnabled } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
@@ -404,7 +404,7 @@ export async function prepareAnthropic(
         // consecutive decision failures.
         const decideTier1Arm = decide !== undefined && !!turn.nudge && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && laneDecisions.compressSurfaceOn && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)));
+        const nudgeEligible = !taskPhaseEnabled(loopConfig) && opts.compress.injectNudge && !!turn.nudge && laneDecisions.compressSurfaceOn && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)));
         // #3461: pressure admitted by every standing gate but held by the backoff
         // is still an active nudge round — self-heal credit (#2155/#3004) must
         // not starve because we chose not to re-inject this round.
@@ -413,7 +413,7 @@ export async function prepareAnthropic(
         // trigger and no intercept health window — those differences are
         // explicit inputs on the responses lane.
         const willInjectNudge = nudgeOn({
-            injectNudge: opts.compress.injectNudge,
+            injectNudge: !taskPhaseEnabled(loopConfig) && opts.compress.injectNudge,
             hasNudgePlan: !!turn.nudge,
             compressSurfaceOn: laneDecisions.compressSurfaceOn,
             compactionTrigger: false,
@@ -491,7 +491,7 @@ export async function prepareAnthropic(
         // the compress prompt on round-2, the exact F2 seam the matrix pins).
         systemOut = stampAnthropicSystemCacheControl(systemOut, anthropicCacheMarks !== undefined);
         if (injectTools) {
-            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
+            toolsOut = injectTool(parsed.tools, [...(absorbActive ? [absorbTools.anthropic] : []), ...(rulesActive ? [RULE_TOOL] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).anthropic] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config), taskPhaseEnabled(config));
         }
         // Nudge as a separate trailing user message (cache-friendly): the
         // system block stays byte-stable so the prefix cache survives.
@@ -514,7 +514,7 @@ export async function prepareAnthropic(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config), taskPhaseEnabled(config)), visibilityMarkers) }];
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -531,7 +531,7 @@ export async function prepareAnthropic(
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config), taskPhaseEnabled(config)), visibilityMarkers) }];
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -547,7 +547,7 @@ export async function prepareAnthropic(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "anthropic");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config), taskPhaseEnabled(config)), visibilityMarkers) }];
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";

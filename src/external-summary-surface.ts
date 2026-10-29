@@ -9,6 +9,10 @@ export const EXTERNAL_SUMMARY_NOTE = "\n\n[External summary mode: the conversati
  *  `config.externalSummary?.enabled === true`. The settings ride the
  *  ResolvedKernelConfig rail from resolveRequestConfig → storeEffectiveConfig,
  *  so no consumer re-reads the config file. */
+export function taskPhaseEnabled(config: unknown): boolean {
+    return (config as ResolvedKernelConfig | undefined)?.externalSummary?.taskPhase === true;
+}
+
 export function externalSummaryEnabled(config: unknown): boolean {
     return (config as ResolvedKernelConfig | undefined)?.externalSummary?.enabled === true;
 }
@@ -20,8 +24,10 @@ export function externalSummaryEnabled(config: unknown): boolean {
  *  (howToCompress, ~1.5K tokens) are then dead weight on every conversation
  *  request, so the section is dropped there. Philosophy (when to compress)
  *  stays. Never apply this to the summary request's own instructions. */
-export function conversationPromptSections(sections: CompressPromptSections | undefined, external: boolean): CompressPromptSections | undefined {
-    return external ? { ...sections, howToCompress: null } : sections;
+export const TASK_PHASE_OWNERSHIP_NOTE = "Context maintenance is handled automatically by an independent external service. Focus on the user's task. Do not judge task phases, select compression ranges, plan compression, or write context summaries unless the user explicitly requests that action. Retrieval and status tools remain available when needed for the task.";
+
+export function conversationPromptSections(sections: CompressPromptSections | undefined, external: boolean, taskPhase = false): CompressPromptSections | undefined {
+    return taskPhase ? { ...sections, philosophy: TASK_PHASE_OWNERSHIP_NOTE, howToCompress: null } : external ? { ...sections, howToCompress: null } : sections;
 }
 
 /** Upper bound (ms) on how long the proxy needs to execute a summary-producing
@@ -129,13 +135,13 @@ function adaptSchema(value: unknown): unknown {
 }
 
 /** Preserve protocol wrappers and unrelated tools; never mutate shared kernel constants. */
-export function withExternalSummaryTools<T>(tools: readonly T[], enabled: boolean): T[] {
-    if (!enabled) return [...tools];
+export function withExternalSummaryTools<T>(tools: readonly T[], enabled: boolean, taskPhase = false): T[] {
+    if (!enabled && !taskPhase) return [...tools];
     return tools.map((tool) => {
         const copy = structuredClone(tool) as T & { name?: string; description?: string; parameters?: unknown; input_schema?: unknown; function?: { name?: string; description?: string; parameters?: unknown } };
         const declaration = copy.function ?? copy;
         if (declaration.name !== "compress") return tool;
-        declaration.description = "Compress selected consumed ranges using the configured independent summary service." + EXTERNAL_SUMMARY_NOTE;
+        declaration.description = taskPhase ? `Only for explicit user-directed compression. ${TASK_PHASE_OWNERSHIP_NOTE}` : "Compress selected consumed ranges using the configured independent summary service." + EXTERNAL_SUMMARY_NOTE;
         if (declaration.parameters) declaration.parameters = adaptSchema(declaration.parameters);
         if (copy.input_schema) copy.input_schema = adaptSchema(copy.input_schema);
         return copy;

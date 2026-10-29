@@ -25,7 +25,7 @@ import { ABSORB_TOOL_NAME, BILI_ACP_READONLY_TOOLS_RESPONSES, BILI_ACP_READONLY_
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, imageRescaleToolArmed, retrieveToolName } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
-import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, taskPhaseEnabled, TASK_PHASE_OWNERSHIP_NOTE } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
@@ -381,7 +381,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // advisory punches through per 3 consecutive decision failures.
         const decideTier1Arm = decide !== undefined && !!turn.nudge && turn.nudge.tier === 1 && turn.nudge.breakdown.emergencyOverride !== 1;
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && compressSurfaceOn && !isCompactionTrigger && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined, autoFoldFloor(session)));
+        const nudgeEligible = !taskPhaseEnabled(loopConfig) && opts.compress.injectNudge && !!turn.nudge && compressSurfaceOn && !isCompactionTrigger && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, codexLane && codexCompactMode() === "intercept" ? loopConfig.modelContextLimit * CODEX_COMPACT_HEALTH_RATIO : undefined, autoFoldFloor(session)));
         // #3461: pressure admitted by every standing gate but held by the backoff
         // is still an active nudge round — self-heal credit (#2155/#3004) must
         // not starve because we chose not to re-inject this round.
@@ -391,7 +391,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
         // trigger (#2155/#2432 — a trigger request never carries the nudge)
         // and the codex-intercept health window (#2774).
         const willInjectNudge = nudgeOn({
-            injectNudge: opts.compress.injectNudge,
+            injectNudge: !taskPhaseEnabled(loopConfig) && opts.compress.injectNudge,
             hasNudgePlan: !!turn.nudge,
             compressSurfaceOn: laneDecisions.compressSurfaceOn,
             compactionTrigger: isCompactionTrigger,
@@ -429,14 +429,16 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
             ? []
             : (session.metadata.codexForgedSummaries as string[] | undefined) ?? [];
         // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
-        const tagsOnlyPrompt = !compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt() && !knobRenderNone()
+        const tagsOnlyPrompt = taskPhaseEnabled(config) && !compressSurfaceOn && !isCompactionTrigger
+            ? TASK_PHASE_OWNERSHIP_NOTE
+            : !compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt() && !knobRenderNone()
             ? buildAcpTagsOnlyPrompt(responsesTextProtocol ? "hybrid" : "function", prompts, surface?.promptSections)
             : "";
         // #4305: standing generation-boundary note — byte-stable once detected;
         // never on a compaction-trigger passthrough (renderTags="none" there).
         const genBoundaryActive = detectGenerationBoundary(session, processedMessages, log);
         if (compressSurfaceOn && !isCompactionTrigger && !knobNoCompressPrompt()) {
-            const prompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))) : buildCompressSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect));
+            const prompt = withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(responsesTextProtocol ? buildCompressHybridSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config), taskPhaseEnabled(config))) : buildCompressSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config), taskPhaseEnabled(config))), externalSummaryEnabled(config), taskPhaseEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect));
             const devParts = [...projection.systemParts, ...forgedSummaries, prompt];
             if (genBoundaryActive) devParts.push(GENERATION_BOUNDARY_NOTE);
             if (absorbActive) devParts.push(buildAbsorbSystemPrompt(absorbToolName(loopConfig)));
@@ -450,8 +452,8 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                 const ccrOn = ccrEnabled(session);
                 const respExtra = [...(absorbActive ? [absorbTools.responses] : []), ...(rulesActive ? [RULE_TOOL_RESPONSES] : []), ...(ccrOn ? [retrieveToolsFor(retrieveToolName(session)).responses] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_RESPONSES] : [])];
                 toolsOut = responsesTextProtocol
-                    ? injectResponsesTool(parsed.tools, ccrOn ? BILI_ACP_READONLY_TOOLS_RESPONSES : BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, surface?.toolPrompts, externalSummaryEnabled(config))
-                    : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...(ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), ...respExtra] : (ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), surface?.toolPrompts, externalSummaryEnabled(config));
+                    ? injectResponsesTool(parsed.tools, ccrOn ? BILI_ACP_READONLY_TOOLS_RESPONSES : BILI_ACP_READONLY_TOOLS_RESPONSES_NO_RANGE, surface?.toolPrompts, externalSummaryEnabled(config), taskPhaseEnabled(config))
+                    : injectResponsesTool(parsed.tools, respExtra.length > 0 ? [...(ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), ...respExtra] : (ccrOn ? BILI_ACP_TOOLS_RESPONSES : BILI_ACP_TOOLS_RESPONSES_NO_RANGE), surface?.toolPrompts, externalSummaryEnabled(config), taskPhaseEnabled(config));
             }
         } else if (tagsOnlyPrompt !== "" || projection.systemParts.length > 0 || forgedSummaries.length > 0) {
             const devContent = [...projection.systemParts, ...forgedSummaries, ...(tagsOnlyPrompt !== "" ? [tagsOnlyPrompt] : []), ...(genBoundaryActive && !isCompactionTrigger ? [GENERATION_BOUNDARY_NOTE] : [])].join("\n\n---\n\n");
@@ -489,7 +491,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                         const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                             ? [{ type: "message", role: "user", content: rebuiltInput }]
                             : rebuiltInput;
-                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) });
+                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config), taskPhaseEnabled(config)), visibilityMarkers) });
                         rebuiltInput = inputItems;
                         log("debug", `[${sessionId}] [inject] ephemeral nudge appended as trailing user turn (${rendered.text.length} chars)`);
                         nudgeOutcome = "injected";
@@ -515,7 +517,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                         const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                             ? [{ type: "message", role: "user", content: rebuiltInput }]
                             : [...stableItems];
-                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) });
+                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config), taskPhaseEnabled(config)), visibilityMarkers) });
                         rebuiltInput = inputItems;
                         log("debug", `[${sessionId}] [inject] compress directive appended as trailing user turn`);
                         nudgeOutcome = "injected";
@@ -536,7 +538,7 @@ reconcileFoldCoverage(session, msgs, { mode: foldMode, sessionId, log, markerStr
                         const inputItems: ResponseInputItem[] = typeof rebuiltInput === "string"
                             ? [{ type: "message", role: "user", content: rebuiltInput }]
                             : rebuiltInput;
-                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) });
+                        inputItems.push({ type: "message", role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config), taskPhaseEnabled(config)), visibilityMarkers) });
                         rebuiltInput = inputItems;
                         log("debug", `[${sessionId}] [inject] ephemeral nudge appended as trailing user turn (${rendered.text.length} chars)`);
                         nudgeOutcome = "injected";

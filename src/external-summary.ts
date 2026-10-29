@@ -1,5 +1,6 @@
 export interface SummaryWork {
     readonly content: string;
+    readonly purpose?: "judge";
     readonly instructions: string;
     readonly reference?: string;
     readonly minSummaryChars?: number;

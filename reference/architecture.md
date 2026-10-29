@@ -11,6 +11,7 @@ billion-context/
 │   ├── index.ts                  # Entry point: runs cli.ts main()
 │   ├── cli.ts                    # CLI dispatcher: start/update/export/test/plugin + client launcher
 │   ├── server.ts                 # HTTP proxy server, request pipeline (hot file — §7.2)
+│   ├── task-phase.ts             # Opt-in external semantic scheduling and strict preflight threshold (fork policy)
 │   ├── server/                   # Server-side support modules
 │   │   ├── admin.ts              #   /__bili/* + /__acp/* admin route surface (stats/status/overview/sessions/detail/logs/config/plugin/watcher/upstream endpoints), loopback + trusted-origin gated (#1440)
 │   │   ├── budget.ts             #   chars/4 overhead measure outside the kernel fold space

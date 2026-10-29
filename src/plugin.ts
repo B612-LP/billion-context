@@ -12,7 +12,7 @@ import { acquireInFlight, createSession, getSession, publishForkSession, diagnos
 import { clientConversationHeader } from "./session-id.js";
 import { buildContextView } from "./context-view.js";
 import { ABSORB_TOOL_NAME, BILI_ACP_TOOLS_ANTHROPIC, BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, BILI_ACP_TOOLS_OPENAI, BILI_ACP_TOOLS_OPENAI_NO_RANGE, BILI_ACP_TOOLS_RESPONSES_NO_RANGE, PROXY_TOOL_NAMES, READ_ORIGINAL_IMAGE_TOOL, READ_ORIGINAL_IMAGE_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, READ_ORIGINAL_IMAGE_TOOL_RESPONSES, RETRIEVE_TOOL_NAME, RULE_TOOL, RULE_TOOL_NAME, RULE_TOOL_OPENAI, RULE_TOOL_RESPONSES, SEARCH_CONTEXT_TOOL_NAME, absorbToolsFor, retrieveToolsFor, withAcpNotes, withAcpNotesOpenAI } from "./compress-tool.js";
-import { externalSummaryEnabled, externalSummaryMaxToolDurationMs, withExternalSummaryTools } from "./external-summary-surface.js";
+import { externalSummaryEnabled, externalSummaryMaxToolDurationMs, taskPhaseEnabled, withExternalSummaryTools } from "./external-summary-surface.js";
 import { salvageCompressArgs } from "./plugin-compress-salvage.js";
 import { absorbEnabled, effectiveAbsorbConfig, isProxyToolFor } from "./absorb.js";
 import { effectiveRulesEnabled, rulesEnabled } from "./rules-feature.js";
@@ -957,13 +957,13 @@ export function handlePluginManifest(res: import("node:http").ServerResponse, co
     // harness will reject nor dodges the direct call native hosts expect.
     // #3243: the pack surface's tool descriptions (toolPrompts) override the
     // stock descriptions where a promptPack declares its own.
-    const acpAnthropic = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalSummary), "binding");
-    const acpOpenai = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalSummary), "binding");
+    const acpAnthropic = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_ANTHROPIC : BILI_ACP_TOOLS_ANTHROPIC_NO_RANGE, toolPrompts), externalSummary, taskPhaseEnabled(config)), "binding");
+    const acpOpenai = withAcpNotesOpenAI(withExternalSummaryTools(applyAcpToolOverrides(ccrOn ? BILI_ACP_TOOLS_OPENAI : BILI_ACP_TOOLS_OPENAI_NO_RANGE, toolPrompts), externalSummary, taskPhaseEnabled(config)), "binding");
     // Responses wire: plugin mode structurally disarms CCR there (#1271 —
     // PLUGIN_CCR_WIRES excludes it), so range restore can never execute for a
     // registered agent on that wire — always the no-range variant, mirroring
     // how ccrTools above is never spread into the responses array.
-    const acpResponses = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, toolPrompts), externalSummary), "binding");
+    const acpResponses = withAcpNotes(withExternalSummaryTools(applyAcpToolOverrides(BILI_ACP_TOOLS_RESPONSES_NO_RANGE, toolPrompts), externalSummary, taskPhaseEnabled(config)), "binding");
     res.writeHead(200, { "content-type": "application/json" });
     res.end(JSON.stringify({
         ok: true,

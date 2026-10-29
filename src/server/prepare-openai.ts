@@ -24,7 +24,7 @@ import { ABSORB_TOOL_NAME, READ_ORIGINAL_IMAGE_TOOL_OPENAI, RULE_TOOL_OPENAI, ab
 import { absorbToolName, applyAbsorbView, storeEffectiveAbsorb } from "../absorb.js";
 import { adoptContentStore, ccrEnabled, ccrLoopConfig, contentStoreOf, dropRetrievals, imageRescaleToolArmed, pruneExpiredRetrievals, reconcileReloadedRetrievals, renderRetrievalNotes, retrieveToolName, snapshotPendingRetrievals, snapshotRetrievalNotes } from "../store.js";
 import { rulesEnabled, storeEffectiveRules } from "../rules-feature.js";
-import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed } from "../external-summary-surface.js";
+import { autoFoldEngaged, autoFoldFloor, conversationPromptSections, externalSummaryEnabled, growthFoldingArmed, taskPhaseEnabled, TASK_PHASE_OWNERSHIP_NOTE } from "../external-summary-surface.js";
 import { filterDeadRanges } from "../dead-ranges.js";
 import { detectGenerationBoundary, GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 import { attachSubagentSessions } from "../subagent-sessions.js";
@@ -261,7 +261,7 @@ export async function prepareOpenai(
         // counter on the same round, so at most ONE legacy advisory punches
         // through per DECIDE_FALLBACK_THRESHOLD consecutive decision failures.
         const decideFallbackOverride = decideTier1Arm && ladderMode(session.metadata) === "fallback";
-        const nudgeEligible = opts.compress.injectNudge && !!turn.nudge && laneDecisions.compressSurfaceOn && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)));
+        const nudgeEligible = !taskPhaseEnabled(loopConfig) && opts.compress.injectNudge && !!turn.nudge && laneDecisions.compressSurfaceOn && (!nudgeSuppressed(session) || decideFallbackOverride) && !compressBreakerArmed(session) && !(autoFoldEngaged(loopConfig, session) && growthFoldingArmed(loopConfig, undefined, autoFoldFloor(session)));
         // #3461: pressure admitted by every standing gate but held by the backoff
         // is still an active nudge round — self-heal credit (#2155/#3004) must
         // not starve because we chose not to re-inject this round.
@@ -272,7 +272,7 @@ export async function prepareOpenai(
         // conjunct is subsumed by compressSurfaceOn (=== shouldInject &&
         // compressReachable).
         const willInjectNudge = nudgeOn({
-            injectNudge: opts.compress.injectNudge,
+            injectNudge: !taskPhaseEnabled(loopConfig) && opts.compress.injectNudge,
             hasNudgePlan: !!turn.nudge,
             compressSurfaceOn: laneDecisions.compressSurfaceOn,
             compactionTrigger: false,
@@ -338,8 +338,9 @@ export async function prepareOpenai(
         // would invalidate the cache every turn.
         const sysParts: string[] = [];
         if (openaiSystemText) sysParts.push(openaiSystemText);
+        if (taskPhaseEnabled(config) && !laneDecisions.compressSurfaceOn) sysParts.push(TASK_PHASE_OWNERSHIP_NOTE);
         let acpStandingPushed = false;
-        if (laneDecisions.compressSurfaceOn) { sysParts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config))), externalSummaryEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect))); acpStandingPushed = true; }
+        if (laneDecisions.compressSurfaceOn) { sysParts.push(withProjectAttribution(withMcpDialectNote(withMarkerIntegrityNote(withSummaryBudgetNote(buildCompressSystemPrompt(prompts, conversationPromptSections(surface?.promptSections, externalSummaryEnabled(config), taskPhaseEnabled(config))), externalSummaryEnabled(config), taskPhaseEnabled(config)), visibilityMarkers), laneDecisions.mcpDialect))); acpStandingPushed = true; }
         else if (!isTitleGen && !knobRenderNone()) {
             // #1881: the NEVER-echo prohibition follows the rendered tags, not the tool switch.
             const tagsOnly = buildAcpTagsOnlyPrompt("function", prompts, surface?.promptSections);
@@ -359,7 +360,7 @@ export async function prepareOpenai(
         // avoids double-counting it.
         openaiOutboundSystem = sysParts.join("\n\n");
         if (injectTools) {
-            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config));
+            toolsOut = injectOpenaiTool(parsed.tools, [...(absorbActive ? [absorbTools.openai] : []), ...(rulesActive ? [RULE_TOOL_OPENAI] : []), ...(ccrEnabled(session) ? [retrieveToolsFor(retrieveToolName(session)).openai] : []), ...(imageRescaleToolArmed(session) ? [READ_ORIGINAL_IMAGE_TOOL_OPENAI] : [])], surface?.toolPrompts, ccrEnabled(session), externalSummaryEnabled(config), taskPhaseEnabled(config));
         }
         // Nudge as a separate trailing user message (cache-friendly). Injected
         // in BOTH modes (#451): plugin agents supply the ACP tools but have no
@@ -378,7 +379,7 @@ export async function prepareOpenai(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "openai");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config), taskPhaseEnabled(config)), visibilityMarkers) }];
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -399,7 +400,7 @@ export async function prepareOpenai(
                 if (outcome.kind === "yes") {
                     const span = resolveDecisionRange(outcome, ranges);
                     if (span) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(buildDirectiveText(span.startRef, span.endRef, outcome.topic), turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config), taskPhaseEnabled(config)), visibilityMarkers) }];
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
@@ -417,7 +418,7 @@ export async function prepareOpenai(
                     const rendered = renderNudgeText(turn.nudge, prompts, surface?.nudgeSections, "openai");
                     const renderedWithPayload = rendered.text;
                     if (rendered.text) {
-                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config)), visibilityMarkers) }];
+                        rebuiltMessages = [...rebuiltMessages, { role: "user", content: withMarkerIntegrityNote(withSummaryBudgetNote(withFirstSightDrain(renderedWithPayload, turn.nudge.reason, externalSummaryEnabled(config)), externalSummaryEnabled(config), taskPhaseEnabled(config)), visibilityMarkers) }];
                         nudgeOutcome = "injected";
                     } else {
                         nudgeOutcome = "skipped";
