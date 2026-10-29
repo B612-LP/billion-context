@@ -384,6 +384,50 @@ remove <client>` best-effort queries the live proxy (instance file →
 `GET /__bili/sessions`, 2.5 s timeout, silent on failure) and prints a note
 when sessions of that client were active within the last **10 minutes**.
 
+## Net-progress guard — stop compressing when folding stops shrinking (#5058)
+
+D1 above only arms when reductions STOP landing — it is blind to the opposite
+failure: folds keep committing while the session keeps GROWING. That is the
+companion-session spiral (#5058): every nudge round ends in a successful
+compress whose own action cost (tool-call args, receipts, reasoning — all
+re-sent next round) outweighs what the fold removed, so the flat-50K growth
+gate re-arms forever and the session walks past its window with no guard
+firing. The net-benefit gate (#2748/#3322) checks each commit in isolation;
+it cannot see the cross-round trajectory.
+
+`src/net-progress-guard.ts` adds the trajectory view:
+
+- **Baseline** — recorded at every successful fold commit in `src/stream.ts`:
+  `recordNetProgressBaseline(session, viewTokens, postCtx)` where both numbers
+  come from the SAME kernel counter over the live outbound view (the
+  #1911 same-space discipline — no usage-grade estimate may mix into this
+  pair). Each new fold opens a fresh evidence window; strikes reset.
+- **Round check** — once per request on nudge-carrying lanes (inside the same
+  `!selfHealRoundDone && prepared.nudge !== undefined` block as D1/D2),
+  `evaluateNetProgressRound(session, observedTokens, log)` compares the
+  inbound resend size (`countMessageTokens` over `prepared.originalMessages`)
+  against the baseline: `observed < baseline − NET_PROGRESS_MARGIN_TOKENS`
+  (25_000 — half the flat step; large enough to absorb estimator noise and
+  the one-round materialization lag where the post-compress re-request still
+  carries the unfolded history, #252) counts as progress and resets;
+  otherwise it is a strike. `NET_PROGRESS_STRIKE_LIMIT` (2) consecutive
+  non-progress rounds arm the latch.
+- **Remedy** — suppress the nudge at all four `willInjectNudge` gates via
+  `nudgeInjectionBlocked(session)` (the D1 predicate OR'd with this one); the
+  decide ladder's fallback escape still punches through ONE legacy advisory
+  while suppressed (same #3004 deadlock guard as D1). Latch:
+  `session.metadata.netProgressGuard = { baseline, expectedFloor, strikes,
+  armedAt }`; wall expiry reuses `SELF_HEAL_SUPPRESS_CAP_MS` (10 min) so a
+  latched session is never silent past that without fresh evidence; any real
+  reduction lifts it early. Evaluate MUST run while suppressed or recovery
+  could never be observed (the #3004 circular-wait trap).
+
+Observability: armed state is exposed in `/__bili/sessions` (`netProgress`)
+and badged in the web UI ("swelling"); arm/recovery/expiry each log one
+`[net-progress]` line with the observed vs baseline numbers and the rotate-to-
+fresh-session advice. No config surface — constants by design (same precedent
+as #2155); operators who want a lazier cadence set `compress.nudgeGrowthTokens`.
+
 ## Degraded direct fallback — refuse, self-heal, announce (#4516, #3304, #2924, #4079)
 
 When a native lane's proxy is unavailable, model traffic falls back to direct
