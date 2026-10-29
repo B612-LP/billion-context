@@ -734,12 +734,16 @@ function sampleActiveBili(pi: ExtensionAPI, state: RegisterState): void {
 // the host currently holds are never removed), mirroring pi's own reload()
 // precedent of re-activating all extension tools. No loadout query/setter (older
 // pi / omp) or a throwing query → no-op, never a blind set.
-// #4988: "missing" is judged against the PRE-navigation observation, not against
-// everything we ever registered — a tool deliberately kept off by an external
-// loadout manager (or a manual toggle) was inactive before the navigation too, so
-// it is not among the candidates and its off state survives in either handler
-// order. Never sampled (host without session_before_tree) → the original
-// all-registered recovery stands.
+ // #4988: "missing" is judged against the PRE-navigation observation, not against
+ // everything we ever registered — a tool deliberately kept off by an external
+ // loadout manager (or a manual toggle) was inactive before the navigation too, so
+ // it is not among the candidates and its off state survives in either handler
+ // order. Never sampled (host without session_before_tree) → the original
+ // all-registered recovery stands. Known boundary: when SOURCE and TARGET branches
+ // carry DIFFERENT selections (active on source, deliberately off on target), the
+ // post-nav absence looks exactly like a rewind drop from bili's local view — bili
+ // running LAST resurrects it, only the manager-last order keeps the target
+ // selection; closing that needs a coordination signal, not a better local guess.
 function reassertLoadoutAfterTree(pi: ExtensionAPI, state: RegisterState, agent: string): void {
     const tools = state.registeredTools;
     if (tools === undefined || tools.length === 0) return;

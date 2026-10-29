@@ -1204,6 +1204,62 @@ test("#4988: a navigation before the manifest lands is a no-op; recovery works o
     }
 });
 
+// #4988 boundary: when the SOURCE and TARGET branches carry DIFFERENT tool
+// selections, bili's local view cannot tell "the rewind dropped my tool" from
+// "an external manager deliberately keeps it off on THIS branch" — both look
+// like "observed active pre-nav, absent post-nav". The outcome then depends on
+// handler order; these two rows pin the current behavior of each order so a
+// future protocol change (or its absence) is visible as a test change.
+test("#4988: differing branch selections, bili LAST — the pre-nav observation wins (known residual)", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        // Source branch: both bili tools active — that is the pre-nav observation.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "compress", "acp_status");
+        await pi.events.get("session_before_tree")!({ type: "session_before_tree", preparation: {} }, undefined);
+        // Rewind to the target branch resets the loadout; the target branch's
+        // selection keeps acp_status on but compress deliberately OFF.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read");
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "acp_status");
+        // Bili's handler runs AFTER the external manager's: from its vantage
+        // point compress was active pre-nav and is gone — indistinguishable
+        // from a rewind drop, so it comes back. Pinned, not blessed.
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.deepEqual([...pi.activeTools].sort(), ["acp_status", "bash", "compress", "read"], "pre-nav (source) observation outranks the target's deliberate off when bili runs last");
+        assert.equal(pi.setActiveCalls.length, 1, "exactly one setter call");
+    } finally {
+        await proxy.close();
+    }
+});
+
+test("#4988: differing branch selections, bili FIRST — the target selection wins", async () => {
+    const proxy = await startFakeProxy();
+    try {
+        const pi = makeFakePi();
+        biliPlugin(pi as never);
+        await pi.events.get("session_start")!({}, fakeCtx(proxy));
+        await waitForTools(pi, 2);
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "compress", "acp_status");
+        await pi.events.get("session_before_tree")!({ type: "session_before_tree", preparation: {} }, undefined);
+        // Raw transcript reset drops both bili tools...
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read");
+        // ...and bili's handler runs FIRST, recovering everything it observed.
+        await pi.events.get("session_tree")!({ type: "session_tree", newLeafId: null, oldLeafId: "leaf-1" }, undefined);
+        assert.deepEqual([...pi.activeTools].sort(), ["acp_status", "bash", "compress", "read"], "bili recovers its observed tools over the raw reset");
+        // The external manager applies the TARGET branch's selection last:
+        // compress stays off there. Its write is additive-host-compatible, so
+        // it simply stands as the final state — no further bili interference.
+        pi.activeTools.splice(0, pi.activeTools.length, "bash", "read", "acp_status");
+        assert.ok(!pi.activeTools.includes("compress"), "the target branch's deliberate off survives when bili ran first");
+        assert.equal(pi.setActiveCalls.length, 1, "exactly one setter call — bili's own");
+    } finally {
+        await proxy.close();
+    }
+});
+
 test("#1217: launcher-mode manifest fetch is primed at extension load time", async () => {
     // Correctness of the -p first-request stamp under ANY latency is #1228's
     // awaited ownership claim; this prime is the latency half: the manifest
