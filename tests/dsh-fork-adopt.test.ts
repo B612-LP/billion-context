@@ -45,6 +45,47 @@ test("forkIdentityHashOf stays byte-identical to plugin.ts forkMessageIdentityHa
     }
 });
 
+test("fork identity tolerates serialization/projection noise but keeps content gates hard (#5123)", () => {
+    // reasoning↔text with identical text is now the SAME history cell (hosts re-project):
+    const reasoning: CoreMessage = { id: "r", role: "assistant", contentType: "reasoning", text: "Let me think." };
+    const asText: CoreMessage = { id: "r", role: "assistant", contentType: "text", text: "Let me think." };
+    assert.equal(forkIdentityHashOf(reasoning), forkIdentityHashOf(asText));
+    // tool-call arguments differing only in whitespace are now the SAME call:
+    const callA: CoreMessage = { id: "c", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "tc-9", text: '{ "command": "ls -la" }' };
+    const callB: CoreMessage = { id: "c", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "tc-9", text: '{"command":"ls -la"}' };
+    assert.equal(forkIdentityHashOf(callA), forkIdentityHashOf(callB));
+    // a genuine TEXT change still breaks the match (content gate stays hard):
+    const edited: CoreMessage = { id: "r", role: "assistant", contentType: "text", text: "Let me think again." };
+    assert.notEqual(forkIdentityHashOf(asText), forkIdentityHashOf(edited));
+    // a different tool-call id still breaks it (content gate stays hard):
+    const otherCall: CoreMessage = { id: "c", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "tc-8", text: '{"command":"ls -la"}' };
+    assert.notEqual(forkIdentityHashOf(callB), forkIdentityHashOf(otherCall));
+    // client/server parity survives the relaxation:
+    for (const m of [reasoning, asText, callA, callB, edited, otherCall]) assert.equal(forkIdentityHashOf(m), forkMessageIdentityHash(m));
+});
+
+test("matchForkPrefix reaches full depth across reasoning→text + tool-call-whitespace divergence (#5123 acceptance)", () => {
+    // Parent-form rows (what the snapshot stores); the child core re-projects them lossily.
+    const parentForm: Array<CoreMessage> = [
+        { id: "p0", role: "user", contentType: "text", text: "question" },
+        { id: "p1", role: "assistant", contentType: "reasoning", text: "Let me explore." },
+        { id: "p2", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "tc-1", text: '{ "command": "ls" }' },
+        { id: "p3", role: "tool", contentType: "tool-result", toolName: "bash", toolCallId: "tc-1", text: "total 0" },
+    ];
+    const identities = parentForm.map((m, i) => ({ rawId: `r${i}`, ref: `m${String(i + 1).padStart(5, "0")}`, identityHash: forkMessageIdentityHash(m) }));
+    // Child core: same content, but reasoning dropped to text and the tool call re-stringified.
+    const childCore: Array<CoreMessage> = [
+        { id: "c0", role: "user", contentType: "text", text: "question" },
+        { id: "c1", role: "assistant", contentType: "text", text: "Let me explore." },
+        { id: "c2", role: "assistant", contentType: "tool-call", toolName: "bash", toolCallId: "tc-1", text: '{"command":"ls"}' },
+        { id: "c3", role: "tool", contentType: "tool-result", toolName: "bash", toolCallId: "tc-1", text: "total 0" },
+    ];
+    assert.equal(matchForkPrefix(childCore, identities), parentForm.length);
+    // A genuine content change at idx1 still truncates the prefix exactly there:
+    const divergedCore = childCore.map((m, i) => (i === 1 ? { ...m, text: "completely different" } : m));
+    assert.equal(matchForkPrefix(divergedCore, identities), 1);
+});
+
 test("forkOrderHashOf matches the plugin.ts recipe (plain JSON.stringify, literal key order)", () => {
     const identities = [
         { rawId: "a", ref: "m00001", identityHash: "x1" },
@@ -494,12 +535,10 @@ test("fork response exposes degraded + parentBlocks so the client can detect emp
         });
         const resText = await res.text();
         assert.equal(res.status, 201, resText);
-        const body = JSON.parse(resText) as { degraded?: boolean; parentBlocks?: number; inheritedBlocks?: unknown[] };
-        // This parent never compressed, so it holds no blocks: nothing to inherit is
-        // NOT a degenerate fork — the flag must be false, or a healthy fresh-session
-        // clone would wrongly degrade and skip its own adoption.
+        const body = JSON.parse(resText) as { degraded?: boolean; parentBlocks?: number; inheritedBlocks?: unknown[]; blockStatus?: string };
         assert.equal(body.parentBlocks, 0);
         assert.equal(body.degraded, false);
+        assert.equal(body.blockStatus, "nothing-to-inherit", "a never-compressed parent has nothing to inherit — not the degenerate zero-of-N case");
         assert.ok(Array.isArray(body.inheritedBlocks));
     } finally {
         await h.close();

@@ -74,10 +74,27 @@ function forkHash(value: unknown): string {
     return createHash("sha256").update(forkStableJson(value), "utf8").digest("hex");
 }
 
+// #5123: canonicalize the identity inputs so serialization/projection noise
+// cannot truncate fork prefix matching. Two relaxations vs the historical
+// tuple, both owner-approved after forensics showed every break on affected
+// sessions was noise, not content loss (97.6%~99.8% of rows align once these
+// two are applied): (1) contentType drops out — a reasoning cell and a text
+// cell with the same text ARE the same history cell (hosts re-project
+// reasoning↔text); (2) tool-call text is JSON-canonicalized — re-stringified
+// arguments differ only in whitespace. role/text/toolName/toolCallId/
+// thinkingTokens/summaryOfBlockId/toolIsError remain hard gates. Must stay
+// byte-identical to src/plugin.ts forkCanonicalText.
+function forkCanonicalText(text: unknown, contentType: unknown): unknown {
+    if (contentType === "tool-call" && typeof text === "string") {
+        try { return JSON.stringify(JSON.parse(text)); } catch { return text; }
+    }
+    return text ?? null;
+}
+
 /** Byte-identical to src/plugin.ts forkMessageIdentityHash. */
 export function forkIdentityHashOf(message: CoreMessage): string {
     const toolIsError = (message as CoreMessage & { toolIsError?: boolean }).toolIsError === true;
-    return forkHash([message.role, message.contentType, message.text ?? null, message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, toolIsError]);
+    return forkHash([message.role, forkCanonicalText(message.text, message.contentType), message.toolName ?? null, message.toolCallId ?? null, message.thinkingTokens ?? null, message.summaryOfBlockId ?? null, toolIsError]);
 }
 
 /** Byte-identical to src/plugin.ts forkOrderHash (plain JSON.stringify over
