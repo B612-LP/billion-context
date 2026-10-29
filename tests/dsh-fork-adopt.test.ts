@@ -297,26 +297,33 @@ const truncatedTailBody = () => bodyFor([
     { role: "user", content: "a different tail" },
 ]);
 
-test("tryForkAdoption degrades when zero blocks inherited while the parent held some and the match truncated (#5123)", async () => {
-    const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true, inheritedBlocks: [], parentBlocks: 3 }, 201) }, []);
+test("tryForkAdoption degrades on the server's authoritative flag when zero blocks were inherited (#5123)", async () => {
+    const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true, degraded: true, inheritedBlocks: [], parentBlocks: 3 }, 201) }, []);
     const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: truncatedTailBody(), fetchImpl });
     assert.equal(result.outcome, "degraded");
     assert.match((result as { reason: string }).reason, /^fork inherited 0 of 3 parent blocks \(branch point 2\/3\)$/);
 });
 
-test("tryForkAdoption still adopts when blocks were inherited, even with a truncated match (#5123)", async () => {
-    const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true, inheritedBlocks: [{ id: "b1", tier: 1, active: true }], parentBlocks: 3 }, 201) }, []);
+test("tryForkAdoption trusts the server flag even on a full local match (no client-side truncation gate) (#5123)", async () => {
+    const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true, degraded: true, inheritedBlocks: [], parentBlocks: 3 }, 201) }, []);
+    const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: parentBody, fetchImpl });
+    assert.equal(result.outcome, "degraded");
+    assert.match((result as { reason: string }).reason, /^fork inherited 0 of 3 parent blocks \(branch point 3\/3\)$/);
+});
+
+test("tryForkAdoption still adopts when the server reports a healthy inheritance (#5123)", async () => {
+    const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true, degraded: false, inheritedBlocks: [{ id: "b1", tier: 1, active: true }], parentBlocks: 3 }, 201) }, []);
     const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: truncatedTailBody(), fetchImpl });
     assert.equal(result.outcome, "adopted");
 });
 
 test("tryForkAdoption adopts a zero-block parent (nothing to inherit) without degrading (#5123)", async () => {
-    const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true, inheritedBlocks: [], parentBlocks: 0 }, 201) }, []);
+    const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true, degraded: false, inheritedBlocks: [], parentBlocks: 0 }, 201) }, []);
     const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: truncatedTailBody(), fetchImpl });
     assert.deepEqual(result, { outcome: "adopted", branchPoint: 2, replayed: false });
 });
 
-test("tryForkAdoption keeps legacy behavior when the server omits parentBlocks (#5123 backward compat)", async () => {
+test("tryForkAdoption keeps legacy behavior when the server omits the degraded flag (#5123 backward compat)", async () => {
     const fetchImpl = routerFetch({ snapshot: () => jsonRes(snapshotFixture(seedCore)), fork: () => jsonRes({ ok: true, inheritedBlocks: [] }, 201) }, []);
     const result = await tryForkAdoption({ base: "http://proxy", parentConversationId: "parent", childConversationId: "child", body: truncatedTailBody(), fetchImpl });
     assert.deepEqual(result, { outcome: "adopted", branchPoint: 2, replayed: false });
@@ -464,7 +471,7 @@ test("full chain: dsh fork child adopts the parent state and its replay is accep
     }
 });
 
-test("fork response exposes parentBlocks so the client can detect empty inheritance (#5123)", async () => {
+test("fork response exposes degraded + parentBlocks so the client can detect empty inheritance (#5123)", async () => {
     const h = await fullChainHarness();
     try {
         const parentMessages = [
@@ -487,10 +494,12 @@ test("fork response exposes parentBlocks so the client can detect empty inherita
         });
         const resText = await res.text();
         assert.equal(res.status, 201, resText);
-        const body = JSON.parse(resText) as { parentBlocks?: number; inheritedBlocks?: unknown[] };
-        // This parent never compressed, so it holds no blocks; the field must be
-        // present (0) so a client can distinguish "nothing to inherit" from a bug.
+        const body = JSON.parse(resText) as { degraded?: boolean; parentBlocks?: number; inheritedBlocks?: unknown[] };
+        // This parent never compressed, so it holds no blocks: nothing to inherit is
+        // NOT a degenerate fork — the flag must be false, or a healthy fresh-session
+        // clone would wrongly degrade and skip its own adoption.
         assert.equal(body.parentBlocks, 0);
+        assert.equal(body.degraded, false);
         assert.ok(Array.isArray(body.inheritedBlocks));
     } finally {
         await h.close();

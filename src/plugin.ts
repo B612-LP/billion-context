@@ -1558,13 +1558,16 @@ export async function handlePluginFork(payload: string, res: ServerResponse): Pr
             }
             // #5123: inheriting zero fold state while the parent held blocks means the
             // branch point collapsed below every block — the child will replay raw on
-            // its next turn. Log it (was silent) and expose the parent's block count so
-            // the client can degrade instead of claiming "adopted" (which sets
-            // publicForkReceipt and skips the #1486 resume-inheritance recovery path).
-            if (blocks.length === 0 && parent.state.blocks.length > 0) {
+            // its next turn. Flag it `degraded` in the response (server-authoritative,
+            // computed from the server's own ledger — the client need not re-derive it
+            // from a count it may not have) so the client degrades instead of claiming
+            // "adopted" (which sets publicForkReceipt and skips the #1486
+            // resume-inheritance recovery path). Old clients ignore the additive flag.
+            const forkDegraded = blocks.length === 0 && parent.state.blocks.length > 0;
+            if (forkDegraded) {
                 loggerLog("warn", `fork ${request.childConversationId} from ${parent.id}: inherited 0 of ${parent.state.blocks.length} parent blocks (branch point ${request.branchPoint.messageCount}/${snapshot.orderedMessages.length}); child replays raw until resume-inheritance recovers (#5123)`);
             }
-            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, parentBlocks: parent.state.blocks.length, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
+            const response = { ok: true, status: crossing.length > 0 ? "expanded" : "exact", protocolVersion: 2, parentConversationId: request.parentConversationId, childConversationId: request.childConversationId, sessionId: child.id, parentRevision: request.parentRevision, childRevision: forkSnapshot(child).parentRevision, branchPoint: request.branchPoint, degraded: forkDegraded, parentBlocks: parent.state.blocks.length, expandedBlocks: crossing.map((b) => b.blockId), inheritedBlocks: child.state.blocks.map((b) => ({ id: b.blockId, tier: b.tier, active: b.active, expanded: b.expanded === true })), replayed: false };
             child.metadata.publicForkReceipt = { requestHash, response };
             await publishForkSession(child, parent.id);
             recordPluginSession(request.childConversationId, child.id);
