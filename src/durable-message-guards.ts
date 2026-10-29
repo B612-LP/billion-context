@@ -45,6 +45,16 @@
 // such contract. The kernel stays host-agnostic: it only knows virtual paths
 // and patterns.
 //
+// #5142 second role — DRIFT ACCOUNTING (not protection): some carriers are
+// deliberately foldable AND permanently retired by their host after use
+// (the per-turn time-context notice; superseded durable instances under the
+// latest-per-identity policy). Once folded they leave the resent history
+// forever, which fold-reconcile used to count as "drift" on every later
+// turn — the O(full-history) tax of #5139. oneShotCarrierPaths below exposes
+// the same evidence-backed classifiers to that accounting surface ONLY:
+// their matches are recorded as expected rebases (excluded from drift),
+// never pinned in the kernel.
+//
 // #2766 ROLE BOUNDARY: every carrier is a host INJECTION into the user
 // channel — no classifier may project an assistant-role message. Model
 // output echoes these markers (anything visible to the model eventually
@@ -147,6 +157,47 @@ export function dshRuntimeContextPath(msg: CoreMessage): string | undefined {
         : undefined;
 }
 
+/** #2286 wire shape (AUTO_INJECTED_NOTIFICATION_PREFIXES in src/server.ts):
+ *  the dsh agent loop injects one timestamp notice before each turn,
+ *  "Time sampled while preparing turn N, step M: <ts> …". Kept local — this
+ *  module must not import src/server.ts; tests pin the two lists in lockstep. */
+const TIME_CONTEXT_MARKER = "Time sampled while preparing turn";
+
+/** Case-insensitive ASCII prefix check over the first needle.length chars —
+ *  mirrors the asciiCI convention of src/server.ts (kept local so this
+ *  module stays dependency-free). */
+function startsWithAsciiCI(hay: string, needle: string): boolean {
+    if (hay.length < needle.length) return false;
+    for (let i = 0; i < needle.length; i++) {
+        const h = hay.charCodeAt(i);
+        const n = needle.charCodeAt(i);
+        if (h === n) continue;
+        const hl = h >= 65 && h <= 90 ? h + 32 : h;
+        if (hl !== (n >= 65 && n <= 90 ? n + 32 : n)) return false;
+    }
+    return true;
+}
+
+/** dsh per-turn time-context carrier (#5142): the timestamp notice injected
+ *  before each turn (marker above). Deliberately FOLDABLE by design — unlike
+ *  the four durable carriers it carries no state beyond its own turn and
+ *  must NEVER be pinned, so it stays OUT of dshDurableToolPath / kernel
+ *  protection. Its problem is retirement, not foldability: the host re-sends
+ *  it only on the turn it was sampled for, so once folded it leaves the
+ *  resent history FOREVER — a permanent missing covered id that
+ *  fold-reconcile used to count as drift on every later turn (#5139: 157
+ *  such ids in one production session, part of the monotonic 739→1045
+ *  growth). oneShotCarrierPaths accounts that retirement as EXPECTED.
+ *  Prefix match on purpose (the turn-number/timestamp tail varies);
+ *  case-insensitive like the other auto-injected notification prefixes.
+ *  #2766: assistant-role messages are never carriers (see
+ *  dshSkillCatalogPath). */
+export function dshTimeContextPath(msg: CoreMessage): string | undefined {
+    return msg.role !== "assistant" && msg.contentType === "text" && typeof msg.text === "string" && startsWithAsciiCI(msg.text.trim(), TIME_CONTEXT_MARKER)
+        ? "oneshot/time-context"
+        : undefined;
+}
+
 /** dsh lane classifier: any of the four evidence-backed carriers → its
  *  canonical durable identity. */
 function dshDurableToolPath(msg: CoreMessage): string | undefined {
@@ -191,3 +242,33 @@ export function withDurableProtection(config: Config, classifier: DurableMessage
     }
     return { ...config, protectedLatestTools: [...(config.protectedLatestTools ?? []), "durable/*"], messagePathOf: classifier };
 }
+
+/** #5142: lane → ONE-SHOT carrier classifier for FOLD-DRIFT ACCOUNTING only
+ *  (fold-reconcile's expected-rebase record). Deliberately separate from
+ *  durableMessageToolPaths: these carriers stay kernel-foldable (lean
+ *  context) but are PERMANENTLY retired by their host after use — superseded
+ *  durable instances under the latest-per-identity policy included (a folded
+ *  old skill-catalog snapshot never comes back either). Their absence from
+ *  later resends is expected host behavior, accounted out of drift, NEVER
+ *  pinned. Same KDD #9 discipline: per-host entries with traffic evidence. */
+export const oneShotCarrierPaths: Record<string, DurableMessageClassifier> = {
+    dsh: (msg) =>
+        dshSkillCatalogPath(msg) ??
+        dshWorkspaceInstructionsPath(msg) ??
+        dshRuntimeContextPath(msg) ??
+        dshMcpCatalogPath(msg) ??
+        dshTimeContextPath(msg),
+};
+
+/** #5142: raw-content pre-filter markers for the stored-row backfill — the
+ *  exact marker strings of the five dsh classifiers above, so a unified-store
+ *  row can be screened with cheap substring checks BEFORE JSON.parse (rows
+ *  may carry megabytes of base64 media). Lockstep with the classifiers is
+ *  enforced in tests/issue5142-expected-rebase.test.ts. */
+export const dshCarrierRawMarkers: readonly string[] = [
+    "\x3cavailable_skills\x3e",
+    "Instructions from:",
+    "Current runtime context",
+    "\x3cmcp_catalog\x3e",
+    "Time sampled while preparing turn",
+];
