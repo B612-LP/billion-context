@@ -73,6 +73,11 @@ export const LIVE_FILES = [
     // in-memory-only value, so no zone band is needed — the entry is for the
     // tripwire
     "tests/issue4982-draining-twin-ladder.test.ts",
+    // #4566 part 2: settleZonePort/ensureProxyRunning rows drive a fully
+    // simulated world (mocked SpawnFn, temp zone file, squatted-port set);
+    // the only real spawn is spawnSync(node -e "") for a pid probe, so no
+    // zone band is needed — the entry is for the tripwire
+    "tests/issue4566-lane-port-sticky.test.ts",
 ];
 
 /** Band width per live file: the zone ladder drifts +1 per EADDRINUSE retry;
