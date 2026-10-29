@@ -1130,7 +1130,7 @@ function maybeRetry(ctx: PluginContext): void {
 type GateAttribution =
     | { state: "ok"; sid: string }
     | { state: "none"; initiatorPresent: boolean }
-    | { state: "threw"; message: string };
+    | { state: "threw"; message: string; stack?: string };
 
 // #4082: session identity carried by the REQUEST OBJECT, not the async chain.
 // dsh's `llm/stream` waterfall stamps `options.sessionId` on every model
@@ -1203,6 +1203,19 @@ function wrapScopedIterable<T>(iter: AsyncIterable<T>, scope: LlmDispatchScope):
     };
 }
 
+// #5067 option A (field gap from #5026): DSH hosts swallow exception stacks,
+// so the gate's `threw` diagnostics carried only the message — a bare
+// "Cannot read properties of undefined (reading 'length')" had zero frame
+// attribution. Carry a bounded, single-line-flattened stack from the throw
+// site into the durable refusal lines (sink-level masking in host-log.ts
+// still applies). Non-Error throws have no stack: the field stays off.
+const THREW_STACK_LOG_CAP = 2000;
+function threwStackOf(err: unknown): string | undefined {
+    if (!(err instanceof Error) || typeof err.stack !== "string" || err.stack.length === 0) return undefined;
+    const flat = err.stack.replace(/\r?\n+/g, " ");
+    return flat.length > THREW_STACK_LOG_CAP ? `${flat.slice(0, THREW_STACK_LOG_CAP)} …[truncated]` : flat;
+}
+
 function attributionOf(ctx: PluginContext): GateAttribution {
     // #4082: the llm/stream-carried sid outranks the ambient initiator — it
     // is the dispatch's own truth (the loop stamps the session it is
@@ -1223,7 +1236,7 @@ function attributionOf(ctx: PluginContext): GateAttribution {
         if (typeof sid === "string" && sid.length > 0) return { state: "ok", sid };
         return { state: "none", initiatorPresent: init !== undefined && init !== null };
     } catch (err) {
-        return { state: "threw", message: err instanceof Error ? err.message : String(err) };
+        return { state: "threw", message: err instanceof Error ? err.message : String(err), stack: threwStackOf(err) };
     }
 }
 
@@ -2088,7 +2101,7 @@ export function apply(ctx: PluginContext): void {
         if (prev === undefined || changed) {
             const reason =
                 attr.state === "threw"
-                    ? `currentInitiator() threw (${attr.message}) — agent scope disposed/closing mid-request?`
+                    ? `currentInitiator() threw (${attr.message}) — agent scope disposed/closing mid-request?${attr.stack !== undefined ? ` — stack: ${attr.stack}` : ""}`
                     : attr.state === "none" && attr.initiatorPresent
                         ? "initiator present but missing session id"
                         : "no active initiator attribution (agentless/background lane, third-party in-process caller, or stale attribution after host resume?)";
@@ -2112,7 +2125,7 @@ export function apply(ctx: PluginContext): void {
     // session (the host's own compaction and the #1117 direct fallback must
     // both ship the full history upstream, which 400s once it exceeds the
     // window — all recovery paths vanish the instant the gate lets go).
-    const settleThrewAttribution = async (message: string, url: string, body: { bytes: number } | undefined, init: RequestInit | undefined): Promise<GateVerdict> => {
+    const settleThrewAttribution = async (attr: Extract<GateAttribution, { state: "threw" }>, url: string, body: { bytes: number } | undefined, init: RequestInit | undefined): Promise<GateVerdict> => {
         // #3581: after giveUpStreak consecutive requests whose settle-retry
         // exhausted STILL threw, stop re-settling — a disposed ctx stays
         // disposed for the host's whole lifetime (#3578), so retrying the same
@@ -2151,8 +2164,8 @@ export function apply(ctx: PluginContext): void {
         // would accept.
         const doom = bodyProvablyOverWindow(body, init, effectiveContextWindow(ctx));
         if (doom !== undefined) {
-            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw and body ≥${doom.floorTokens} tok (core est ${doom.coreBytes}B/4${doom.mediaBytes > 0 ? `, ${doom.mediaBytes}B media excluded` : ""}) exceeds window ${doom.window} (declared ${doom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would 400 upstream (#2924/#4111)`);
-            noteAttrRefusal("threw", { message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
+            persistClientEvent(`bili-native-dsh: takeover gate refused ${gateKeyOf(url)} LOCALLY (422) — attribution threw (${attr.message}) and body ≥${doom.floorTokens} tok (core est ${doom.coreBytes}B/4${doom.mediaBytes > 0 ? `, ${doom.mediaBytes}B media excluded` : ""}) exceeds window ${doom.window} (declared ${doom.declaredWindow}; never assumes below ${MIN_ASSUMED_WINDOW_TOKENS}); a direct send would 400 upstream (#2924/#4111)${attr.stack !== undefined ? ` — stack: ${attr.stack}` : ""}`);
+            noteAttrRefusal("threw", { message: attr.message, endpoint: maskUrlForDiagnostics(gateKeyOf(url)) });
             return "refuse-oversized";
         }
         return refuse(url, attributionOf(ctx));
@@ -2217,7 +2230,7 @@ export function apply(ctx: PluginContext): void {
             });
         }
         if (attr.state === "threw") {
-            return settleThrewAttribution(attr.message, url, body, init).then((verdict) => {
+            return settleThrewAttribution(attr, url, body, init).then((verdict) => {
                 if (verdict === true) {
                     threwStreak = 0;
                     threwGiveUpNoticed = false;

@@ -1998,6 +1998,8 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 assert.equal(lines.length, 2, `expected a state-transition re-print, got: ${lines.join(" | ")}`);
                 assert.match(lines[1]!, /currentInitiator\(\) threw \(agent initiator scope is disposed\)/);
                 assert.match(lines[1]!, /refusals so far: 5 \(state none→threw\)$/);
+                // #5067 option A: an Error throw carries its (flattened) stack into the durable line
+                assert.match(lines[1]!, / — stack: Error: agent initiator scope is disposed/);
                 // further thrown refusals stay silent again
                 assert.equal(await gate(url), false);
                 assert.equal(refusedLines().length, 2);
@@ -2007,15 +2009,27 @@ test("#1158 L2 gate three-state: thrown attribution is a distinct state; counts 
                 lines = refusedLines();
                 assert.equal(lines.length, 3);
                 assert.match(lines[2]!, /refusals so far: 7 \(state threw→none\)$/);
+                // #5067 option A negative leg: a non-Error throw has no stack — the
+                // transition re-print must NOT gain a stack segment
+                ctx.agents.currentInitiator = () => {
+                    throw "bare-string attribution failure";
+                };
+                assert.equal(await gate(url), false);
+                lines = refusedLines();
+                assert.equal(lines.length, 4);
+                assert.match(lines[3]!, /currentInitiator\(\) threw \(bare-string attribution failure\)/);
+                assert.ok(!lines[3]!.includes(" — stack:"), "non-Error throws must not fabricate a stack");
                 // attributed traffic claims silently — no line
                 ctx.agents.currentInitiator = origCI;
                 ctx.setInitiator({ session: { id: "s1158l2" } });
                 assert.equal(gate(url), true);
-                assert.equal(refusedLines().length, 3);
+                assert.equal(refusedLines().length, 4);
                 // the durable copy carries the same lines into bili.log, [dsh-client]-marked
                 const content = fs.readFileSync(logFile, "utf8");
                 // #3651: the durable line masks non-public upstream hosts (paste-safe sink), loopback stays verbatim.
-                assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/<private-host>\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\? — refusals so far: 5 \(state none→threw\)$/m);
+                // #5067 option A: the optional single-line stack segment sits between
+                // the reason and the counter; `.` not matching \n also pins the flattening.
+                assert.match(content, /\[warn\] \[v=[^\]]+\] \[dsh-client\] bili-native-dsh: model request sent DIRECT \(uncompressed\) — takeover gate refused https:\/\/<private-host>\/v1\/chat\/completions: currentInitiator\(\) threw \(agent initiator scope is disposed\) — agent scope disposed\/closing mid-request\?( — stack: .+?)? — refusals so far: 5 \(state none→threw\)$/m);
                 assert.equal(errs.filter((e) => e.includes("takeover gate refused")).length, 0, "#2831: must not reach the terminal surface");
             } finally {
                 console.error = origErr;
