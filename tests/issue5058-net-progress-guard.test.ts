@@ -25,10 +25,13 @@ import {
 
 const noop = () => {};
 
-function mkSession(): Session {
+// The guard is plugin-lane only: fakes carry a plugin binding by default so
+// the state-machine rows below exercise the guarded path; pass undefined for
+// proxy-mode (unbound) sessions.
+function mkSession(pluginAgent: string | undefined = "dsh"): Session {
     return {
         id: "s1",
-        metadata: {},
+        metadata: pluginAgent === undefined ? {} : { pluginAgent },
         state: { nextBlockId: 1 },
         lastCompress: undefined,
     } as unknown as Session;
@@ -164,7 +167,20 @@ test("unit: the guard never touches persisted session state (storage goldens sta
     evaluateNetProgressRound(s, 900_000, noop);
     evaluateNetProgressRound(s, 900_000, noop);
     evaluateNetProgressRound(s, 600_000 - NET_PROGRESS_MARGIN_TOKENS - 1, noop);
-    assert.deepEqual(Object.keys(s.metadata), [], "session.metadata must stay untouched");
+    assert.deepEqual(Object.keys(s.metadata), ["pluginAgent"], "session.metadata must stay untouched apart from the pre-existing lane binding");
+});
+
+test("unit: proxy-mode sessions (no plugin binding) are out of scope and never arm", () => {
+    const s = mkSession(undefined);
+    recordNetProgressBaseline(s, 600_000, 120_000);
+    assert.equal(netProgressState(s), undefined, "proxy sessions get no evidence window");
+    // A mature proxy session's raw resend structurally never drops below the
+    // bar (the client keeps its full local history) — the guard must stay
+    // inert there so the flat-50K cadence keeps running (KDD #8).
+    evaluateNetProgressRound(s, 900_000, noop);
+    evaluateNetProgressRound(s, 900_000, noop);
+    assert.equal(netProgressState(s), undefined, "rounds stay inert without a window");
+    assert.equal(nudgeInjectionBlocked(s), false, "proxy cadence stays untouched");
 });
 
 test("unit: a healthy long session never arms", () => {

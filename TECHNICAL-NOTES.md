@@ -397,11 +397,22 @@ it cannot see the cross-round trajectory.
 
 `src/net-progress-guard.ts` adds the trajectory view:
 
+- **Lane scope** — plugin lanes only (`session.metadata.pluginAgent` bound).
+  Only a plugin host persists and re-sends the compression action itself, so
+  only there does the resent payload shrink when a fold works. Proxy-mode
+  clients keep their full local history and re-send it verbatim every turn —
+  once folded coverage exceeds the margin the raw resend structurally never
+  drops below pre-fold-minus-margin, so an unscoped latch would arm on every
+  mature proxy session and silence the flat-50K cadence without defending
+  anything.
 - **Baseline** — recorded at every successful fold commit in `src/stream.ts`:
-  `recordNetProgressBaseline(session, viewTokens, postCtx)` where both numbers
-  come from the SAME kernel counter over the live outbound view (the
-  #1911 same-space discipline — no usage-grade estimate may mix into this
-  pair). Each new fold opens a fresh evidence window; strikes reset.
+  `recordNetProgressBaseline(session, rawViewTokens, postCtx)`. The baseline
+  is the INBOUND RESEND total (same array class as the round check's
+  observation, #1911 same-space discipline); postCtx stays the rendered
+  post-fold estimate (diagnostic only). The rendered live view must not feed
+  this pair — mixing spaces would distort the bar by the reasoning-drop delta
+  on heavy-reasoning hosts. Each new fold opens a fresh evidence window;
+  strikes reset.
 - **Round check** — once per request on nudge-carrying lanes (inside the same
   `!selfHealRoundDone && prepared.nudge !== undefined` block as D1/D2),
   `evaluateNetProgressRound(session, observedTokens, log)` compares the

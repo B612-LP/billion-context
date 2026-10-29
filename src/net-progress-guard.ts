@@ -23,10 +23,11 @@ import { SELF_HEAL_SUPPRESS_CAP_MS, nudgeSuppressed } from "./session-self-heal.
  * #3461 backoff rate-limits host-side emergency injections only. Nothing
  * measures the cross-round trajectory of the resent payload.
  *
- * Remedy: after each successful fold commit, remember the live-view level
+ * Remedy: after each successful fold commit, remember the client-resend level
  * (recordNetProgressBaseline, src/stream.ts). On each following nudge-carrying
  * round, measure the client's raw resend (evaluateNetProgressRound,
- * src/server/handle.ts — same kernel counter space). Two consecutive rounds
+ * src/server/handle.ts — same kernel counter over the SAME array class). Two
+ * consecutive rounds
  * that fail to drop the context below pre-fold-level-minus-margin mean the
  * folds are not buying back room: latch a per-session nudge suppression
  * (same channel as the #2155 suppress-nudge remedy) until a round
@@ -44,6 +45,18 @@ import { SELF_HEAL_SUPPRESS_CAP_MS, nudgeSuppressed } from "./session-self-heal.
  * anyway, and a fresh arm needs one more successful fold commit followed by
  * at most NET_PROGRESS_STRIKE_LIMIT non-progress rounds. The web badge
  * therefore only appears while the session object is live.
+ *
+ * Lane scope: PLUGIN LANES ONLY (session.metadata.pluginAgent bound). Only a
+ * plugin host persists and re-sends the compression action itself, so only
+ * there does the resent payload shrink when a fold works. Proxy-mode clients
+ * keep their full local history and re-send it verbatim every turn — bili's
+ * folds shrink the rendered view sent to the model, never the client's own
+ * store — so once folded coverage exceeds the margin the raw resend
+ * structurally never drops below pre-fold-minus-margin and an unscoped latch
+ * would arm on every mature proxy session, silencing the flat-50K proactive
+ * cadence (KDD #8) without defending any real swelling. The #5058 failure
+ * domain (a host store walked past its window by its own action cost) is
+ * plugin-mode only.
  */
 
 /** Below pre-fold level by MORE than this counts as progress. Half the flat
@@ -57,7 +70,7 @@ export const NET_PROGRESS_MARGIN_TOKENS = 25_000;
 export const NET_PROGRESS_STRIKE_LIMIT = 2;
 
 type NetProgressState = {
-    /** live-view tokens at the last successful fold commit */
+    /** client-resend tokens at the last successful fold commit */
     baseline: number;
     /** rendered post-fold estimate at commit time (diagnostic only) */
     expectedFloor: number;
@@ -77,13 +90,22 @@ export function netProgressState(key: object): NetProgressState | undefined {
     return states.get(key);
 }
 
-/** Called on the compress success path (src/stream.ts) with the live-view
- *  token total and the rendered post-fold estimate of the SAME request. A new
- *  fold starts a fresh evidence window: prior strikes are stale. */
-export function recordNetProgressBaseline(session: Session, viewTokens: number, expectedFloor: number): void {
-    if (!Number.isFinite(viewTokens) || viewTokens <= 0) return;
+/** The guard measures the client's RESENT payload, which only plugin-lane
+ * hosts shrink through folds (see module doc) — proxy sessions are out of
+ * scope and keep the flat-50K cadence untouched. */
+function netProgressGuardApplies(session: Session): boolean {
+    return typeof session.metadata.pluginAgent === "string";
+}
+
+/** Called on the compress success path (src/stream.ts) with the INBOUND
+ * RESEND token total (same array class as the round check's observation) and
+ * the rendered post-fold estimate of the SAME request. A new fold starts a
+ * fresh evidence window: prior strikes are stale. */
+export function recordNetProgressBaseline(session: Session, resendTokens: number, expectedFloor: number): void {
+    if (!netProgressGuardApplies(session)) return;
+    if (!Number.isFinite(resendTokens) || resendTokens <= 0) return;
     states.set(session, {
-        baseline: Math.round(viewTokens),
+        baseline: Math.round(resendTokens),
         expectedFloor: Math.max(0, Math.round(expectedFloor)),
         strikes: 0,
     });
@@ -111,6 +133,7 @@ type LogFn = (level: "info" | "warn", message: string) => void;
  *  fold's baseline. Pure w.r.t. inputs; mutates only the process-local store
  *  (never persisted — see module doc). */
 export function evaluateNetProgressRound(session: Session, observedTokens: number, log: LogFn): void {
+    if (!netProgressGuardApplies(session)) return;
     const st = states.get(session);
     if (st === undefined) return;
     if (!Number.isFinite(observedTokens) || observedTokens <= 0) return;
