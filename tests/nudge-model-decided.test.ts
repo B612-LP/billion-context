@@ -29,9 +29,9 @@ function okJson(promptTokens: number): string {
     });
 }
 
-// Same 29-message history as plugin-nudge-injection.test.ts: 50k/64k = 78%
-// arms the OVER-LIMIT tier-1 nudge deterministically (not EMERGENCY, so it
-// routes through the model-decided path when enabled).
+// Same 29-message history as plugin-nudge-injection.test.ts. Both 50k/64k
+// and 250k/320k arm tier-1 at about 78%; only the latter reaches the
+// 250k dynamic-nudge floor. The 384k window reserves 64k output headroom.
 function turn2Messages(): Record<string, unknown>[] {
     const longText = "y".repeat(20_000);
     const filler: { role: "user" | "assistant"; content: string }[] = [];
@@ -57,7 +57,7 @@ interface ScenarioResult {
     sideLastText: string[];
 }
 
-async function runScenario(sessionId: string, modelDecided: boolean, verdict: string | null): Promise<ScenarioResult> {
+async function runScenario(sessionId: string, modelDecided: boolean, verdict: string | null, context = 384_000, usage = 250_000): Promise<ScenarioResult> {
     const mains: unknown[][] = [];
     const sides: { maxTokens: unknown; lastText: string }[] = [];
     const upstream = http.createServer((req, res) => {
@@ -76,13 +76,13 @@ async function runScenario(sessionId: string, modelDecided: boolean, verdict: st
                     id: "chatcmpl-decide",
                     object: "chat.completion",
                     choices: [{ index: 0, message: { role: "assistant", content: verdict ?? "Let me think about whether we should compress..." }, finish_reason: "stop" }],
-                    usage: { prompt_tokens: 50_000, completion_tokens: 10, total_tokens: 50_010 },
+                    usage: { prompt_tokens: usage, completion_tokens: 10, total_tokens: usage + 10 },
                 }));
                 return;
             }
             mains.push(messages);
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(okJson(50_000));
+            res.end(okJson(usage));
         });
     });
     upstream.listen(0, "127.0.0.1");
@@ -95,9 +95,9 @@ async function runScenario(sessionId: string, modelDecided: boolean, verdict: st
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "deepseek-v4-flash": { context: 64_000 } } } },
-        modelContextLimit: 200_000,
-        kernelConfig: defaultConfig(200_000),
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "deepseek-v4-flash": { context } } } },
+        modelContextLimit: context,
+        kernelConfig: defaultConfig(context),
         compress: {
             injectTool: true,
             injectNudge: true,
@@ -155,6 +155,21 @@ async function runScenario(sessionId: string, modelDecided: boolean, verdict: st
     }
 }
 
+for (const [name, enabled, verdict] of [
+    ["yes", true, '{"compress": true}'],
+    ["no", true, '{"compress": false}'],
+    ["invalid", true, null],
+    ["feature off", false, null],
+] as const) {
+    test(`#2228: 50k/64k stays silent (${name})`, async () => {
+        const out = await runScenario(`small-${name}`, enabled, verdict, 64_000, 50_000);
+        assert.equal(out.sideCalls, 0, "below 250k there is no decision call");
+        assert.equal(out.mainLen, 30, "below 250k there is no dynamic nudge");
+        assert.ok(!out.mainLastText.includes("[bili-compress-directive]"));
+        assert.ok(!out.mainLastText.includes("[bili-compress-decision]"));
+    });
+}
+
 test("#2228: model says yes → directive injected with a program-finalized span", async () => {
     const out = await runScenario("decide-yes", true, '{"compress": true}');
     assert.equal(out.sideCalls, 1, "exactly one decision side call");
@@ -182,7 +197,7 @@ test("#2228: unparseable answer → treated as failure, nothing injected", async
 test("#2228 control: feature off → legacy advisory nudge unchanged, no side call", async () => {
     const out = await runScenario("decide-off", false, null);
     assert.equal(out.sideCalls, 0, "no decision call when the feature is off");
-    assert.equal(out.mainLen, 31, "legacy advisory nudge still injected at 78% of 64k");
+    assert.equal(out.mainLen, 31, "legacy advisory nudge still injected at 78% of 320k");
     assert.ok(!out.mainLastText.includes("[bili-compress-directive]"));
     assert.ok(!out.mainLastText.includes("[bili-compress-decision]"));
 });
