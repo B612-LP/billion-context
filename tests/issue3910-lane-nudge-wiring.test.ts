@@ -30,21 +30,20 @@ import type { ProxyOptions } from "../src/config.ts";
 import { SessionStore, _setStoreForTest } from "../src/persist.ts";
 import { _setForTest as setRegistryForTest } from "../src/registry.ts";
 
-const WINDOW = 15_000;
+const WINDOW = 280_000;
 const MODEL = "claude-test";
 const SYSTEM = "You are a coding agent.";
 // Distinctive, bracket-free slice of ANTHROPIC_LANE_NOTE — unique to the note,
 // safe to count occurrences of without tripping the KDD#2 tag-stripping rule.
 const NOTE = "Write the summary ONLY as the `compress` tool's `content` argument";
-// Upstream-reported usage that crosses the OVER-LIMIT band (90% of WINDOW) while
-// the LOCAL estimate of the fixture stays ~51% — so turn 1 is clean and only the
-// recorded usage arms the turn-2 nudge (mirrors compaction-trigger-finality).
-const ARMED_INPUT_TOKENS = 13_500;
+// Upstream-reported usage crosses the pressure band and the 250k nudge floor;
+// the much smaller local estimate leaves turn 1 clean.
+const ARMED_INPUT_TOKENS = 250_000;
 
 const notesIn = (s: string): number => s.split(NOTE).length - 1;
 
-// 7 messages × ~4400 distinct chars → local estimate ≈51% of WINDOW (below the
-// band) with m00001/m00002 outside the kernel's last-5 protected zone, so a
+// 7 messages × ~4400 distinct chars stay below the band, with
+// m00001/m00002 outside the kernel's last-5 protected zone, so a
 // pending range exists for the nudge to point at.
 function filler(seed: number, targetChars: number): string {
     const para = `Paragraph ${seed}: the ledger module under review passed its integration suite across all four regions without any reported regressions. `;
@@ -67,9 +66,9 @@ const anthropicSse = (event: string, data: unknown): string => `event: ${event}\
 
 // Non-streaming text reply whose message_start reports the armed usage so the
 // proxy records lastInputTokens for the next turn.
-const anthropicReply = (): string =>
+const anthropicReply = (inputTokens = ARMED_INPUT_TOKENS): string =>
     [
-        anthropicSse("message_start", { type: "message_start", message: { id: "msg_r", role: "assistant", usage: { input_tokens: ARMED_INPUT_TOKENS } } }),
+        anthropicSse("message_start", { type: "message_start", message: { id: "msg_r", role: "assistant", usage: { input_tokens: inputTokens } } }),
         anthropicSse("content_block_start", { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } }),
         anthropicSse("content_block_delta", { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ack" } }),
         anthropicSse("content_block_stop", { type: "content_block_stop", index: 0 }),
@@ -84,7 +83,7 @@ interface Harness {
     close(): Promise<void>;
 }
 
-async function startHarness(wire: "anthropic" | "openai"): Promise<Harness> {
+async function startHarness(wire: "anthropic" | "openai", inputTokens = ARMED_INPUT_TOKENS): Promise<Harness> {
     const captured: string[] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -93,7 +92,7 @@ async function startHarness(wire: "anthropic" | "openai"): Promise<Harness> {
             captured.push(Buffer.concat(chunks).toString("utf8"));
             if (wire === "anthropic") {
                 res.writeHead(200, { "content-type": "text/event-stream", "cache-control": "no-cache" });
-                res.end(anthropicReply());
+                res.end(anthropicReply(inputTokens));
             } else {
                 res.writeHead(200, { "content-type": "application/json" });
                 res.end(JSON.stringify({ id: "chat_r", object: "chat.completion", choices: [{ index: 0, message: { role: "assistant", content: "ack" }, finish_reason: "stop" }], usage: { prompt_tokens: ARMED_INPUT_TOKENS, completion_tokens: 3, total_tokens: ARMED_INPUT_TOKENS + 3 } }));
@@ -141,6 +140,28 @@ async function startHarness(wire: "anthropic" | "openai"): Promise<Harness> {
             await once(upstream, "close");
         },
     };
+}
+
+for (const [mode, headers] of [["proxy", {}], ["plugin", { "x-bili-plugin": "omp" }]] as const) {
+    test(`anthropic ${mode}: 249999 suppresses nudge while retaining standing principle`, async () => {
+        const h = await startHarness("anthropic", 249_999);
+        try {
+            const url = `${h.origin}/bili/${h.upstreamUrl}/v1/messages`;
+            for (let i = 0; i < 2; i++) {
+                const r = await fetch(url, {
+                    method: "POST",
+                    headers: { "content-type": "application/json", "x-acp-session": `anth-below-${mode}`, ...headers },
+                    body: JSON.stringify({ model: MODEL, max_tokens: 1024, stream: true, system: SYSTEM, messages: ANTHROPIC_MESSAGES() }),
+                });
+                assert.equal(r.status, 200);
+                await r.text();
+            }
+            const body = JSON.parse(h.captured[1]!) as { messages: unknown[]; system: unknown };
+            assert.equal(body.messages.length, ANTHROPIC_MESSAGES().length);
+            assert.match(JSON.stringify(body.system), /proactively compress suitable completed ranges/);
+            assert.equal(notesIn(h.captured[1]!), 0);
+        } finally { await h.close(); }
+    });
 }
 
 test("#3910 positive: anthropic lane nudge carries ANTHROPIC_LANE_NOTE exactly once, in the trailing nudge message", async () => {

@@ -49,7 +49,7 @@ function turn2Messages(): Record<string, unknown>[] {
     ];
 }
 
-async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, string>): Promise<{ count: number; messages: Record<string, unknown>[] }> {
+async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, string>, promptTokens = 250_000): Promise<{ count: number; messages: Record<string, unknown>[] }> {
     const received: unknown[][] = [];
     const upstream = http.createServer((req, res) => {
         const chunks: Buffer[] = [];
@@ -58,7 +58,7 @@ async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, st
             const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
             received.push(body.messages ?? []);
             res.writeHead(200, { "content-type": "application/json" });
-            res.end(okJson(50_000));
+            res.end(okJson(promptTokens));
         });
     });
     upstream.listen(0, "127.0.0.1");
@@ -71,9 +71,8 @@ async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, st
         port: 0,
         host: "127.0.0.1",
         upstream: "http://127.0.0.1",
-        // Operator-declared window (never floored) so 50k/64k = 78% trips the
-        // OVER-LIMIT nudge deterministically.
-        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "deepseek-v4-flash": { context: 64_000 } } } },
+        // An operator-declared window makes the 250k usage sample arm the nudge.
+        routes: { [`http://127.0.0.1:${upstreamPort}`]: { models: { "deepseek-v4-flash": { context: 320_000 } } } },
         modelContextLimit: 200_000,
         kernelConfig: defaultConfig(200_000),
         compress: { injectTool: true, injectNudge: true },
@@ -94,7 +93,7 @@ async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, st
         const url = `http://127.0.0.1:${proxyPort}/bili/http://127.0.0.1:${upstreamPort}/v1/chat/completions`;
         const headers = { "content-type": "application/json", "x-acp-session": sessionId, ...extraHeaders };
 
-        // Turn 1 teaches the session its real context size (50k via usage report).
+        // Turn 1 teaches the session its context size via the usage report.
         const r1 = await fetch(url, {
             method: "POST",
             headers,
@@ -103,7 +102,7 @@ async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, st
         assert.equal(r1.status, 200);
         await r1.text();
 
-        // Turn 2: 78% of the declared window arms the nudge. Forwarded payload =
+        // Turn 2: the usage sample arms the nudge. Forwarded payload =
         // 29 client msgs + 1 leading compress system message [+ 1 nudge].
         const r2 = await fetch(url, {
             method: "POST",
@@ -128,13 +127,22 @@ async function forwardedTurn2(sessionId: string, extraHeaders: Record<string, st
 
 test("#451 control: nudge injected in PROXY mode when armed", async () => {
     const { count } = await forwardedTurn2("nudge-ctrl", {});
-    assert.equal(count, 31, "proxy mode appends the nudge as a trailing user message at 78% of 64k");
+    assert.equal(count, 31, "proxy mode appends the nudge at the 250k boundary");
 });
 
 test("#451: nudge ALSO injected in PLUGIN mode when armed (regression)", async () => {
     const { count } = await forwardedTurn2("nudge-plugin", { "x-bili-plugin": "omp" });
     assert.equal(count, 31, "plugin mode must append the nudge too — before the fix the !pluginMode gate suppressed it and this would be 30");
 });
+
+for (const [mode, headers] of [["proxy", {}], ["plugin", { "x-bili-plugin": "omp" }]] as const) {
+    test(`${mode}: below 250k suppresses dynamic nudge but retains standing principle`, async () => {
+        const { count, messages } = await forwardedTurn2(`below-${mode}`, headers, 249_999);
+        assert.equal(count, 30);
+        assert.match(String(messages[0]?.content), /proactively compress suitable completed ranges/);
+        assert.match(String(messages[0]?.content), /preserve active work/i);
+    });
+}
 
 // #3177: DSH registers bili's ACP tools host-scope, invisible to its preset agent
 // (0 of 3939 request headers carried them), so model-driven compression is

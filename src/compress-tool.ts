@@ -340,8 +340,10 @@ export const PROJECT_ATTRIBUTION_LINE = "Context management for this conversatio
 
 /** Append PROJECT_ATTRIBUTION_LINE to a built compress prompt — used by all
  *  four wire prepare paths (anthropic/openai/google/responses). */
+export const STANDING_COMPRESSION_PRINCIPLE = "After completing a substantial phase, proactively compress suitable completed ranges, regardless of context size; preserve active work and essential details. Do not compress merely for its own sake.";
+
 export function withProjectAttribution(prompt: string): string {
-    return prompt + "\n\n" + PROJECT_ATTRIBUTION_LINE;
+    return prompt + "\n\n" + PROJECT_ATTRIBUTION_LINE + "\n\n" + STANDING_COMPRESSION_PRINCIPLE;
 }
 
 /** The MCP-dialect name bili's fixed "bili" shim server (src/mcp.ts, #2578)

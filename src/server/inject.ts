@@ -9,6 +9,8 @@ import { conversationPromptSections, externalSummaryEnabled, withExternalSummary
 import { forceTextProtocol as knobForceTextProtocol, renderNone as knobRenderNone } from "../knobs.js";
 import { GENERATION_BOUNDARY_NOTE } from "../generation-boundary.js";
 
+export const MIN_DYNAMIC_NUDGE_TOKENS = 250_000;
+
 export function injectSystem(
     parsed: AnthropicRequestBody,
     opts: ProxyOptions,
